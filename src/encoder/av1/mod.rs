@@ -200,10 +200,13 @@ mod tests {
 
         // Build up some references (like a sequence of P-frames).
         for i in 0..3u8 {
-            references.insert(0, ReferenceInfo {
-                dpb_slot: i,
-                order_hint: i as u32,
-            });
+            references.insert(
+                0,
+                ReferenceInfo {
+                    dpb_slot: i,
+                    order_hint: i as u32,
+                },
+            );
         }
         assert_eq!(references.len(), 3);
 
@@ -212,10 +215,13 @@ mod tests {
         assert!(references.is_empty());
 
         // First frame after key should start fresh at slot 0.
-        references.insert(0, ReferenceInfo {
-            dpb_slot: 0,
-            order_hint: 0,
-        });
+        references.insert(
+            0,
+            ReferenceInfo {
+                dpb_slot: 0,
+                order_hint: 0,
+            },
+        );
         assert_eq!(references.len(), 1);
         assert_eq!(references[0].dpb_slot, 0);
         assert_eq!(references[0].order_hint, 0);
@@ -243,21 +249,45 @@ mod tests {
 
         // Frame 0 (IDR): uses slot 0.
         assert_eq!(current_dpb_slot, 0);
-        references.insert(0, ReferenceInfo { dpb_slot: 0, order_hint: 0 });
-        while references.len() > max_refs { references.pop(); }
+        references.insert(
+            0,
+            ReferenceInfo {
+                dpb_slot: 0,
+                order_hint: 0,
+            },
+        );
+        while references.len() > max_refs {
+            references.pop();
+        }
         current_dpb_slot = find_free_slot(&references, dpb_slot_count);
         assert_eq!(current_dpb_slot, 1); // slot 0 is used, next free is 1
 
         // Frame 1 (P): uses slot 1.
-        references.insert(0, ReferenceInfo { dpb_slot: 1, order_hint: 1 });
-        while references.len() > max_refs { references.pop(); }
+        references.insert(
+            0,
+            ReferenceInfo {
+                dpb_slot: 1,
+                order_hint: 1,
+            },
+        );
+        while references.len() > max_refs {
+            references.pop();
+        }
         current_dpb_slot = find_free_slot(&references, dpb_slot_count);
         assert_eq!(current_dpb_slot, 2); // slots 0,1 used, next free is 2
 
         // Frame 2 (P): uses slot 2. Now all 3 slots have been touched,
         // but max_refs=2 means the oldest reference (slot 0) gets evicted.
-        references.insert(0, ReferenceInfo { dpb_slot: 2, order_hint: 2 });
-        while references.len() > max_refs { references.pop(); }
+        references.insert(
+            0,
+            ReferenceInfo {
+                dpb_slot: 2,
+                order_hint: 2,
+            },
+        );
+        while references.len() > max_refs {
+            references.pop();
+        }
         // references = [{slot:2, hint:2}, {slot:1, hint:1}] - slot 0 evicted
         assert_eq!(references.len(), 2);
         assert_eq!(references[0].dpb_slot, 2);
@@ -266,8 +296,16 @@ mod tests {
         assert_eq!(current_dpb_slot, 0); // slot 0 is now free again (reuse!)
 
         // Frame 3 (P): uses recycled slot 0.
-        references.insert(0, ReferenceInfo { dpb_slot: 0, order_hint: 3 });
-        while references.len() > max_refs { references.pop(); }
+        references.insert(
+            0,
+            ReferenceInfo {
+                dpb_slot: 0,
+                order_hint: 3,
+            },
+        );
+        while references.len() > max_refs {
+            references.pop();
+        }
         // references = [{slot:0, hint:3}, {slot:2, hint:2}] - slot 1 evicted
         current_dpb_slot = find_free_slot(&references, dpb_slot_count);
         assert_eq!(current_dpb_slot, 1); // slot 1 recycled
@@ -294,7 +332,13 @@ mod tests {
 
         // IDR frame: clears refs, writes to slot 0.
         references.clear();
-        references.insert(0, ReferenceInfo { dpb_slot: current_dpb_slot, order_hint: 0 });
+        references.insert(
+            0,
+            ReferenceInfo {
+                dpb_slot: current_dpb_slot,
+                order_hint: 0,
+            },
+        );
         current_dpb_slot = find_free_slot(&references, dpb_slot_count);
 
         assert_eq!(references.len(), 1);
@@ -302,8 +346,16 @@ mod tests {
         assert_eq!(current_dpb_slot, 1);
 
         // P frame 1: writes to slot 1.
-        references.insert(0, ReferenceInfo { dpb_slot: current_dpb_slot, order_hint: 1 });
-        while references.len() > max_refs { references.pop(); }
+        references.insert(
+            0,
+            ReferenceInfo {
+                dpb_slot: current_dpb_slot,
+                order_hint: 1,
+            },
+        );
+        while references.len() > max_refs {
+            references.pop();
+        }
         current_dpb_slot = find_free_slot(&references, dpb_slot_count);
 
         assert_eq!(references.len(), 2);
@@ -311,8 +363,16 @@ mod tests {
         assert_eq!(current_dpb_slot, 2);
 
         // P frame 2: writes to slot 2, evicts oldest ref (slot 0).
-        references.insert(0, ReferenceInfo { dpb_slot: current_dpb_slot, order_hint: 2 });
-        while references.len() > max_refs { references.pop(); }
+        references.insert(
+            0,
+            ReferenceInfo {
+                dpb_slot: current_dpb_slot,
+                order_hint: 2,
+            },
+        );
+        while references.len() > max_refs {
+            references.pop();
+        }
         current_dpb_slot = find_free_slot(&references, dpb_slot_count);
 
         assert_eq!(references.len(), 2);
@@ -342,22 +402,46 @@ mod tests {
         };
 
         // Frame 0: slot 0.
-        references.insert(0, ReferenceInfo { dpb_slot: 0, order_hint: 0 });
-        while references.len() > max_refs { references.pop(); }
+        references.insert(
+            0,
+            ReferenceInfo {
+                dpb_slot: 0,
+                order_hint: 0,
+            },
+        );
+        while references.len() > max_refs {
+            references.pop();
+        }
         let mut current_dpb_slot = find_free_slot(&references, dpb_slot_count);
         assert_eq!(current_dpb_slot, 1);
 
         // Frame 1: slot 1. Old ref (slot 0) evicted since max_refs=1.
-        references.insert(0, ReferenceInfo { dpb_slot: 1, order_hint: 1 });
-        while references.len() > max_refs { references.pop(); }
+        references.insert(
+            0,
+            ReferenceInfo {
+                dpb_slot: 1,
+                order_hint: 1,
+            },
+        );
+        while references.len() > max_refs {
+            references.pop();
+        }
         assert_eq!(references.len(), 1);
         assert_eq!(references[0].dpb_slot, 1);
         current_dpb_slot = find_free_slot(&references, dpb_slot_count);
         assert_eq!(current_dpb_slot, 0); // ping-pong between 0 and 1
 
         // Frame 2: slot 0 again.
-        references.insert(0, ReferenceInfo { dpb_slot: 0, order_hint: 2 });
-        while references.len() > max_refs { references.pop(); }
+        references.insert(
+            0,
+            ReferenceInfo {
+                dpb_slot: 0,
+                order_hint: 2,
+            },
+        );
+        while references.len() > max_refs {
+            references.pop();
+        }
         current_dpb_slot = find_free_slot(&references, dpb_slot_count);
         assert_eq!(current_dpb_slot, 1); // ping-pong back
     }

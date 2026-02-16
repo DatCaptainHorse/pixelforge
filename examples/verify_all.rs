@@ -1,6 +1,6 @@
 //! Example: Verify all encoding combinations
 //!
-//! Verifies H.264/H.265, 8-bit/10-bit, YUV420/YUV444 combinations.
+//! Verifies H.264/H.265/AV1, 8-bit/10-bit, YUV420/YUV444 combinations.
 //! Runs PSNR analysis for each combination.
 
 use pixelforge::{
@@ -39,6 +39,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         (Codec::H265, EncodeBitDepth::Eight, PixelFormat::Yuv444),
         (Codec::H265, EncodeBitDepth::Ten, PixelFormat::Yuv420),
         (Codec::H265, EncodeBitDepth::Ten, PixelFormat::Yuv444),
+        (Codec::AV1, EncodeBitDepth::Eight, PixelFormat::Yuv420),
+        (Codec::AV1, EncodeBitDepth::Eight, PixelFormat::Yuv444),
+        (Codec::AV1, EncodeBitDepth::Ten, PixelFormat::Yuv420),
+        (Codec::AV1, EncodeBitDepth::Ten, PixelFormat::Yuv444),
     ];
 
     let context = VideoContextBuilder::new()
@@ -109,7 +113,7 @@ fn run_test(
         let config = match codec {
             Codec::H264 => EncodeConfig::h264(WIDTH, HEIGHT),
             Codec::H265 => EncodeConfig::h265(WIDTH, HEIGHT),
-            _ => return Err("Unsupported codec".into()),
+            Codec::AV1 => EncodeConfig::av1(WIDTH, HEIGHT),
         }
         .with_rate_control(RateControlMode::Cqp)
         .with_quality_level(10)
