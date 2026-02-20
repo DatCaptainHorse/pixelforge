@@ -13,8 +13,8 @@ use std::path::Path;
 use std::process::Command;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, Layer};
 
-const WIDTH: u32 = 320;
-const HEIGHT: u32 = 240;
+const WIDTH: u32 = 480;
+const HEIGHT: u32 = 320;
 const FRAMES: u32 = 30;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -105,7 +105,10 @@ fn run_test(
     depth: EncodeBitDepth,
     format: PixelFormat,
 ) -> Result<f64, Box<dyn std::error::Error>> {
-    let output_filename = format!("output_{:?}_{:?}_{:?}.bin", codec, depth, format);
+    // AV1 uses .obu extension for raw OBU streams (with temporal delimiters).
+    // H.264/H.265 use .bin for raw Annex B bitstreams.
+    let output_ext = if codec == Codec::AV1 { "obu" } else { "bin" };
+    let output_filename = format!("output_{:?}_{:?}_{:?}.{}", codec, depth, format, output_ext);
     let decoded_filename = format!("decoded_{:?}_{:?}_{:?}.yuv", codec, depth, format);
 
     // 1. Encode
@@ -153,31 +156,20 @@ fn run_test(
             }
             let frame = &yuv_data[start..end];
 
+            // Upload directly to encoder's input image to avoid cross-queue
+            // copy issues (InputImage uses the transfer queue, encoder uses the
+            // video encode queue which doesn't support transfer ops).
+            let encoder_image = encoder.input_image();
             match format {
-                PixelFormat::Yuv420 => input_image.upload_yuv420(frame)?,
-                PixelFormat::Yuv444 => {
-                    // Bypass InputImage's internal image and upload directly to encoder's image
-                    // to avoid potential issues with vkCmdCopyImage between images.
-                    let encoder_image = encoder.input_image();
-                    input_image.upload_yuv444_to(encoder_image, frame)?;
-                }
+                PixelFormat::Yuv420 => input_image.upload_yuv420_to(encoder_image, frame)?,
+                PixelFormat::Yuv444 => input_image.upload_yuv444_to(encoder_image, frame)?,
                 _ => return Err("Unsupported format".into()),
             }
 
-            // For YUV444, we uploaded directly to encoder image.
-            // For YUV420, we uploaded to input_image.image().
-            let src_image = match format {
-                PixelFormat::Yuv420 => input_image.image(),
-                PixelFormat::Yuv444 => encoder.input_image(),
-                _ => return Err("Unsupported format".into()),
-            };
-
-            for packet in encoder.encode(src_image)? {
+            for packet in encoder.encode(encoder_image)? {
                 output_file.write_all(&packet.data)?;
             }
         }
-        // Flush? The encoder doesn't seem to have a flush method in the example,
-        // but usually we just stop feeding frames.
     }
 
     // 2. Decode to raw YUV

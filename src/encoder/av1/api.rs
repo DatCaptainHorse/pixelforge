@@ -73,6 +73,11 @@ impl AV1Encoder {
 
         let mut encoded_data = Vec::new();
 
+        // AV1 Temporal Delimiter OBU: type=2, has_size=1, size=0.
+        // Required as the first OBU in each temporal unit for conformant bitstreams.
+        // This enables ffmpeg's AV1 demuxer to detect frame boundaries in raw OBU streams.
+        encoded_data.extend_from_slice(&[0x12, 0x00]);
+
         // For key frames, prepend the AV1 Sequence Header OBU.
         // This is required for AV1 decoders to initialize (equivalent to H.265 VPS/SPS/PPS).
         if is_key_frame {
@@ -142,9 +147,10 @@ impl AV1Encoder {
     }
 
     /// Retrieve encoded AV1 Sequence Header OBU from video session parameters.
-    /// This uses vkGetEncodedVideoSessionParametersKHR to get the OBU data.
-    /// For AV1, no codec-specific pNext extension is needed (unlike H.265 which
-    /// requires VideoEncodeH265SessionParametersGetInfoKHR).
+    ///
+    /// Uses vkGetEncodedVideoSessionParametersKHR to get the driver-generated OBU.
+    /// The driver's sequence header must be used because the frame OBUs it produces
+    /// reference values from its internal sequence header (not ours).
     fn get_av1_sequence_header(&self) -> Result<Vec<u8>> {
         let get_info = vk::VideoEncodeSessionParametersGetInfoKHR {
             video_session_parameters: self.session_params,

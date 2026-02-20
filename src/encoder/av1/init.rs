@@ -44,11 +44,11 @@ impl AV1Encoder {
         let luma_bit_depth: vk::VideoComponentBitDepthFlagsKHR = config.bit_depth.into();
         let chroma_bit_depth: vk::VideoComponentBitDepthFlagsKHR = config.bit_depth.into();
 
-        // AV1 profile: Main profile for 8-bit 4:2:0, High profile for 10-bit or 4:4:4
-        let profile = match (config.bit_depth, config.pixel_format) {
-            (crate::encoder::BitDepth::Eight, PixelFormat::Yuv420) => {
-                ash::vk::native::StdVideoAV1Profile_STD_VIDEO_AV1_PROFILE_MAIN
-            }
+        // AV1 profile selection based on chroma subsampling (not bit depth).
+        // Main profile: 8/10-bit, 4:2:0 only.
+        // High profile: 8/10-bit, 4:2:0 and 4:4:4.
+        let profile = match config.pixel_format {
+            PixelFormat::Yuv420 => ash::vk::native::StdVideoAV1Profile_STD_VIDEO_AV1_PROFILE_MAIN,
             _ => ash::vk::native::StdVideoAV1Profile_STD_VIDEO_AV1_PROFILE_HIGH,
         };
 

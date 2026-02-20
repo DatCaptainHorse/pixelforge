@@ -87,11 +87,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for i in 0..num_frames {
         let frame = &yuv_data[i * frame_size..(i + 1) * frame_size];
 
-        // Upload YUV420 data to the input image.
-        input_image.upload_yuv420(frame)?;
+        // Upload directly to encoder's input image to avoid cross-queue
+        // copy issues (InputImage uses the transfer queue, encoder uses the
+        // video encode queue which doesn't support transfer ops).
+        let encoder_image = encoder.input_image();
+        input_image.upload_yuv420_to(encoder_image, frame)?;
 
         // Encode the image.
-        for packet in encoder.encode(input_image.image())? {
+        for packet in encoder.encode(encoder_image)? {
             total_bytes += packet.data.len();
             output.write_all(&packet.data)?;
             println!(

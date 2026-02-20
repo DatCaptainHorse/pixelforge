@@ -280,7 +280,9 @@ impl AV1Encoder {
                 let ref_idx = [ref_info.dpb_slot as i8; 7];
                 let mut order_hints = [0u8; 8];
                 order_hints[ref_info.dpb_slot as usize] = ref_info.order_hint as u8;
-                (ref_idx, order_hints, ref_info.dpb_slot)
+                // primary_ref_frame is a reference NAME index (0=LAST_FRAME), not a DPB slot.
+                // We use SINGLE_REFERENCE with LAST_FRAME, so always 0.
+                (ref_idx, order_hints, 0u8)
             } else {
                 ([0i8; 7], [0u8; 8], 7u8) // 7 = PRIMARY_REF_NONE for key frames
             };

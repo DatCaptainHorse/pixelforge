@@ -48,53 +48,13 @@ impl InputImage {
     /// * `pixel_format` - Pixel format (YUV420 or YUV444)
     pub fn new(
         context: VideoContext,
-        codec: Codec,
+        _codec: Codec,
         width: u32,
         height: u32,
         bit_depth: BitDepth,
         pixel_format: PixelFormat,
     ) -> Result<Self> {
         let device = context.device();
-
-        // Determine H.264 profile IDC based on pixel format.
-        let h264_profile_idc = if pixel_format == PixelFormat::Yuv444 {
-            ash::vk::native::StdVideoH264ProfileIdc_STD_VIDEO_H264_PROFILE_IDC_HIGH_444_PREDICTIVE
-        } else {
-            ash::vk::native::StdVideoH264ProfileIdc_STD_VIDEO_H264_PROFILE_IDC_HIGH
-        };
-
-        // Create video profile info for the image creation.
-        let mut h264_profile =
-            vk::VideoEncodeH264ProfileInfoKHR::default().std_profile_idc(h264_profile_idc);
-        let mut h265_profile = vk::VideoEncodeH265ProfileInfoKHR::default().std_profile_idc(
-            ash::vk::native::StdVideoH265ProfileIdc_STD_VIDEO_H265_PROFILE_IDC_MAIN,
-        );
-
-        let mut profile_info = vk::VideoProfileInfoKHR::default()
-            .chroma_subsampling(pixel_format.into())
-            .luma_bit_depth(bit_depth.into())
-            .chroma_bit_depth(bit_depth.into());
-
-        match codec {
-            Codec::H264 => {
-                profile_info = profile_info
-                    .video_codec_operation(vk::VideoCodecOperationFlagsKHR::ENCODE_H264);
-                profile_info.p_next = &mut h264_profile as *mut _ as *mut std::ffi::c_void;
-            }
-            Codec::H265 => {
-                profile_info = profile_info
-                    .video_codec_operation(vk::VideoCodecOperationFlagsKHR::ENCODE_H265);
-                profile_info.p_next = &mut h265_profile as *mut _ as *mut std::ffi::c_void;
-            }
-            _ => {
-                return Err(PixelForgeError::InvalidInput(
-                    "Unsupported codec".to_string(),
-                ))
-            }
-        }
-
-        let mut profile_list =
-            vk::VideoProfileListInfoKHR::default().profiles(std::slice::from_ref(&profile_info));
 
         // Select format based on pixel format and bit depth.
         // Use 2-plane semi-planar formats for both YUV420 and YUV444.
@@ -115,22 +75,10 @@ impl InputImage {
             }
         };
 
-        // Determine sharing mode and queue families.
-        let mut queue_families = vec![context.transfer_queue_family()];
-        if let Some(encode_family) = context.video_encode_queue_family() {
-            if encode_family != context.transfer_queue_family() {
-                queue_families.push(encode_family);
-            }
-        }
-
-        let sharing_mode = if queue_families.len() > 1 {
-            vk::SharingMode::CONCURRENT
-        } else {
-            vk::SharingMode::EXCLUSIVE
-        };
-
         // Create the image.
-        let mut image_create_info = vk::ImageCreateInfo::default()
+        // This image is used purely for staging (buffer→image copy on the transfer queue),
+        // so it only needs TRANSFER_DST | TRANSFER_SRC and no video profile pNext.
+        let image_create_info = vk::ImageCreateInfo::default()
             .image_type(vk::ImageType::TYPE_2D)
             .format(format)
             .extent(vk::Extent3D {
@@ -142,17 +90,9 @@ impl InputImage {
             .array_layers(1)
             .samples(vk::SampleCountFlags::TYPE_1)
             .tiling(vk::ImageTiling::OPTIMAL)
-            .usage(
-                vk::ImageUsageFlags::TRANSFER_DST
-                    | vk::ImageUsageFlags::TRANSFER_SRC
-                    | vk::ImageUsageFlags::SAMPLED
-                    | vk::ImageUsageFlags::VIDEO_ENCODE_SRC_KHR,
-            )
-            .sharing_mode(sharing_mode)
-            .queue_family_indices(&queue_families)
+            .usage(vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::TRANSFER_SRC)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
             .initial_layout(vk::ImageLayout::UNDEFINED);
-
-        image_create_info.p_next = &mut profile_list as *mut _ as *mut std::ffi::c_void;
 
         let image = unsafe { device.create_image(&image_create_info, None) }
             .map_err(|e| PixelForgeError::ResourceCreation(format!("image creation: {}", e)))?;
@@ -464,6 +404,83 @@ impl InputImage {
 
         // Record and submit copy commands.
         self.copy_staging_to_image()?;
+
+        Ok(())
+    }
+
+    /// Upload YUV420 (I420) data to an external image.
+    ///
+    /// Same as `upload_yuv420()` but copies the data to the specified target image
+    /// instead of this InputImage's own image. Useful for uploading directly to an
+    /// encoder's input image to avoid cross-queue copy issues.
+    pub fn upload_yuv420_to(&mut self, target_image: vk::Image, yuv_data: &[u8]) -> Result<()> {
+        if self.pixel_format != PixelFormat::Yuv420 {
+            return Err(PixelForgeError::InvalidInput(
+                "upload_yuv420_to can only be used with YUV420 InputImage".to_string(),
+            ));
+        }
+
+        let expected_size = (self.width * self.height * 3 / 2) as usize;
+        if yuv_data.len() < expected_size {
+            return Err(PixelForgeError::InvalidInput(format!(
+                "YUV data too small: expected {} bytes, got {}",
+                expected_size,
+                yuv_data.len()
+            )));
+        }
+
+        let device = self.context.device();
+        let width = self.width as usize;
+        let height = self.height as usize;
+        let y_size = width * height;
+
+        // Map staging buffer and convert I420 to NV12/P010.
+        let data_ptr = unsafe {
+            device.map_memory(
+                self.staging_memory,
+                0,
+                self.staging_size as vk::DeviceSize,
+                vk::MemoryMapFlags::empty(),
+            )
+        }
+        .map_err(|e| PixelForgeError::MemoryAllocation(e.to_string()))?;
+
+        unsafe {
+            match self.bit_depth {
+                BitDepth::Eight => {
+                    let dst =
+                        std::slice::from_raw_parts_mut(data_ptr as *mut u8, self.staging_size);
+                    dst[..y_size].copy_from_slice(&yuv_data[..y_size]);
+                    let u_plane = &yuv_data[y_size..y_size + y_size / 4];
+                    let v_plane = &yuv_data[y_size + y_size / 4..];
+                    for i in 0..y_size / 4 {
+                        dst[y_size + i * 2] = u_plane[i];
+                        dst[y_size + i * 2 + 1] = v_plane[i];
+                    }
+                }
+                BitDepth::Ten => {
+                    let dst =
+                        std::slice::from_raw_parts_mut(data_ptr as *mut u16, self.staging_size / 2);
+                    for i in 0..y_size {
+                        let val = yuv_data[i] as u16;
+                        dst[i] = val << 8;
+                    }
+                    let u_plane = &yuv_data[y_size..y_size + y_size / 4];
+                    let v_plane = &yuv_data[y_size + y_size / 4..];
+                    for i in 0..y_size / 4 {
+                        let u_val = u_plane[i] as u16;
+                        let v_val = v_plane[i] as u16;
+                        dst[y_size + i * 2] = u_val << 8;
+                        dst[y_size + i * 2 + 1] = v_val << 8;
+                    }
+                }
+            }
+
+            device.unmap_memory(self.staging_memory);
+        }
+
+        // Record and submit copy commands to the target image.
+        self.copy_staging_to_image_internal(target_image)?;
 
         Ok(())
     }
