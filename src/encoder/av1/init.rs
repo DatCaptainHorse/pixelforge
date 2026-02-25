@@ -2,9 +2,9 @@ use super::{AV1Encoder, MIN_BITSTREAM_BUFFER_SIZE, SUPERBLOCK_SIZE};
 
 use crate::encoder::gop::GopStructure;
 use crate::encoder::resources::{
-    allocate_session_memory, create_bitstream_buffer, create_command_resources, create_dpb_images,
-    create_image, get_video_format, make_codec_name, map_bitstream_buffer,
-    query_supported_video_formats,
+    allocate_session_memory, clear_input_image, create_bitstream_buffer, create_command_resources,
+    create_dpb_images, create_image, get_video_format, make_codec_name, map_bitstream_buffer,
+    query_supported_video_formats, ClearImageParams,
 };
 use crate::encoder::PixelFormat;
 use crate::error::{PixelForgeError, Result};
@@ -440,6 +440,7 @@ impl AV1Encoder {
             reference_picture_format,
             requested_dpb_slots,
             &profile_info,
+            false,
         )?;
 
         // Create bitstream buffer.
@@ -453,12 +454,29 @@ impl AV1Encoder {
             map_bitstream_buffer(&context, bitstream_buffer_memory, bitstream_buffer_size)?;
 
         // Create command resources.
-        let cmd_resources = create_command_resources(&context, encode_queue_family)?;
+        let upload_queue_family = context.transfer_queue_family();
+        let cmd_resources = create_command_resources(&context, encode_queue_family, upload_queue_family)?;
         let command_pool = cmd_resources.command_pool;
         let upload_command_buffer = cmd_resources.upload_command_buffer;
         let upload_fence = cmd_resources.upload_fence;
         let encode_command_buffer = cmd_resources.encode_command_buffer;
         let encode_fence = cmd_resources.encode_fence;
+
+        // Clear the input image so padding between user dimensions and the
+        // aligned coded extent is zero-initialized.
+        clear_input_image(
+            &context,
+            &ClearImageParams {
+                command_buffer: upload_command_buffer,
+                fence: upload_fence,
+                queue: context.transfer_queue(),
+                image: input_image,
+                width: aligned_width,
+                height: aligned_height,
+                pixel_format: config.pixel_format,
+                bit_depth: config.bit_depth,
+            },
+        )?;
 
         // Create query pool for bitstream size queries.
         // Need 1 query to capture bitstream offset and size.
@@ -511,6 +529,7 @@ impl AV1Encoder {
             bitstream_buffer_memory,
             bitstream_buffer_ptr,
             command_pool,
+            upload_command_pool: cmd_resources.upload_command_pool,
             upload_command_buffer,
             upload_fence,
             encode_command_buffer,

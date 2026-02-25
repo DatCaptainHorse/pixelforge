@@ -66,6 +66,7 @@ pub struct AV1Encoder {
 
     // Command resources.
     command_pool: vk::CommandPool,
+    upload_command_pool: vk::CommandPool,
     upload_command_buffer: vk::CommandBuffer,
     upload_fence: vk::Fence,
     encode_command_buffer: vk::CommandBuffer,
@@ -106,6 +107,7 @@ impl AV1Encoder {
             height: self.config.dimensions.height,
             pixel_format: self.config.pixel_format,
             input_image_layout: self.input_image_layout,
+            upload_queue: self.context.transfer_queue(),
         };
 
         upload_image_to_input(&self.context, &params)?;
@@ -459,6 +461,11 @@ impl Drop for AV1Encoder {
             self.context
                 .device()
                 .destroy_command_pool(self.command_pool, None);
+            if self.upload_command_pool != self.command_pool {
+                self.context
+                    .device()
+                    .destroy_command_pool(self.upload_command_pool, None);
+            }
             self.context
                 .device()
                 .destroy_buffer(self.bitstream_buffer, None);

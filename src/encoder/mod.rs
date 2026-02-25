@@ -253,6 +253,8 @@ impl EncodeConfig {
             gop_size: DEFAULT_GOP_SIZE,
             b_frame_count: 0, // Start without B-frames for simplicity.
             max_reference_frames: DEFAULT_MAX_REFERENCE_FRAMES,
+            virtual_buffer_size_ms: 1000,
+            initial_virtual_buffer_size_ms: 1000,
         }
     }
 

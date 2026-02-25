@@ -13,8 +13,8 @@ use std::path::Path;
 use std::process::Command;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, Layer};
 
-const WIDTH: u32 = 480;
-const HEIGHT: u32 = 320;
+const WIDTH: u32 = 320;
+const HEIGHT: u32 = 240;
 const FRAMES: u32 = 30;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
