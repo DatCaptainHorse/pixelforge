@@ -285,13 +285,46 @@ impl VideoContext {
             // Check codec support for encoding.
             let mut encode_codecs = Vec::new();
             if let Some(eq) = encode_queue {
-                if Self::check_h264_encode_support(&entry, &instance, physical_device, eq) {
+                // Get list of available device extensions
+                let available_extensions = match unsafe {
+                    instance.enumerate_device_extension_properties(physical_device)
+                } {
+                    Ok(exts) => exts,
+                    Err(e) => {
+                        warn!(
+                            "Failed to enumerate device extension properties for {}: {}. Skipping device.",
+                            device_name, e
+                        );
+                        continue;
+                    }
+                };
+
+                let has_extension = |name: &std::ffi::CStr| -> bool {
+                    available_extensions.iter().any(|ext| {
+                        let ext_name =
+                            unsafe { std::ffi::CStr::from_ptr(ext.extension_name.as_ptr()) };
+                        ext_name == name
+                    })
+                };
+
+                // Only check codec support if the extension exists
+                if has_extension(ash::khr::video_encode_h264::NAME)
+                    && Self::check_h264_encode_support(&entry, &instance, physical_device, eq)
+                {
                     encode_codecs.push(Codec::H264);
                     debug!("Device {} supports H.264 encode", device_name);
                 }
-                if Self::check_h265_encode_support(&entry, &instance, physical_device, eq) {
+                if has_extension(ash::khr::video_encode_h265::NAME)
+                    && Self::check_h265_encode_support(&entry, &instance, physical_device, eq)
+                {
                     encode_codecs.push(Codec::H265);
                     debug!("Device {} supports H.265 encode", device_name);
+                }
+                if has_extension(ash::khr::video_encode_av1::NAME)
+                    && Self::check_av1_encode_support(&entry, &instance, physical_device, eq)
+                {
+                    encode_codecs.push(Codec::AV1);
+                    debug!("Device {} supports AV1 encode", device_name);
                 }
             }
 
@@ -384,6 +417,9 @@ impl VideoContext {
             if supported_encode_codecs.contains(&Codec::H265) {
                 push_ext(ash::khr::video_encode_h265::NAME.as_ptr());
             }
+            if supported_encode_codecs.contains(&Codec::AV1) {
+                push_ext(ash::khr::video_encode_av1::NAME.as_ptr());
+            }
         }
 
         // Enable synchronization2 feature.
@@ -402,12 +438,31 @@ impl VideoContext {
         // Add the 2-plane 444 formats extension.
         push_ext(ash::ext::ycbcr_2plane_444_formats::NAME.as_ptr());
 
-        // Manually chain p_next pointers: sync2_features -> ycbcr_features -> ycbcr_2plane_444_features.
+        // Enable AV1 video encode feature only if AV1 is supported.
+        // Only include AV1 features in the pNext chain when AV1 is actually supported,
+        // to avoid chaining unknown feature structs on devices without AV1.
+        let mut av1_encode_features =
+            vk::PhysicalDeviceVideoEncodeAV1FeaturesKHR::default().video_encode_av1(true);
+
+        if supported_encode_codecs.contains(&Codec::AV1) {
+            ycbcr_2plane_444_features.p_next = (&mut av1_encode_features
+                as *mut vk::PhysicalDeviceVideoEncodeAV1FeaturesKHR)
+                .cast();
+        }
+
+        // Chain: sync2_features -> ycbcr_features -> ycbcr_2plane_444_features (-> av1 if supported)
         ycbcr_features.p_next = (&mut ycbcr_2plane_444_features
             as *mut vk::PhysicalDeviceYcbcr2Plane444FormatsFeaturesEXT)
             .cast();
         sync2_features.p_next =
             (&mut ycbcr_features as *mut vk::PhysicalDeviceSamplerYcbcrConversionFeatures).cast();
+
+        // Log all extensions being enabled
+        debug!("Enabling {} device extensions:", extension_names.len());
+        for ext_name_ptr in &extension_names {
+            let ext_name = unsafe { std::ffi::CStr::from_ptr(*ext_name_ptr) };
+            debug!("  - {}", ext_name.to_string_lossy());
+        }
 
         let mut device_create_info = vk::DeviceCreateInfo::default()
             .queue_create_infos(&queue_create_infos)
@@ -573,6 +628,68 @@ impl VideoContext {
             }
             err => {
                 warn!("Failed to query H.265 encode capabilities: {:?}", err);
+                false
+            }
+        }
+    }
+
+    fn check_av1_encode_support(
+        entry: &ash::Entry,
+        instance: &ash::Instance,
+        physical_device: vk::PhysicalDevice,
+        _queue_family: u32,
+    ) -> bool {
+        // Create video queue instance extension.
+        let video_queue = ash::khr::video_queue::Instance::load(entry, instance);
+
+        // Create AV1 encode profile info (must stay alive during the call)
+        let mut av1_profile = vk::VideoEncodeAV1ProfileInfoKHR::default()
+            .std_profile(ash::vk::native::StdVideoAV1Profile_STD_VIDEO_AV1_PROFILE_MAIN);
+
+        // Create video profile info for AV1 encode with typical 8-bit 4:2:0.
+        let mut profile_info = vk::VideoProfileInfoKHR::default()
+            .video_codec_operation(vk::VideoCodecOperationFlagsKHR::ENCODE_AV1)
+            .chroma_subsampling(vk::VideoChromaSubsamplingFlagsKHR::TYPE_420)
+            .luma_bit_depth(vk::VideoComponentBitDepthFlagsKHR::TYPE_8)
+            .chroma_bit_depth(vk::VideoComponentBitDepthFlagsKHR::TYPE_8);
+
+        // Chain the codec-specific profile into profile_info.
+        profile_info.p_next = (&mut av1_profile as *mut vk::VideoEncodeAV1ProfileInfoKHR).cast();
+
+        // Create capabilities structures.
+        let mut encode_capabilities = vk::VideoEncodeCapabilitiesKHR::default();
+        let mut av1_capabilities = vk::VideoEncodeAV1CapabilitiesKHR::default();
+        encode_capabilities.p_next =
+            &mut av1_capabilities as *mut vk::VideoEncodeAV1CapabilitiesKHR as *mut _;
+        let mut capabilities = vk::VideoCapabilitiesKHR::default();
+        capabilities.p_next =
+            &mut encode_capabilities as *mut vk::VideoEncodeCapabilitiesKHR as *mut _;
+
+        // Query capabilities.
+        let result = unsafe {
+            (video_queue.fp().get_physical_device_video_capabilities_khr)(
+                physical_device,
+                &profile_info,
+                &mut capabilities,
+            )
+        };
+
+        match result {
+            vk::Result::SUCCESS => {
+                debug!(
+                    "AV1 encode supported: max {}x{}, {} DPB slots",
+                    capabilities.max_coded_extent.width,
+                    capabilities.max_coded_extent.height,
+                    capabilities.max_dpb_slots
+                );
+                true
+            }
+            vk::Result::ERROR_VIDEO_PROFILE_CODEC_NOT_SUPPORTED_KHR => {
+                debug!("AV1 encode not supported on this device");
+                false
+            }
+            err => {
+                warn!("Failed to query AV1 encode capabilities: {:?}", err);
                 false
             }
         }

@@ -1,6 +1,6 @@
 //! # PixelForge
 //!
-//! A Vulkan-based video encoding library for Rust, supporting H.264 and H.265 codecs.
+//! A Vulkan-based video encoding library for Rust, supporting H.264, H.265, and AV1 codecs.
 //!
 //! > ⚠️ **Disclaimer**: This library was developed using AI ("vibe-coding") - partly to
 //! > see if it could be done, partly because I have practically zero experience with Vulkan.
@@ -10,7 +10,7 @@
 //! ## Features
 //!
 //! - **Hardware-accelerated** video encoding using Vulkan Video extensions.
-//! - **Multiple codec support**: H.264/AVC, H.265/HEVC.
+//! - **Multiple codec support**: H.264/AVC, H.265/HEVC, AV1.
 //! - **GPU-native API**: Encode directly from Vulkan images (`vk::Image`).
 //! - **Flexible configuration**: Rate control (CBR, VBR, CQP), quality levels, GOP settings.
 //! - **Utility helpers**: [`InputImage`] for easy YUV data upload to GPU.
@@ -24,6 +24,12 @@
 //! |-------|--------|
 //! | H.264/AVC | ✓ |
 //! | H.265/HEVC | ✓ |
+//! | AV1 | ✓ (experimental) |
+//!
+//! > ⚠️ **AV1 Warning**: AV1 encoding is experimental. On NVIDIA GPUs, P-frames cannot
+//! > reference other P-frames, causing all P-frames to reference the I-frame instead. This
+//! > leads to progressively larger frame sizes over time. Consider using H.264 or HEVC
+//! > until this is resolved.
 //!
 //! ## Requirements
 //!
@@ -63,7 +69,7 @@
 //!         .app_name("My App")
 //!         .build()?;
 //!
-//!     for codec in [Codec::H264, Codec::H265] {
+//!     for codec in [Codec::H264, Codec::H265, Codec::AV1] {
 //!         println!("{:?}: encode={}",
 //!             codec,
 //!             context.supports_encode(codec)
@@ -126,13 +132,15 @@
 //!
 //! # H.265 encoding example
 //! cargo run --example encode_h265
+//!
+//! # AV1 encoding example
+//! cargo run --example encode_av1
 //! ```
 //!
 //! ## TODO's
 //!
 //! 1. [] Decoding.
 //! 1. [] B-frames support.
-//! 1. [] AV1 support (depends on a new version of ash with more up-to-date Vulkan support).
 //!
 //! ## Contributing
 //!

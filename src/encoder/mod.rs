@@ -5,6 +5,7 @@
 //! - GOP structure management (`gop` module) - reusable for H.264/H.265.
 //! - Frame reordering for B-frame support (`reorder` module) - reusable for H.264/H.265.
 
+pub mod av1;
 pub mod bitwriter;
 pub mod dpb;
 pub mod gop;
@@ -38,7 +39,7 @@ pub const DEFAULT_H265_QP: u32 = 28;
 /// Default maximum number of reference frames.
 pub const DEFAULT_MAX_REFERENCE_FRAMES: u32 = 4;
 
-use crate::error::{PixelForgeError, Result};
+use crate::error::Result;
 use crate::vulkan::VideoContext;
 
 /// Video codec types.
@@ -233,6 +234,30 @@ impl EncodeConfig {
         }
     }
 
+    /// Create a new AV1 encode configuration with default settings.
+    pub fn av1(width: u32, height: u32) -> Self {
+        assert!(width > 0, "width must be non-zero");
+        assert!(height > 0, "height must be non-zero");
+
+        Self {
+            codec: Codec::AV1,
+            dimensions: Dimensions { width, height },
+            pixel_format: PixelFormat::Yuv420,
+            bit_depth: BitDepth::Eight,
+            rate_control_mode: RateControlMode::Disabled,
+            target_bitrate: DEFAULT_TARGET_BITRATE,
+            max_bitrate: DEFAULT_MAX_BITRATE,
+            quality_level: 128, // AV1 uses 0-255 QP range
+            frame_rate_numerator: DEFAULT_FRAME_RATE,
+            frame_rate_denominator: 1,
+            gop_size: DEFAULT_GOP_SIZE,
+            b_frame_count: 0, // Start without B-frames for simplicity.
+            max_reference_frames: DEFAULT_MAX_REFERENCE_FRAMES,
+            virtual_buffer_size_ms: 1000,
+            initial_virtual_buffer_size_ms: 1000,
+        }
+    }
+
     /// Set the rate control mode.
     pub fn with_rate_control(mut self, mode: RateControlMode) -> Self {
         self.rate_control_mode = mode;
@@ -336,6 +361,8 @@ pub enum Encoder {
     H264(self::h264::H264Encoder),
     /// H.265/HEVC encoder.
     H265(self::h265::H265Encoder),
+    /// AV1 encoder.
+    AV1(self::av1::AV1Encoder),
 }
 
 impl Encoder {
@@ -347,6 +374,7 @@ impl Encoder {
         match self {
             Encoder::H264(encoder) => encoder.input_image(),
             Encoder::H265(encoder) => encoder.input_image(),
+            Encoder::AV1(encoder) => encoder.input_image(),
         }
     }
 
@@ -359,9 +387,7 @@ impl Encoder {
             Codec::H265 => Ok(Encoder::H265(self::h265::H265Encoder::new(
                 context, config,
             )?)),
-            Codec::AV1 => Err(PixelForgeError::CodecNotSupported(
-                "AV1 encoding not yet implemented".to_string(),
-            )),
+            Codec::AV1 => Ok(Encoder::AV1(self::av1::AV1Encoder::new(context, config)?)),
         }
     }
 
@@ -399,6 +425,7 @@ impl Encoder {
         match self {
             Encoder::H264(encoder) => encoder.encode(src_image),
             Encoder::H265(encoder) => encoder.encode(src_image),
+            Encoder::AV1(encoder) => encoder.encode(src_image),
         }
     }
 
@@ -407,6 +434,7 @@ impl Encoder {
         match self {
             Encoder::H264(encoder) => encoder.flush(),
             Encoder::H265(encoder) => encoder.flush(),
+            Encoder::AV1(encoder) => encoder.flush(),
         }
     }
 
@@ -415,6 +443,7 @@ impl Encoder {
         match self {
             Encoder::H264(encoder) => encoder.request_idr(),
             Encoder::H265(encoder) => encoder.request_idr(),
+            Encoder::AV1(encoder) => encoder.request_idr(),
         }
     }
 }
@@ -614,6 +643,44 @@ mod tests {
             let config = EncodeConfig::h264(1920, 1080).with_max_bitrate(12_000_000);
 
             assert_eq!(config.max_bitrate, 12_000_000);
+        }
+
+        #[test]
+        fn test_av1_defaults() {
+            let config = EncodeConfig::av1(2560, 1440);
+
+            assert_eq!(config.codec, Codec::AV1);
+            assert_eq!(config.dimensions.width, 2560);
+            assert_eq!(config.dimensions.height, 1440);
+            assert_eq!(config.pixel_format, PixelFormat::Yuv420);
+            assert_eq!(config.bit_depth, BitDepth::Eight);
+            assert_eq!(config.rate_control_mode, RateControlMode::Disabled);
+            assert_eq!(config.quality_level, 128); // AV1 uses 0-255 QP range
+            assert_eq!(config.gop_size, 30);
+            assert_eq!(config.b_frame_count, 0);
+            assert_eq!(config.frame_rate_numerator, 30);
+            assert_eq!(config.frame_rate_denominator, 1);
+        }
+
+        #[test]
+        fn test_av1_builder_chaining() {
+            let config = EncodeConfig::av1(1920, 1080)
+                .with_rate_control(RateControlMode::Vbr)
+                .with_target_bitrate(8_000_000)
+                .with_max_bitrate(12_000_000)
+                .with_gop_size(60)
+                .with_frame_rate(60, 1)
+                .with_quality_level(100)
+                .with_max_reference_frames(2);
+
+            assert_eq!(config.codec, Codec::AV1);
+            assert_eq!(config.rate_control_mode, RateControlMode::Vbr);
+            assert_eq!(config.target_bitrate, 8_000_000);
+            assert_eq!(config.max_bitrate, 12_000_000);
+            assert_eq!(config.gop_size, 60);
+            assert_eq!(config.frame_rate_numerator, 60);
+            assert_eq!(config.quality_level, 100);
+            assert_eq!(config.max_reference_frames, 2);
         }
 
         #[test]

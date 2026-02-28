@@ -5,7 +5,10 @@
 use super::H265Encoder;
 
 use crate::encoder::gop::{GopFrameType, GopPosition};
-use crate::encoder::resources::{record_dpb_barriers, MIN_BITSTREAM_BUFFER_SIZE};
+use crate::encoder::resources::{
+    prepare_encode_command_buffer, record_dpb_barriers, record_post_encode_dpb_barrier,
+    submit_encode_and_read_bitstream, MIN_BITSTREAM_BUFFER_SIZE,
+};
 use crate::error::{PixelForgeError, Result};
 use ash::vk;
 use tracing::debug;
@@ -24,34 +27,13 @@ impl H265Encoder {
         pic_order_cnt: i32,
         is_idr: bool,
     ) -> Result<Vec<u8>> {
-        // Reset command buffer.
+        // Prepare command buffer for recording.
         unsafe {
-            self.context.device().reset_command_buffer(
-                self.encode_command_buffer,
-                vk::CommandBufferResetFlags::empty(),
-            )
-        }
-        .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
-
-        // Begin command buffer.
-        let begin_info = vk::CommandBufferBeginInfo::default()
-            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
-
-        unsafe {
-            self.context
-                .device()
-                .begin_command_buffer(self.encode_command_buffer, &begin_info)
-        }
-        .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
-
-        // Reset query pool before beginning queries (required by validation layers)
-        unsafe {
-            self.context.device().cmd_reset_query_pool(
+            prepare_encode_command_buffer(
+                self.context.device(),
                 self.encode_command_buffer,
                 self.query_pool,
-                0,
-                1,
-            );
+            )?;
         }
 
         // Transition DPB images for encode.
@@ -649,45 +631,14 @@ impl H265Encoder {
         }
 
         // Add DPB synchronization barrier after encoding.
-        {
-            let post_dpb_image = if self.use_layered_dpb {
-                self.dpb_images[0]
-            } else {
-                self.dpb_images[self.current_dpb_slot as usize]
-            };
-            let post_dpb_layer = if self.use_layered_dpb {
-                self.current_dpb_slot as u32
-            } else {
-                0
-            };
-
-            let dpb_sync_barrier = vk::ImageMemoryBarrier::default()
-                .old_layout(vk::ImageLayout::VIDEO_ENCODE_DPB_KHR)
-                .new_layout(vk::ImageLayout::VIDEO_ENCODE_DPB_KHR)
-                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .image(post_dpb_image)
-                .subresource_range(vk::ImageSubresourceRange {
-                    aspect_mask: vk::ImageAspectFlags::COLOR,
-                    base_mip_level: 0,
-                    level_count: 1,
-                    base_array_layer: post_dpb_layer,
-                    layer_count: 1,
-                })
-                .src_access_mask(vk::AccessFlags::MEMORY_WRITE)
-                .dst_access_mask(vk::AccessFlags::MEMORY_READ);
-
-            unsafe {
-                self.context.device().cmd_pipeline_barrier(
-                    self.encode_command_buffer,
-                    vk::PipelineStageFlags::ALL_COMMANDS,
-                    vk::PipelineStageFlags::ALL_COMMANDS,
-                    vk::DependencyFlags::empty(),
-                    &[],
-                    &[],
-                    &[dpb_sync_barrier],
-                );
-            }
+        unsafe {
+            record_post_encode_dpb_barrier(
+                self.context.device(),
+                self.encode_command_buffer,
+                &self.dpb_images,
+                self.use_layered_dpb,
+                self.current_dpb_slot,
+            );
         }
 
         // End video coding.
@@ -707,10 +658,7 @@ impl H265Encoder {
         }
         .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
 
-        // Submit encode command.
-        let submit_info = vk::SubmitInfo::default()
-            .command_buffers(std::slice::from_ref(&self.encode_command_buffer));
-
+        // Submit, wait, and read bitstream.
         let encode_queue = self.context.video_encode_queue().ok_or_else(|| {
             PixelForgeError::NoSuitableDevice("No video encode queue available".to_string())
         })?;
@@ -725,67 +673,21 @@ impl H265Encoder {
 
         let gpu_start = std::time::Instant::now();
 
-        unsafe {
-            self.context
-                .device()
-                .queue_submit(encode_queue, &[submit_info], self.encode_fence)
-        }
-        .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
-
-        // Wait for completion.
-        unsafe {
-            self.context
-                .device()
-                .wait_for_fences(&[self.encode_fence], true, u64::MAX)
-        }
-        .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
-
-        let gpu_elapsed = gpu_start.elapsed();
-        debug!("GPU encode took {:?}", gpu_elapsed);
-
-        unsafe { self.context.device().reset_fences(&[self.encode_fence]) }
-            .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
-
-        // Get query results.
-        #[repr(C)]
-        struct VideoEncodeFeedbackResult {
-            offset: u32,
-            bytes_written: u32,
-        }
-        let mut query_results = [VideoEncodeFeedbackResult {
-            offset: 0,
-            bytes_written: 0,
-        }];
-        unsafe {
-            self.context.device().get_query_pool_results(
+        let encoded_data = unsafe {
+            submit_encode_and_read_bitstream(
+                self.context.device(),
+                self.encode_command_buffer,
+                self.encode_fence,
+                encode_queue,
                 self.query_pool,
-                0,
-                &mut query_results,
-                vk::QueryResultFlags::WAIT,
-            )
-        }
-        .map_err(|e| PixelForgeError::QueryPool(e.to_string()))?;
+                self.bitstream_buffer_ptr,
+            )?
+        };
 
-        let offset = query_results[0].offset as usize;
-        let size = query_results[0].bytes_written as usize;
-
-        if size == 0 {
-            return Err(PixelForgeError::QueryPool(
-                "Encoder produced 0 bytes".to_string(),
-            ));
-        }
-
-        debug!("Encoded frame: offset={}, size={}", offset, size);
+        debug!("GPU encode took {:?}", gpu_start.elapsed());
 
         // Mark DPB slot as active.
         self.dpb_slot_active[self.current_dpb_slot as usize] = true;
-
-        // Copy data from bitstream buffer.
-        let mut encoded_data = vec![0u8; size];
-        unsafe {
-            let src = std::slice::from_raw_parts(self.bitstream_buffer_ptr.add(offset), size);
-            encoded_data.copy_from_slice(src);
-        }
 
         Ok(encoded_data)
     }

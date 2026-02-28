@@ -1,7 +1,7 @@
-//! Example: H.265/HEVC Video Encoding
+//! Example: AV1 Video Encoding
 //!
-//! Demonstrates H.265 video encoding using PixelForge with Vulkan Video.
-//! Loads raw YUV444 frames from `testdata/test_frames_yuv444.yuv`.
+//! Demonstrates AV1 video encoding using PixelForge with Vulkan Video.
+//! Loads raw YUV420 frames from `testdata/test_frames.yuv`.
 
 use pixelforge::{
     Codec, EncodeBitDepth, EncodeConfig, Encoder, InputImage, PixelFormat, RateControlMode,
@@ -17,7 +17,7 @@ const WIDTH: u32 = 320;
 const HEIGHT: u32 = 240;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Initialize tracing.
+    // Initialize tracing with RUST_LOG support.
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::fmt::layer().with_filter(
@@ -27,7 +27,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .init();
 
-    println!("PixelForge H.265 Encode Example\n");
+    println!("PixelForge AV1 Encode Example\n");
 
     // Load test frames.
     let test_path = Path::new(TEST_FRAMES_PATH);
@@ -40,7 +40,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut yuv_data = Vec::new();
     File::open(test_path)?.read_to_end(&mut yuv_data)?;
 
-    // YUV420: Y + U + V = 1.5 planes, each WIDTH * HEIGHT bytes
     let frame_size = (WIDTH * HEIGHT * 3 / 2) as usize;
     let num_frames = yuv_data.len() / frame_size;
     println!(
@@ -50,45 +49,40 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Create video context.
     let context = VideoContextBuilder::new()
-        .app_name("H265 Encode Example")
+        .app_name("AV1 Encode Example")
         .enable_validation(cfg!(debug_assertions))
-        .require_encode(Codec::H265)
+        .require_encode(Codec::AV1)
         .build()?;
 
-    if !context.supports_encode(Codec::H265) {
-        eprintln!("H.265 encode not supported");
+    if !context.supports_encode(Codec::AV1) {
+        eprintln!("AV1 encode not supported");
         return Ok(());
     }
 
     // Configure encoder.
-    let config = EncodeConfig::h265(WIDTH, HEIGHT)
+    let config = EncodeConfig::av1(WIDTH, HEIGHT)
         .with_rate_control(RateControlMode::Cqp)
         .with_quality_level(26)
         .with_frame_rate(30, 1)
         .with_gop_size(30)
-        .with_b_frames(0)
-        .with_pixel_format(PixelFormat::Yuv420);
+        .with_b_frames(0);
 
     println!(
-        "Config: {:?}, QP={}, GOP={}, B-frames={}, pixel_format={:?}\n",
-        config.rate_control_mode,
-        config.quality_level,
-        config.gop_size,
-        config.b_frame_count,
-        config.pixel_format
+        "Config: {:?}, QP={}, GOP={}, B-frames={}\n",
+        config.rate_control_mode, config.quality_level, config.gop_size, config.b_frame_count
     );
 
     // Create input image for uploading frames.
     let mut input_image = InputImage::new(
         context.clone(),
-        Codec::H265,
+        Codec::AV1,
         WIDTH,
         HEIGHT,
         EncodeBitDepth::Eight,
         PixelFormat::Yuv420,
     )?;
     let mut encoder = Encoder::new(context, config)?;
-    let mut output = File::create("output.h265")?;
+    let mut output = File::create("output.av1")?;
     let mut total_bytes = 0;
 
     // Encode frames.
@@ -98,7 +92,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Upload YUV420 data to the input image.
         input_image.upload_yuv420(frame)?;
 
-        // Encode the image.
+        // Encode the image (passing InputImage's image, which triggers
+        // an internal copy to the encoder's input image with proper
+        // layout transitions).
         for packet in encoder.encode(input_image.image())? {
             total_bytes += packet.data.len();
             output.write_all(&packet.data)?;
@@ -128,7 +124,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let ratio = (num_frames * frame_size) as f64 / total_bytes as f64;
     println!("\nEncoded {num_frames} frames, {total_bytes} bytes, {ratio:.1}:1 compression");
-    println!("Output: output.h265");
+    println!("Output: output.av1");
 
     Ok(())
 }

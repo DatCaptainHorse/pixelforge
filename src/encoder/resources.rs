@@ -1234,20 +1234,167 @@ pub(crate) unsafe fn record_dpb_barriers(
                     base_array_layer: ref_layer,
                     layer_count: 1,
                 })
-                .src_access_mask(vk::AccessFlags::empty())
-                .dst_access_mask(vk::AccessFlags::empty()),
+                .src_access_mask(vk::AccessFlags::MEMORY_WRITE)
+                .dst_access_mask(vk::AccessFlags::MEMORY_READ),
         );
     }
 
     device.cmd_pipeline_barrier(
         command_buffer,
-        vk::PipelineStageFlags::TOP_OF_PIPE,
-        vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+        vk::PipelineStageFlags::ALL_COMMANDS,
+        vk::PipelineStageFlags::ALL_COMMANDS,
         vk::DependencyFlags::empty(),
         &[],
         &[],
         &all_barriers,
     );
+}
+
+/// Prepare an encode command buffer for recording.
+///
+/// Resets the command buffer, begins recording with ONE_TIME_SUBMIT, and resets
+/// the query pool. This is the common preamble for all encode operations.
+///
+/// # Safety
+///
+/// The command buffer must not be in use by the GPU.
+pub(crate) unsafe fn prepare_encode_command_buffer(
+    device: &ash::Device,
+    command_buffer: vk::CommandBuffer,
+    query_pool: vk::QueryPool,
+) -> Result<()> {
+    device
+        .reset_command_buffer(command_buffer, vk::CommandBufferResetFlags::empty())
+        .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
+
+    let begin_info =
+        vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+    device
+        .begin_command_buffer(command_buffer, &begin_info)
+        .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
+
+    device.cmd_reset_query_pool(command_buffer, query_pool, 0, 1);
+
+    Ok(())
+}
+
+/// Record a post-encode DPB synchronization barrier.
+///
+/// Ensures the DPB image write from the encode operation is visible to subsequent
+/// reads (e.g. as a reference frame for the next encode).
+///
+/// # Safety
+///
+/// The command buffer must be in recording state.
+pub(crate) unsafe fn record_post_encode_dpb_barrier(
+    device: &ash::Device,
+    command_buffer: vk::CommandBuffer,
+    dpb_images: &[vk::Image],
+    use_layered_dpb: bool,
+    current_dpb_slot: u8,
+) {
+    let (post_dpb_image, post_dpb_layer) = if use_layered_dpb {
+        (dpb_images[0], current_dpb_slot as u32)
+    } else {
+        (dpb_images[current_dpb_slot as usize], 0)
+    };
+
+    let dpb_sync_barrier = vk::ImageMemoryBarrier::default()
+        .old_layout(vk::ImageLayout::VIDEO_ENCODE_DPB_KHR)
+        .new_layout(vk::ImageLayout::VIDEO_ENCODE_DPB_KHR)
+        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .image(post_dpb_image)
+        .subresource_range(vk::ImageSubresourceRange {
+            aspect_mask: vk::ImageAspectFlags::COLOR,
+            base_mip_level: 0,
+            level_count: 1,
+            base_array_layer: post_dpb_layer,
+            layer_count: 1,
+        })
+        .src_access_mask(vk::AccessFlags::MEMORY_WRITE)
+        .dst_access_mask(vk::AccessFlags::MEMORY_READ);
+
+    device.cmd_pipeline_barrier(
+        command_buffer,
+        vk::PipelineStageFlags::ALL_COMMANDS,
+        vk::PipelineStageFlags::ALL_COMMANDS,
+        vk::DependencyFlags::empty(),
+        &[],
+        &[],
+        &[dpb_sync_barrier],
+    );
+}
+
+/// Submit an encode command buffer and wait for completion.
+///
+/// Submits the command buffer to the encode queue, waits for the fence, resets it,
+/// then reads query results and copies the encoded bitstream data.
+///
+/// # Safety
+///
+/// The command buffer must have been ended. The fence must be in the unsignaled state.
+/// The bitstream buffer pointer must be valid and the buffer must be persistently mapped.
+pub(crate) unsafe fn submit_encode_and_read_bitstream(
+    device: &ash::Device,
+    command_buffer: vk::CommandBuffer,
+    fence: vk::Fence,
+    encode_queue: vk::Queue,
+    query_pool: vk::QueryPool,
+    bitstream_buffer_ptr: *const u8,
+) -> Result<Vec<u8>> {
+    let submit_info =
+        vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&command_buffer));
+
+    device
+        .queue_submit(encode_queue, &[submit_info], fence)
+        .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
+
+    device
+        .wait_for_fences(&[fence], true, u64::MAX)
+        .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
+
+    device
+        .reset_fences(&[fence])
+        .map_err(|e| PixelForgeError::Synchronization(e.to_string()))?;
+
+    // Read query results (offset + bytes_written).
+    #[repr(C)]
+    struct QueryResult {
+        offset: u32,
+        bytes_written: u32,
+    }
+
+    let mut query_results = [QueryResult {
+        offset: 0,
+        bytes_written: 0,
+    }];
+
+    device
+        .get_query_pool_results(
+            query_pool,
+            0,
+            &mut query_results,
+            vk::QueryResultFlags::WAIT,
+        )
+        .map_err(|e| PixelForgeError::QueryPool(e.to_string()))?;
+
+    let offset = query_results[0].offset as usize;
+    let size = query_results[0].bytes_written as usize;
+
+    if size == 0 {
+        return Err(PixelForgeError::QueryPool(
+            "Encoder produced 0 bytes".to_string(),
+        ));
+    }
+
+    tracing::debug!("Encoded frame: offset={}, size={}", offset, size);
+
+    let mut encoded_data = vec![0u8; size];
+    let src = std::slice::from_raw_parts(bitstream_buffer_ptr.add(offset), size);
+    encoded_data.copy_from_slice(src);
+
+    Ok(encoded_data)
 }
 
 #[cfg(test)]
