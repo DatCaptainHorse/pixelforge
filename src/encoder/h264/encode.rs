@@ -1,7 +1,10 @@
 use super::H264Encoder;
 
 use crate::encoder::gop::{GopFrameType, GopPosition};
-use crate::encoder::resources::{record_dpb_barriers, MIN_BITSTREAM_BUFFER_SIZE};
+use crate::encoder::resources::{
+    prepare_encode_command_buffer, record_dpb_barriers, submit_encode_and_read_bitstream,
+    MIN_BITSTREAM_BUFFER_SIZE,
+};
 use crate::error::{PixelForgeError, Result};
 use ash::vk;
 use tracing::debug;
@@ -48,34 +51,13 @@ impl H264Encoder {
             ),
         };
 
-        // Reset command buffer before recording.
+        // Prepare command buffer for recording.
         unsafe {
-            self.context.device().reset_command_buffer(
-                self.encode_command_buffer,
-                vk::CommandBufferResetFlags::empty(),
-            )
-        }
-        .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
-
-        // Begin command buffer.
-        let begin_info = vk::CommandBufferBeginInfo::default()
-            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
-
-        unsafe {
-            self.context
-                .device()
-                .begin_command_buffer(self.encode_command_buffer, &begin_info)
-        }
-        .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
-
-        // Reset query pool.
-        unsafe {
-            self.context.device().cmd_reset_query_pool(
+            prepare_encode_command_buffer(
+                self.context.device(),
                 self.encode_command_buffer,
                 self.query_pool,
-                0,
-                1,
-            );
+            )?;
         }
 
         // Transition DPB images for encode.
@@ -633,76 +615,24 @@ impl H264Encoder {
         }
         .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
 
-        // Submit
-        let submit_info = vk::SubmitInfo::default()
-            .command_buffers(std::slice::from_ref(&self.encode_command_buffer));
-
+        // Submit, wait, and read bitstream.
         let encode_queue = self.context.video_encode_queue().ok_or_else(|| {
             PixelForgeError::NoSuitableDevice("No video encode queue available".to_string())
         })?;
 
-        unsafe {
-            self.context
-                .device()
-                .queue_submit(encode_queue, &[submit_info], self.encode_fence)
-        }
-        .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
-
-        // Wait for encode to complete.
-        unsafe {
-            self.context
-                .device()
-                .wait_for_fences(&[self.encode_fence], true, u64::MAX)
-        }
-        .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
-
-        unsafe { self.context.device().reset_fences(&[self.encode_fence]) }
-            .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
-
-        // Read back query results to get actual encoded size.
-        #[repr(C)]
-        struct QueryResult {
-            offset: u32,
-            bytes_written: u32,
-        }
-
-        let mut query_results = [QueryResult {
-            offset: 0,
-            bytes_written: 0,
-        }];
-
-        unsafe {
-            self.context.device().get_query_pool_results(
+        let encoded_data = unsafe {
+            submit_encode_and_read_bitstream(
+                self.context.device(),
+                self.encode_command_buffer,
+                self.encode_fence,
+                encode_queue,
                 self.query_pool,
-                0, // first_query
-                &mut query_results,
-                vk::QueryResultFlags::WAIT,
-            )
-        }
-        .map_err(|e| PixelForgeError::QueryPool(e.to_string()))?;
-
-        let query_result = &query_results[0];
-
-        debug!(
-            "Encode complete: offset={}, bytes_written={}",
-            query_result.offset, query_result.bytes_written
-        );
+                self.bitstream_buffer_ptr,
+            )?
+        };
 
         // Mark DPB slot as active.
         self.dpb_slot_active[self.current_dpb_slot as usize] = true;
-
-        // Read back the bitstream data using the persistently mapped buffer pointer.
-        // This avoids per-frame map/unmap overhead (the buffer is mapped once at init)
-        // Note: The Vulkan encoder output already includes NAL start codes (Annex B format)
-        let mut encoded_data = Vec::with_capacity(query_result.bytes_written as usize);
-
-        unsafe {
-            let src = std::slice::from_raw_parts(
-                self.bitstream_buffer_ptr.add(query_result.offset as usize),
-                query_result.bytes_written as usize,
-            );
-            encoded_data.extend_from_slice(src);
-        }
 
         Ok(encoded_data)
     }

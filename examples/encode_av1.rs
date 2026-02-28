@@ -17,11 +17,13 @@ const WIDTH: u32 = 320;
 const HEIGHT: u32 = 240;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Initialize tracing.
+    // Initialize tracing with RUST_LOG support.
     tracing_subscriber::registry()
         .with(
-            tracing_subscriber::fmt::layer()
-                .with_filter(tracing_subscriber::filter::LevelFilter::INFO),
+            tracing_subscriber::fmt::layer().with_filter(
+                tracing_subscriber::EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+            ),
         )
         .init();
 
@@ -87,14 +89,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for i in 0..num_frames {
         let frame = &yuv_data[i * frame_size..(i + 1) * frame_size];
 
-        // Upload directly to encoder's input image to avoid cross-queue
-        // copy issues (InputImage uses the transfer queue, encoder uses the
-        // video encode queue which doesn't support transfer ops).
-        let encoder_image = encoder.input_image();
-        input_image.upload_yuv420_to(encoder_image, frame)?;
+        // Upload YUV420 data to the input image.
+        input_image.upload_yuv420(frame)?;
 
-        // Encode the image.
-        for packet in encoder.encode(encoder_image)? {
+        // Encode the image (passing InputImage's image, which triggers
+        // an internal copy to the encoder's input image with proper
+        // layout transitions).
+        for packet in encoder.encode(input_image.image())? {
             total_bytes += packet.data.len();
             output.write_all(&packet.data)?;
             println!(

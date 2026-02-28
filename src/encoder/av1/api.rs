@@ -69,6 +69,10 @@ impl AV1Encoder {
             self.order_hint = 0;
             // Reset references for key frames.
             self.references.clear();
+            // Reset DPB slot activation tracking on key frame - all slots become inactive.
+            for active in &mut self.dpb_slot_active {
+                *active = false;
+            }
         }
 
         let mut encoded_data = Vec::new();
@@ -103,20 +107,19 @@ impl AV1Encoder {
         self.frame_num += 1;
         self.order_hint = (self.order_hint + 1) & 0xFF; // 8-bit order hint
 
-        if is_reference {
-            // Update reference tracking for the next frame.
-            // Use the order_hint value that was active during encoding, not the incremented value.
+        // Only KEY frames are stored as references. P frames all reference the KEY frame
+        // and don't update any reference buffer, avoiding P→P which produces corrupt output
+        // on NVIDIA AV1 encoders.
+        if is_key_frame {
             let ref_info = super::ReferenceInfo {
                 dpb_slot: self.current_dpb_slot,
                 order_hint: encoded_order_hint,
+                frame_type: ash::vk::native::StdVideoAV1FrameType_STD_VIDEO_AV1_FRAME_TYPE_KEY,
             };
-            self.references.insert(0, ref_info);
-            // Limit to negotiated max active references
-            while self.references.len() > self.active_reference_count as usize {
-                self.references.pop();
-            }
+            self.references.clear();
+            self.references.push(ref_info);
 
-            // Find a free DPB slot for the next frame.
+            // KEY frame uses the current DPB slot; pick a different one for P frames.
             let used_slots: Vec<u8> = self.references.iter().map(|r| r.dpb_slot).collect();
             for i in 0..self.dpb_slot_count as u8 {
                 if !used_slots.contains(&i) {
@@ -125,6 +128,8 @@ impl AV1Encoder {
                 }
             }
         }
+        // P frames reuse the same scratch DPB slot (current_dpb_slot stays unchanged
+        // between P frames since it's always different from the KEY frame's slot).
 
         Ok(EncodedPacket {
             data: encoded_data,

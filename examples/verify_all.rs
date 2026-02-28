@@ -21,8 +21,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize tracing.
     tracing_subscriber::registry()
         .with(
-            tracing_subscriber::fmt::layer()
-                .with_filter(tracing_subscriber::EnvFilter::from_default_env()),
+            tracing_subscriber::fmt::layer().with_filter(
+                tracing_subscriber::EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+            ),
         )
         .init();
 
@@ -190,8 +192,14 @@ fn run_test(
 
     // Let's decode to the input format (8-bit).
     let (input_pix_fmt, input_path) = match format {
-        PixelFormat::Yuv420 => ("yuv420p", format!("testdata/test_frames_{}x{}_yuv420p.yuv", WIDTH, HEIGHT)),
-        PixelFormat::Yuv444 => ("yuv444p", format!("testdata/test_frames_{}x{}_yuv444p.yuv", WIDTH, HEIGHT)),
+        PixelFormat::Yuv420 => (
+            "yuv420p",
+            format!("testdata/test_frames_{}x{}_yuv420p.yuv", WIDTH, HEIGHT),
+        ),
+        PixelFormat::Yuv444 => (
+            "yuv444p",
+            format!("testdata/test_frames_{}x{}_yuv444p.yuv", WIDTH, HEIGHT),
+        ),
         _ => return Err("Unsupported format".into()),
     };
 

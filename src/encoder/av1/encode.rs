@@ -1,6 +1,10 @@
 use super::{AV1Encoder, MIN_BITSTREAM_BUFFER_SIZE};
 
 use crate::encoder::gop::GopPosition;
+use crate::encoder::resources::{
+    prepare_encode_command_buffer, record_dpb_barriers, record_post_encode_dpb_barrier,
+    submit_encode_and_read_bitstream,
+};
 use crate::error::{PixelForgeError, Result};
 use ash::vk;
 use tracing::debug;
@@ -8,10 +12,11 @@ use tracing::debug;
 impl AV1Encoder {
     pub(super) fn encode_frame_internal(
         &mut self,
-        gop_position: &GopPosition,
+        _gop_position: &GopPosition,
         is_key_frame: bool,
     ) -> Result<Vec<u8>> {
-        let is_reference = gop_position.is_reference;
+        // All frames need a setup reference slot (DPB write) per Vulkan spec when maxDpbSlots > 0.
+        let is_reference = true;
 
         debug!(
             "encode_frame_internal: key={}, ref={}, refs_len={}, dpb_slot={}",
@@ -21,84 +26,48 @@ impl AV1Encoder {
             self.current_dpb_slot
         );
 
-        // Rate control setup.
-        let (rc_mode, average_bitrate, max_bitrate, _qp) = match self.config.rate_control_mode {
+        // Rate control setup (matches H265 pattern: CQP/Disabled uses DISABLED mode).
+        let (rc_mode, average_bitrate, max_bitrate, qp) = match self.config.rate_control_mode {
             crate::encoder::RateControlMode::Cqp | crate::encoder::RateControlMode::Disabled => (
-                vk::VideoEncodeRateControlModeFlagsKHR::VBR,
-                100_000_000, // 100 Mbps
-                100_000_000,
-                self.config.quality_level as i32,
+                vk::VideoEncodeRateControlModeFlagsKHR::DISABLED,
+                0,
+                0,
+                self.config.quality_level as u32,
             ),
             crate::encoder::RateControlMode::Cbr => (
                 vk::VideoEncodeRateControlModeFlagsKHR::CBR,
                 self.config.target_bitrate,
                 self.config.target_bitrate,
-                128, // Default QP for AV1 to adjust from
+                128u32,
             ),
             crate::encoder::RateControlMode::Vbr => (
                 vk::VideoEncodeRateControlModeFlagsKHR::VBR,
                 self.config.target_bitrate,
                 self.config.max_bitrate,
-                128, // Default QP for AV1 to adjust from
+                128u32,
             ),
         };
 
-        // Reset command buffer.
+        // Prepare command buffer for recording.
         unsafe {
-            self.context.device().reset_command_buffer(
-                self.encode_command_buffer,
-                vk::CommandBufferResetFlags::empty(),
-            )
-        }
-        .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
-
-        // Begin command buffer.
-        let begin_info = vk::CommandBufferBeginInfo::default()
-            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
-
-        unsafe {
-            self.context
-                .device()
-                .begin_command_buffer(self.encode_command_buffer, &begin_info)
-        }
-        .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
-
-        // Reset query pool (1 query for bitstream feedback).
-        unsafe {
-            self.context.device().cmd_reset_query_pool(
+            prepare_encode_command_buffer(
+                self.context.device(),
                 self.encode_command_buffer,
                 self.query_pool,
-                0,
-                1,
-            );
+            )?;
         }
 
-        // Transition DPB image to video encode DPB layout.
-        let dpb_barrier = vk::ImageMemoryBarrier::default()
-            .old_layout(vk::ImageLayout::UNDEFINED)
-            .new_layout(vk::ImageLayout::VIDEO_ENCODE_DPB_KHR)
-            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .image(self.dpb_images[self.current_dpb_slot as usize])
-            .subresource_range(vk::ImageSubresourceRange {
-                aspect_mask: vk::ImageAspectFlags::COLOR,
-                base_mip_level: 0,
-                level_count: 1,
-                base_array_layer: 0,
-                layer_count: 1,
-            })
-            .src_access_mask(vk::AccessFlags::empty())
-            .dst_access_mask(vk::AccessFlags::empty());
-
+        // Transition DPB images for encode.
+        let ref_dpb_slots: Vec<u8> = self.references.iter().map(|r| r.dpb_slot).collect();
         unsafe {
-            self.context.device().cmd_pipeline_barrier(
+            record_dpb_barriers(
+                self.context.device(),
                 self.encode_command_buffer,
-                vk::PipelineStageFlags::TOP_OF_PIPE,
-                vk::PipelineStageFlags::BOTTOM_OF_PIPE,
-                vk::DependencyFlags::empty(),
-                &[],
-                &[],
-                &[dpb_barrier],
+                &self.dpb_images,
+                false, // AV1 does not use layered DPB
+                self.current_dpb_slot,
+                &ref_dpb_slots,
+                self.dpb_slot_active[self.current_dpb_slot as usize],
             );
         }
 
@@ -118,11 +87,14 @@ impl AV1Encoder {
         picture_info_flags.set_show_frame(1);
         if is_key_frame {
             picture_info_flags.set_error_resilient_mode(1);
+        } else {
+            picture_info_flags.set_showable_frame(1);
         }
 
-        // Frame extent uses display dimensions (not superblock-aligned coded extent).
-        // The video session's max_coded_extent is the upper bound; individual frames
-        // use actual dimensions so the decoder doesn't show a green border.
+        // Frame extent uses display dimensions for all picture resources.
+        // Per Vulkan spec, without MOTION_VECTOR_SCALING support, all picture resource
+        // codedExtent values must match, and srcPictureResource.codedExtent must equal
+        // the sequence header's max_frame_width/height.
         let frame_extent = vk::Extent2D {
             width: self.config.dimensions.width,
             height: self.config.dimensions.height,
@@ -180,7 +152,7 @@ impl AV1Encoder {
             // Create StdVideoEncodeAV1ReferenceInfo for the reference slot.
             let ref_std_info = ash::vk::native::StdVideoEncodeAV1ReferenceInfo {
                 flags: reference_info_flags,
-                frame_type: ash::vk::native::StdVideoAV1FrameType_STD_VIDEO_AV1_FRAME_TYPE_INTER,
+                frame_type: ref_info.frame_type,
                 RefFrameId: ref_info.dpb_slot as u32,
                 OrderHint: ref_info.order_hint as u8,
                 reserved1: [0; 3],
@@ -224,7 +196,7 @@ impl AV1Encoder {
 
         let quantization = ash::vk::native::StdVideoAV1Quantization {
             flags: quantization_flags,
-            base_q_idx: 128, // Moderate QP (0-255 range)
+            base_q_idx: qp as u8, // Use the same QP as constant_q_index
             DeltaQYDc: 0,
             DeltaQUDc: 0,
             DeltaQUAc: 0,
@@ -272,29 +244,25 @@ impl AV1Encoder {
         // Match FFmpeg: don't provide tile info (set to null).
         // Note: If this causes issues, we may need to re-enable it with proper values.
 
-        // Build ref_frame_idx, ref_order_hint, and primary_ref_frame based on frame type.
-        // Match FFmpeg: for P frames all 7 ref_frame_idx entries point to same reference slot.
-        let (ref_frame_idx, ref_order_hint, primary_ref_frame) =
+        // Build ref_frame_idx, ref_order_hint, refresh_frame_flags, and primary_ref_frame.
+        //
+        // All P frames reference only the KEY frame (stored in buffer 0).
+        // P frames set refresh_frame_flags=0x00 (don't update any reference buffer).
+        // This avoids P→P references which produce corrupt output on NVIDIA AV1 encoders.
+        let (ref_frame_idx, ref_order_hint, primary_ref_frame, refresh_frame_flags) =
             if !is_key_frame && !self.references.is_empty() {
+                // All reference names point to buffer 0 (where KEY frame lives).
+                let ref_idx = [0i8; 7];
                 let ref_info = &self.references[0];
-                let ref_idx = [ref_info.dpb_slot as i8; 7];
                 let mut order_hints = [0u8; 8];
-                order_hints[ref_info.dpb_slot as usize] = ref_info.order_hint as u8;
-                // primary_ref_frame is a reference NAME index (0=LAST_FRAME), not a DPB slot.
-                // We use SINGLE_REFERENCE with LAST_FRAME, so always 0.
-                (ref_idx, order_hints, 0u8)
-            } else {
-                ([0i8; 7], [0u8; 8], 7u8) // 7 = PRIMARY_REF_NONE for key frames
-            };
+                order_hints[0] = ref_info.order_hint as u8;
 
-        // refresh_frame_flags: key frames refresh ALL slots, P frames refresh current slot.
-        let refresh_frame_flags = if is_key_frame {
-            0xFF // Key frames refresh all 8 reference slots (match FFmpeg)
-        } else if is_reference {
-            1u8 << self.current_dpb_slot // P frames refresh current slot
-        } else {
-            0x00 // Non-reference frames don't refresh
-        };
+                // P frames don't refresh any reference buffer.
+                (ref_idx, order_hints, 0u8, 0x00u8)
+            } else {
+                // KEY frame: refresh all buffers.
+                ([0i8; 7], [0u8; 8], 7u8, 0xFFu8)
+            };
 
         // AV1 encode picture info.
         let std_picture_info = ash::vk::native::StdVideoEncodeAV1PictureInfo {
@@ -316,7 +284,7 @@ impl AV1Encoder {
             ref_frame_idx,
             reserved1: [0; 3],
             delta_frame_id_minus_1: [0; 7],
-            pTileInfo: std::ptr::null(), // Match FFmpeg: null (not implemented)
+            pTileInfo: std::ptr::null(),
             pQuantization: &quantization,
             pSegmentation: std::ptr::null(),
             pLoopFilter: &loop_filter,
@@ -327,12 +295,13 @@ impl AV1Encoder {
             pBufferRemovalTimes: std::ptr::null(),
         };
 
-        // Reference name slot indices - maps AV1 reference frame names to DPB slot indices.
-        // For SINGLE_REFERENCE mode, we use LAST_FRAME (index 0).
+        // Reference name slot indices - maps AV1 reference names to Vulkan DPB slot indices.
+        // Only set entries for reference names that appear in pReferenceSlots.
+        // For SINGLE_REFERENCE mode, only LAST_FRAME (index 0) is used.
         let mut reference_name_slot_indices = [-1i32; 7];
 
-        // For inter frames, map LAST_FRAME to our reference DPB slot.
         if !is_key_frame && !self.references.is_empty() {
+            // Map LAST_FRAME to the reference's DPB slot.
             let ref_info = &self.references[0];
             reference_name_slot_indices[0] = ref_info.dpb_slot as i32;
         }
@@ -350,79 +319,129 @@ impl AV1Encoder {
             )
         };
 
-        let av1_picture_info = vk::VideoEncodeAV1PictureInfoKHR::default()
+        let mut av1_picture_info = vk::VideoEncodeAV1PictureInfoKHR::default()
             .std_picture_info(&std_picture_info)
             .prediction_mode(prediction_mode)
             .rate_control_group(rate_control_group)
             .reference_name_slot_indices(reference_name_slot_indices);
 
-        // Rate control layer info.
-        let rc_layer_info = vk::VideoEncodeRateControlLayerInfoKHR::default()
+        // For DISABLED rate control mode, set constant_q_index on the picture info.
+        if rc_mode == vk::VideoEncodeRateControlModeFlagsKHR::DISABLED {
+            av1_picture_info = av1_picture_info.constant_q_index(qp);
+        }
+
+        // AV1-specific rate control layer info.
+        let min_q_index = vk::VideoEncodeAV1QIndexKHR {
+            intra_q_index: qp,
+            predictive_q_index: qp,
+            bipredictive_q_index: qp,
+        };
+        let max_q_index = vk::VideoEncodeAV1QIndexKHR {
+            intra_q_index: qp,
+            predictive_q_index: qp,
+            bipredictive_q_index: qp,
+        };
+        let mut av1_rc_layer_info = vk::VideoEncodeAV1RateControlLayerInfoKHR::default()
+            .use_min_q_index(true)
+            .min_q_index(min_q_index)
+            .use_max_q_index(true)
+            .max_q_index(max_q_index);
+
+        let mut rc_layer_info = vk::VideoEncodeRateControlLayerInfoKHR::default()
             .average_bitrate(average_bitrate as u64)
             .max_bitrate(max_bitrate as u64)
             .frame_rate_numerator(self.config.frame_rate_numerator)
             .frame_rate_denominator(self.config.frame_rate_denominator);
+        rc_layer_info.p_next =
+            (&mut av1_rc_layer_info as *mut vk::VideoEncodeAV1RateControlLayerInfoKHR).cast();
+        let rc_layers = [rc_layer_info];
 
-        // Rate control info.
-        let rc_info = vk::VideoEncodeRateControlInfoKHR::default()
-            .rate_control_mode(rc_mode)
-            .virtual_buffer_size_in_ms(1000) // 1 second VBV buffer
-            .layers(std::slice::from_ref(&rc_layer_info));
+        // AV1-specific rate control info.
+        let mut av1_rc_info = vk::VideoEncodeAV1RateControlInfoKHR::default()
+            .gop_frame_count(self.config.gop_size)
+            .key_frame_period(self.config.gop_size)
+            .consecutive_bipredictive_frame_count(0)
+            .temporal_layer_count(1);
+
+        // Rate control info (matches H265 pattern: only add layers/buffer for non-DISABLED modes).
+        let mut rc_info = vk::VideoEncodeRateControlInfoKHR::default().rate_control_mode(rc_mode);
+
+        if rc_mode != vk::VideoEncodeRateControlModeFlagsKHR::DISABLED {
+            rc_info = rc_info
+                .layers(&rc_layers)
+                .virtual_buffer_size_in_ms(self.config.virtual_buffer_size_ms)
+                .initial_virtual_buffer_size_in_ms(self.config.initial_virtual_buffer_size_ms);
+            rc_info.p_next = (&mut av1_rc_info as *mut vk::VideoEncodeAV1RateControlInfoKHR).cast();
+        }
 
         // Video begin coding info.
-        // FFmpeg trick: Include the setup slot in reference_slots but with slotIndex = -1.
-        // This binds the picture resource without requiring the slot to be active yet.
+        // Include the setup slot (with slot_index -1 to indicate it's not yet active)
+        // and any reference slots that will be used for reading during encoding.
         let mut all_reference_slots = Vec::new();
 
         if is_reference {
-            // Create a copy of setup_reference_slot with slotIndex = -1
-            let mut setup_slot_for_binding = setup_reference_slot;
-            setup_slot_for_binding.slot_index = -1; // Magic value to bind resource without activation
-            all_reference_slots.push(setup_slot_for_binding);
+            // Build a separate setup slot for begin coding with slot_index = -1.
+            // This tells the implementation the slot is being set up, not yet active.
+            let mut setup_slot_for_begin = vk::VideoReferenceSlotInfoKHR::default()
+                .slot_index(-1)
+                .picture_resource(&setup_picture_resource);
+            setup_slot_for_begin.p_next =
+                (&setup_av1_dpb_info as *const vk::VideoEncodeAV1DpbSlotInfoKHR).cast();
+            all_reference_slots.push(setup_slot_for_begin);
         }
 
         // Add reference slots (already active slots we're reading from)
         all_reference_slots.extend_from_slice(&reference_slots);
 
-        // Begin video coding with rate control info on first frame only (matching HEVC pattern).
+        debug!(
+            "Begin coding: {} reference slots (setup={}, refs={})",
+            all_reference_slots.len(),
+            if is_reference { 1 } else { 0 },
+            reference_slots.len()
+        );
+
+        // Begin video coding with rate control info for non-first frames.
         let is_first_frame = self.encode_frame_num == 0;
-        let mut begin_coding_info = if is_first_frame {
+
+        let begin_coding_info = if is_first_frame {
             vk::VideoBeginCodingInfoKHR::default()
                 .video_session(self.session)
                 .video_session_parameters(self.session_params)
+                .reference_slots(&all_reference_slots)
         } else {
             let mut info = vk::VideoBeginCodingInfoKHR::default()
                 .video_session(self.session)
-                .video_session_parameters(self.session_params);
+                .video_session_parameters(self.session_params)
+                .reference_slots(&all_reference_slots);
             info.p_next = (&rc_info as *const vk::VideoEncodeRateControlInfoKHR).cast();
             info
         };
-
-        if !all_reference_slots.is_empty() {
-            begin_coding_info = begin_coding_info.reference_slots(&all_reference_slots);
-        }
 
         unsafe {
             self.video_queue_fn
                 .cmd_begin_video_coding(self.encode_command_buffer, &begin_coding_info);
         }
 
-        // Initialize video session on first frame.
+        // Reset video coding state for the first frame.
+        // Combine RESET + RATE_CONTROL + QUALITY_LEVEL into a single control command.
+        // This matches the H265 approach and is required for AMD RADV.
         if is_first_frame {
-            let reset_control_info = vk::VideoCodingControlInfoKHR::default()
-                .flags(vk::VideoCodingControlFlagsKHR::RESET);
-            unsafe {
-                self.video_queue_fn
-                    .cmd_control_video_coding(self.encode_command_buffer, &reset_control_info);
-            }
+            let mut quality_level_info =
+                vk::VideoEncodeQualityLevelInfoKHR::default().quality_level(0);
+            quality_level_info.p_next =
+                (&rc_info as *const vk::VideoEncodeRateControlInfoKHR).cast();
 
-            // Set rate control after reset (matching HEVC pattern).
-            let mut rate_control = vk::VideoCodingControlInfoKHR::default()
-                .flags(vk::VideoCodingControlFlagsKHR::ENCODE_RATE_CONTROL);
-            rate_control.p_next = (&rc_info as *const vk::VideoEncodeRateControlInfoKHR).cast();
+            let mut control_info = vk::VideoCodingControlInfoKHR::default().flags(
+                vk::VideoCodingControlFlagsKHR::RESET
+                    | vk::VideoCodingControlFlagsKHR::ENCODE_RATE_CONTROL
+                    | vk::VideoCodingControlFlagsKHR::ENCODE_QUALITY_LEVEL,
+            );
+            control_info.p_next =
+                (&quality_level_info as *const vk::VideoEncodeQualityLevelInfoKHR).cast();
+
             unsafe {
                 self.video_queue_fn
-                    .cmd_control_video_coding(self.encode_command_buffer, &rate_control);
+                    .cmd_control_video_coding(self.encode_command_buffer, &control_info);
             }
         }
 
@@ -471,6 +490,17 @@ impl AV1Encoder {
                 .cmd_end_query(self.encode_command_buffer, self.query_pool, 0);
         }
 
+        // Add DPB synchronization barrier after encoding.
+        unsafe {
+            record_post_encode_dpb_barrier(
+                self.context.device(),
+                self.encode_command_buffer,
+                &self.dpb_images,
+                false, // AV1 does not use layered DPB
+                self.current_dpb_slot,
+            );
+        }
+
         // End video coding.
         let end_coding_info = vk::VideoEndCodingInfoKHR::default();
         unsafe {
@@ -486,93 +516,36 @@ impl AV1Encoder {
         }
         .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
 
-        // Submit command buffer.
-        let submit_info = vk::SubmitInfo::default()
-            .command_buffers(std::slice::from_ref(&self.encode_command_buffer));
-
-        unsafe { self.context.device().reset_fences(&[self.encode_fence]) }
-            .map_err(|e| PixelForgeError::Synchronization(e.to_string()))?;
-
-        unsafe {
-            self.context.device().queue_submit(
-                self.context
-                    .video_encode_queue()
-                    .expect("Video encode queue should be available"),
-                &[submit_info],
-                self.encode_fence,
-            )
-        }
-        .map_err(|e| PixelForgeError::Synchronization(e.to_string()))?;
-
-        // Wait for encode to complete.
-        unsafe {
-            self.context
-                .device()
-                .wait_for_fences(&[self.encode_fence], true, u64::MAX)
-        }
-        .map_err(|e| PixelForgeError::Synchronization(e.to_string()))?;
-
-        // Get query results for bitstream size.
-        // Need to use raw vkGetQueryPoolResults because ash's wrapper infers query count from buffer size.
-        // We want 1 query returning 12 bytes (3 u32s): offset, bytes_written, status.
-        let mut query_results = [0u32; 3];
-        let result = unsafe {
-            (self.context.device().fp_v1_0().get_query_pool_results)(
-                self.context.device().handle(),
-                self.query_pool,
-                0,  // firstQuery
-                1,  // queryCount (explicit: we want 1 query, not 3!)
-                12, // dataSize in bytes (3 u32s: offset, bytes_written, status)
-                query_results.as_mut_ptr() as *mut std::ffi::c_void,
-                12, // stride (12 bytes per query result)
-                vk::QueryResultFlags::WAIT | vk::QueryResultFlags::WITH_STATUS_KHR,
-            )
-        };
-        if result != vk::Result::SUCCESS {
-            return Err(PixelForgeError::QueryPool(format!(
-                "Failed to get query results: {:?}",
-                result
-            )));
-        }
-
-        // Query result layout (WITH_STATUS at the END per Vulkan spec):
-        //   [0] = bitstream buffer offset (from BITSTREAM_BUFFER_OFFSET feedback flag)
-        //   [1] = bitstream bytes written (from BITSTREAM_BYTES_WRITTEN feedback flag)
-        //   [2] = status (VkQueryResultStatusKHR: 1 = COMPLETE, 0 = NOT_READY, -1 = ERROR)
-        let bitstream_offset = query_results[0];
-        let bitstream_size = query_results[1] as usize;
-        let status = query_results[2] as i32;
+        // Submit, wait, and read bitstream.
+        let encode_queue = self.context.video_encode_queue().ok_or_else(|| {
+            PixelForgeError::NoSuitableDevice("No video encode queue available".to_string())
+        })?;
 
         debug!(
-            "AV1 query results: status={}, offset={}, size={}",
-            status, bitstream_offset, bitstream_size
+            "Submitting frame {} to GPU: key={}, num_refs={}, cur_slot={}",
+            self.encode_frame_num,
+            is_key_frame,
+            self.references.len(),
+            self.current_dpb_slot
         );
 
-        if status != 1 {
-            return Err(PixelForgeError::CommandBuffer(format!(
-                "Encode query status indicates failure: {} (1=COMPLETE, 0=NOT_READY, -1=ERROR)",
-                status
-            )));
-        }
+        let gpu_start = std::time::Instant::now();
 
-        if bitstream_size == 0 || bitstream_size > MIN_BITSTREAM_BUFFER_SIZE {
-            return Err(PixelForgeError::CommandBuffer(format!(
-                "Invalid bitstream size: {}",
-                bitstream_size
-            )));
-        }
+        let encoded_data = unsafe {
+            submit_encode_and_read_bitstream(
+                self.context.device(),
+                self.encode_command_buffer,
+                self.encode_fence,
+                encode_queue,
+                self.query_pool,
+                self.bitstream_buffer_ptr,
+            )?
+        };
 
-        // Copy encoded data from mapped buffer at the reported offset.
-        let mut encoded_data = vec![0u8; bitstream_size];
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                self.bitstream_buffer_ptr.add(bitstream_offset as usize),
-                encoded_data.as_mut_ptr(),
-                bitstream_size,
-            );
-        }
+        debug!("GPU encode took {:?}", gpu_start.elapsed());
 
-        debug!("Encoded frame: {} bytes", bitstream_size);
+        // Mark current DPB slot as active.
+        self.dpb_slot_active[self.current_dpb_slot as usize] = true;
 
         Ok(encoded_data)
     }

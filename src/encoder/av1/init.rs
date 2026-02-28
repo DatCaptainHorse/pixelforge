@@ -241,10 +241,7 @@ impl AV1Encoder {
             .queue_family_index(encode_queue_family)
             .video_profile(&profile_info)
             .picture_format(picture_format)
-            .max_coded_extent(vk::Extent2D {
-                width: aligned_width,
-                height: aligned_height,
-            })
+            .max_coded_extent(vk::Extent2D { width, height })
             .reference_picture_format(reference_picture_format)
             .max_dpb_slots(requested_dpb_slots as u32)
             .max_active_reference_pictures(target_active_refs as u32)
@@ -419,49 +416,43 @@ impl AV1Encoder {
                     ))
                 })?
         };
-
         // Create input image.
         let (input_image, input_image_memory, input_image_view) = create_image(
             &context,
-            aligned_width,
-            aligned_height,
+            width,
+            height,
             picture_format,
             false, // is_dpb
             &profile_info,
         )?;
-
         let input_image_layout = vk::ImageLayout::UNDEFINED;
 
         // Create DPB images.
         let (dpb_images, dpb_image_memories, dpb_image_views) = create_dpb_images(
             &context,
-            aligned_width,
-            aligned_height,
+            width,
+            height,
             reference_picture_format,
             requested_dpb_slots,
             &profile_info,
             false,
         )?;
-
         // Create bitstream buffer.
-        let bitstream_buffer_size =
-            MIN_BITSTREAM_BUFFER_SIZE.max(aligned_width as usize * aligned_height as usize);
+        let bitstream_buffer_size = MIN_BITSTREAM_BUFFER_SIZE.max(width as usize * height as usize);
         let (bitstream_buffer, bitstream_buffer_memory) =
             create_bitstream_buffer(&context, bitstream_buffer_size, &profile_info)?;
-
         // Map bitstream buffer persistently.
         let bitstream_buffer_ptr =
             map_bitstream_buffer(&context, bitstream_buffer_memory, bitstream_buffer_size)?;
-
         // Create command resources.
         let upload_queue_family = context.transfer_queue_family();
-        let cmd_resources = create_command_resources(&context, encode_queue_family, upload_queue_family)?;
+        let cmd_resources =
+            create_command_resources(&context, encode_queue_family, upload_queue_family)?;
         let command_pool = cmd_resources.command_pool;
         let upload_command_buffer = cmd_resources.upload_command_buffer;
         let upload_fence = cmd_resources.upload_fence;
         let encode_command_buffer = cmd_resources.encode_command_buffer;
         let encode_fence = cmd_resources.encode_fence;
-
         // Clear the input image so padding between user dimensions and the
         // aligned coded extent is zero-initialized.
         clear_input_image(
@@ -471,13 +462,12 @@ impl AV1Encoder {
                 fence: upload_fence,
                 queue: context.transfer_queue(),
                 image: input_image,
-                width: aligned_width,
-                height: aligned_height,
+                width,
+                height,
                 pixel_format: config.pixel_format,
                 bit_depth: config.bit_depth,
             },
         )?;
-
         // Create query pool for bitstream size queries.
         // Need 1 query to capture bitstream offset and size.
         // Need to provide profile info and feedback flags in pNext chain.
@@ -525,6 +515,7 @@ impl AV1Encoder {
             dpb_image_memories,
             dpb_image_views,
             dpb_slot_count: requested_dpb_slots,
+            dpb_slot_active: vec![false; requested_dpb_slots],
             bitstream_buffer,
             bitstream_buffer_memory,
             bitstream_buffer_ptr,
@@ -538,7 +529,6 @@ impl AV1Encoder {
             header_data: None,
             current_dpb_slot: 0,
             references: Vec::new(),
-            active_reference_count: target_active_refs as u32,
         })
     }
 }

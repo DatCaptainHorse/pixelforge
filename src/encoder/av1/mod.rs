@@ -26,6 +26,7 @@ pub const SUPERBLOCK_SIZE: u32 = 128;
 pub(crate) struct ReferenceInfo {
     pub dpb_slot: u8,
     pub order_hint: u32,
+    pub frame_type: u32,
 }
 
 /// AV1 encoder.
@@ -59,6 +60,8 @@ pub struct AV1Encoder {
     dpb_image_views: Vec<vk::ImageView>,
     /// Number of DPB slots allocated.
     dpb_slot_count: usize,
+    /// Whether each DPB slot has been activated (written to at least once).
+    dpb_slot_active: Vec<bool>,
     bitstream_buffer: vk::Buffer,
     bitstream_buffer_memory: vk::DeviceMemory,
     /// Persistently mapped pointer to the bitstream buffer (avoids per-frame map/unmap).
@@ -81,8 +84,6 @@ pub struct AV1Encoder {
     current_dpb_slot: u8,
     /// Active reference pictures. Ordered from most recent to oldest.
     references: Vec<ReferenceInfo>,
-    /// Number of active reference frames (as configured/negotiated).
-    active_reference_count: u32,
 }
 
 impl AV1Encoder {
@@ -149,6 +150,7 @@ mod tests {
         let ref_info = ReferenceInfo {
             dpb_slot: 2,
             order_hint: 42,
+            frame_type: 0,
         };
 
         assert_eq!(ref_info.dpb_slot, 2);
@@ -181,6 +183,7 @@ mod tests {
             let ref_info = ReferenceInfo {
                 dpb_slot: i % max_refs as u8,
                 order_hint: i as u32,
+                frame_type: 0,
             };
             references.insert(0, ref_info);
             while references.len() > max_refs {
@@ -207,6 +210,7 @@ mod tests {
                 ReferenceInfo {
                     dpb_slot: i,
                     order_hint: i as u32,
+                    frame_type: 0,
                 },
             );
         }
@@ -222,6 +226,7 @@ mod tests {
             ReferenceInfo {
                 dpb_slot: 0,
                 order_hint: 0,
+                frame_type: 0,
             },
         );
         assert_eq!(references.len(), 1);
@@ -256,6 +261,7 @@ mod tests {
             ReferenceInfo {
                 dpb_slot: 0,
                 order_hint: 0,
+                frame_type: 0,
             },
         );
         while references.len() > max_refs {
@@ -270,6 +276,7 @@ mod tests {
             ReferenceInfo {
                 dpb_slot: 1,
                 order_hint: 1,
+                frame_type: 0,
             },
         );
         while references.len() > max_refs {
@@ -285,6 +292,7 @@ mod tests {
             ReferenceInfo {
                 dpb_slot: 2,
                 order_hint: 2,
+                frame_type: 0,
             },
         );
         while references.len() > max_refs {
@@ -303,6 +311,7 @@ mod tests {
             ReferenceInfo {
                 dpb_slot: 0,
                 order_hint: 3,
+                frame_type: 0,
             },
         );
         while references.len() > max_refs {
@@ -339,6 +348,7 @@ mod tests {
             ReferenceInfo {
                 dpb_slot: current_dpb_slot,
                 order_hint: 0,
+                frame_type: 0,
             },
         );
         current_dpb_slot = find_free_slot(&references, dpb_slot_count);
@@ -353,6 +363,7 @@ mod tests {
             ReferenceInfo {
                 dpb_slot: current_dpb_slot,
                 order_hint: 1,
+                frame_type: 0,
             },
         );
         while references.len() > max_refs {
@@ -370,6 +381,7 @@ mod tests {
             ReferenceInfo {
                 dpb_slot: current_dpb_slot,
                 order_hint: 2,
+                frame_type: 0,
             },
         );
         while references.len() > max_refs {
@@ -409,6 +421,7 @@ mod tests {
             ReferenceInfo {
                 dpb_slot: 0,
                 order_hint: 0,
+                frame_type: 0,
             },
         );
         while references.len() > max_refs {
@@ -423,6 +436,7 @@ mod tests {
             ReferenceInfo {
                 dpb_slot: 1,
                 order_hint: 1,
+                frame_type: 0,
             },
         );
         while references.len() > max_refs {
@@ -439,6 +453,7 @@ mod tests {
             ReferenceInfo {
                 dpb_slot: 0,
                 order_hint: 2,
+                frame_type: 0,
             },
         );
         while references.len() > max_refs {
