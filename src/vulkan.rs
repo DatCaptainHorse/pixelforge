@@ -350,12 +350,27 @@ impl VideoContext {
                 supported_encode_codecs = encode_codecs;
                 info!("Selected device: {}", device_name);
                 break;
+            } else {
+                warn!(
+                    "Device {} skipped: video_support={}, encode_supported={}, compute_support={}",
+                    device_name, has_video_support, encode_supported, has_compute_support
+                );
+                if !has_video_support {
+                    warn!("  - No queue with VIDEO_ENCODE_KHR flag found");
+                }
+                if !encode_supported {
+                    warn!(
+                        "  - Required codecs not supported: {:?}",
+                        builder.required_encode_codecs
+                    );
+                    warn!("  - Available codecs: {:?}", encode_codecs);
+                }
             }
         }
 
         let physical_device = selected_device.ok_or_else(|| {
             PixelForgeError::NoSuitableDevice(
-                "No device with required video support found".to_string(),
+                "No device with required video support found. Ensure your GPU drivers support Vulkan Video extensions (VK_KHR_video_queue, VK_KHR_video_encode_queue, etc.).".to_string(),
             )
         })?;
 

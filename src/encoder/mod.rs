@@ -142,6 +142,44 @@ pub struct Dimensions {
     pub height: u32,
 }
 
+/// Video signal color description for VUI parameters.
+///
+/// Describes how color is encoded in the video stream, allowing decoders
+/// to correctly interpret the color space.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ColorDescription {
+    /// Color primaries (1=BT.709, 9=BT.2020).
+    pub color_primaries: u8,
+    /// Transfer characteristics (1=BT.709, 16=ST2084/PQ).
+    pub transfer_characteristics: u8,
+    /// Matrix coefficients (1=BT.709, 9=BT.2020 NCL).
+    pub matrix_coefficients: u8,
+    /// Full range (true) or limited/TV range (false).
+    pub full_range: bool,
+}
+
+impl ColorDescription {
+    /// BT.709 color description (standard SDR).
+    pub fn bt709() -> Self {
+        Self {
+            color_primaries: 1,
+            transfer_characteristics: 1,
+            matrix_coefficients: 1,
+            full_range: true,
+        }
+    }
+
+    /// BT.2020 with PQ transfer function (HDR10).
+    pub fn bt2020_pq() -> Self {
+        Self {
+            color_primaries: 9,
+            transfer_characteristics: 16,
+            matrix_coefficients: 9,
+            full_range: false,
+        }
+    }
+}
+
 /// Encode configuration.
 #[derive(Debug, Clone)]
 #[must_use]
@@ -183,6 +221,9 @@ pub struct EncodeConfig {
     /// P-frames. Setting it equal to `virtual_buffer_size_ms` gives
     /// IDR frames maximum headroom.
     pub initial_virtual_buffer_size_ms: u32,
+    /// Color description for VUI signaling.
+    /// Defaults to BT.709 (full-range) when `None`.
+    pub color_description: Option<ColorDescription>,
 }
 
 impl EncodeConfig {
@@ -207,6 +248,7 @@ impl EncodeConfig {
             max_reference_frames: DEFAULT_MAX_REFERENCE_FRAMES,
             virtual_buffer_size_ms: 1000,
             initial_virtual_buffer_size_ms: 1000,
+            color_description: None,
         }
     }
 
@@ -231,6 +273,7 @@ impl EncodeConfig {
             max_reference_frames: DEFAULT_MAX_REFERENCE_FRAMES,
             virtual_buffer_size_ms: 1000,
             initial_virtual_buffer_size_ms: 1000,
+            color_description: None,
         }
     }
 
@@ -255,6 +298,7 @@ impl EncodeConfig {
             max_reference_frames: DEFAULT_MAX_REFERENCE_FRAMES,
             virtual_buffer_size_ms: 1000,
             initial_virtual_buffer_size_ms: 1000,
+            color_description: None,
         }
     }
 
@@ -331,6 +375,12 @@ impl EncodeConfig {
     /// Use 0 to tightly constrain IDR/I-frame sizes.
     pub fn with_initial_virtual_buffer_size_ms(mut self, ms: u32) -> Self {
         self.initial_virtual_buffer_size_ms = ms;
+        self
+    }
+
+    /// Set the color description for VUI signaling.
+    pub fn with_color_description(mut self, desc: ColorDescription) -> Self {
+        self.color_description = Some(desc);
         self
     }
 }
@@ -746,6 +796,29 @@ mod tests {
         fn test_codec_variants() {
             assert_ne!(Codec::H264, Codec::H265);
             assert_ne!(Codec::H265, Codec::AV1);
+        }
+    }
+
+    // ColorDescription tests.
+    mod color_description_tests {
+        use super::*;
+
+        #[test]
+        fn test_bt709() {
+            let cd = ColorDescription::bt709();
+            assert_eq!(cd.color_primaries, 1);
+            assert_eq!(cd.transfer_characteristics, 1);
+            assert_eq!(cd.matrix_coefficients, 1);
+            assert!(cd.full_range);
+        }
+
+        #[test]
+        fn test_bt2020_pq() {
+            let cd = ColorDescription::bt2020_pq();
+            assert_eq!(cd.color_primaries, 9);
+            assert_eq!(cd.transfer_characteristics, 16);
+            assert_eq!(cd.matrix_coefficients, 9);
+            assert!(!cd.full_range);
         }
     }
 }

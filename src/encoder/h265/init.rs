@@ -8,7 +8,7 @@ use crate::encoder::resources::{
     make_codec_name, map_bitstream_buffer, query_supported_video_formats, ClearImageParams,
     MIN_BITSTREAM_BUFFER_SIZE,
 };
-use crate::encoder::{BitDepth, PixelFormat};
+use crate::encoder::{BitDepth, ColorDescription, PixelFormat};
 use crate::error::{PixelForgeError, Result};
 use crate::vulkan::VideoContext;
 use ash::vk;
@@ -395,7 +395,7 @@ impl H265Encoder {
                 0, // long_term_ref_pics_present_flag
                 0, // sps_temporal_mvp_enabled_flag
                 0, // strong_intra_smoothing_enabled_flag
-                0, // vui_parameters_present_flag
+                1, // vui_parameters_present_flag
                 0, // sps_extension_present_flag
                 0, // sps_range_extension_flag
                 0, // transform_skip_rotation_enabled_flag
@@ -413,6 +413,65 @@ impl H265Encoder {
                 0, // sps_palette_predictor_initializers_present_flag
                 0, // intra_boundary_filtering_disabled_flag
             ),
+        };
+
+        // Build VUI structure. Defaults to BT.709 when no color description is set.
+        let color_desc = config
+            .color_description
+            .unwrap_or(ColorDescription::bt709());
+        let vui_flags = ash::vk::native::StdVideoH265SpsVuiFlags {
+            _bitfield_align_1: [],
+            _bitfield_1: ash::vk::native::StdVideoH265SpsVuiFlags::new_bitfield_1(
+                1,                                         // aspect_ratio_info_present_flag
+                0,                                         // overscan_info_present_flag
+                0,                                         // overscan_appropriate_flag
+                1,                                         // video_signal_type_present_flag
+                if color_desc.full_range { 1 } else { 0 }, // video_full_range_flag
+                1,                                         // colour_description_present_flag
+                0,                                         // chroma_loc_info_present_flag
+                0,                                         // neutral_chroma_indication_flag
+                0,                                         // field_seq_flag
+                0,                                         // frame_field_info_present_flag
+                0,                                         // default_display_window_flag
+                0,                                         // vui_timing_info_present_flag
+                0,                                         // vui_poc_proportional_to_timing_flag
+                0,                                         // vui_hrd_parameters_present_flag
+                0,                                         // bitstream_restriction_flag
+                0,                                         // tiles_fixed_structure_flag
+                0, // motion_vectors_over_pic_boundaries_flag
+                0, // restricted_ref_pic_lists_flag
+            ),
+            __bindgen_padding_0: 0,
+        };
+
+        let vui = ash::vk::native::StdVideoH265SequenceParameterSetVui {
+            flags: vui_flags,
+            aspect_ratio_idc:
+                ash::vk::native::StdVideoH265AspectRatioIdc_STD_VIDEO_H265_ASPECT_RATIO_IDC_SQUARE,
+            sar_width: 0,
+            sar_height: 0,
+            video_format: 5,
+            colour_primaries: color_desc.color_primaries,
+            transfer_characteristics: color_desc.transfer_characteristics,
+            matrix_coeffs: color_desc.matrix_coefficients,
+            chroma_sample_loc_type_top_field: 0,
+            chroma_sample_loc_type_bottom_field: 0,
+            reserved1: 0,
+            reserved2: 0,
+            def_disp_win_left_offset: 0,
+            def_disp_win_right_offset: 0,
+            def_disp_win_top_offset: 0,
+            def_disp_win_bottom_offset: 0,
+            vui_num_units_in_tick: 0,
+            vui_time_scale: 0,
+            vui_num_ticks_poc_diff_one_minus1: 0,
+            min_spatial_segmentation_idc: 0,
+            reserved3: 0,
+            max_bytes_per_pic_denom: 0,
+            max_bits_per_min_cu_denom: 0,
+            log2_max_mv_length_horizontal: 0,
+            log2_max_mv_length_vertical: 0,
+            pHrdParameters: ptr::null(),
         };
 
         // Calculate bit depth minus 8 values for SPS (0 for 8-bit, 2 for 10-bit)
@@ -477,7 +536,7 @@ impl H265Encoder {
             pScalingLists: ptr::null(),
             pShortTermRefPicSet: ptr::null(),
             pLongTermRefPicsSps: ptr::null(),
-            pSequenceParameterSetVui: ptr::null(),
+            pSequenceParameterSetVui: &vui,
             pPredictorPaletteEntries: ptr::null(),
         };
 

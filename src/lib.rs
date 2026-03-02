@@ -152,10 +152,10 @@ pub mod error;
 pub mod image;
 pub mod vulkan;
 
-pub use converter::{ColorConverter, ColorConverterConfig, InputFormat, OutputFormat};
+pub use converter::{ColorConverter, ColorConverterConfig, ColorSpace, InputFormat, OutputFormat};
 pub use encoder::{
-    BitDepth as EncodeBitDepth, Codec, EncodeConfig, EncodedPacket, Encoder, FrameType,
-    PixelFormat, RateControlMode, DEFAULT_FRAME_RATE, DEFAULT_GOP_SIZE, DEFAULT_H264_QP,
+    BitDepth as EncodeBitDepth, Codec, ColorDescription, EncodeConfig, EncodedPacket, Encoder,
+    FrameType, PixelFormat, RateControlMode, DEFAULT_FRAME_RATE, DEFAULT_GOP_SIZE, DEFAULT_H264_QP,
     DEFAULT_H265_QP, DEFAULT_MAX_BITRATE, DEFAULT_MAX_REFERENCE_FRAMES, DEFAULT_TARGET_BITRATE,
 };
 pub use error::PixelForgeError;

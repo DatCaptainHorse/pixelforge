@@ -8,6 +8,7 @@ use crate::encoder::resources::{
     map_bitstream_buffer, query_supported_video_formats, ClearImageParams,
     MIN_BITSTREAM_BUFFER_SIZE,
 };
+use crate::encoder::ColorDescription;
 use crate::encoder::PixelFormat;
 use crate::error::{PixelForgeError, Result};
 use crate::vulkan::VideoContext;
@@ -435,7 +436,10 @@ impl H264Encoder {
         let mut vui_flags: ash::vk::native::StdVideoH264SpsVuiFlags = unsafe { std::mem::zeroed() };
         vui_flags.set_aspect_ratio_info_present_flag(1);
         vui_flags.set_video_signal_type_present_flag(1);
-        vui_flags.set_video_full_range_flag(1);
+        let color_desc = config
+            .color_description
+            .unwrap_or(ColorDescription::bt709());
+        vui_flags.set_video_full_range_flag(if color_desc.full_range { 1 } else { 0 });
         vui_flags.set_color_description_present_flag(1);
         // Do not set HRD parameters when rate control is disabled/CQP.
         // HRD with zeroed bitrate values causes device loss on some drivers (AMD).
@@ -449,9 +453,9 @@ impl H264Encoder {
             sar_width: 0,
             sar_height: 0,
             video_format: 5,
-            colour_primaries: 1,
-            transfer_characteristics: 1,
-            matrix_coefficients: 1,
+            colour_primaries: color_desc.color_primaries,
+            transfer_characteristics: color_desc.transfer_characteristics,
+            matrix_coefficients: color_desc.matrix_coefficients,
             num_units_in_tick: 0,
             time_scale: 0,
             max_num_reorder_frames: if config.b_frame_count > 0 { 1 } else { 0 },

@@ -38,7 +38,7 @@ pub fn create_converter(
     let push_constant_range = vk::PushConstantRange::default()
         .stage_flags(vk::ShaderStageFlags::COMPUTE)
         .offset(0)
-        .size(16); // 4 x u32: width, height, input_format, output_format
+        .size(24); // 6 x u32: width, height, input_format, output_format, color_space, full_range
 
     let pipeline_layout_info = vk::PipelineLayoutCreateInfo::default()
         .set_layouts(std::slice::from_ref(&descriptor_set_layout))
@@ -48,7 +48,7 @@ pub fn create_converter(
         .map_err(|e| PixelForgeError::ResourceCreation(e.to_string()))?;
 
     // Create compute shader module.
-    let shader_code = super::shader::get_spirv_code();
+    let shader_code = super::shader::get_spirv_code()?;
     let shader_info = vk::ShaderModuleCreateInfo::default().code(&shader_code);
 
     let shader_module = unsafe { device.create_shader_module(&shader_info, None) }

@@ -56,6 +56,10 @@ pub enum PixelForgeError {
     /// Generic Vulkan error.
     #[error("Vulkan error: {0}")]
     Vulkan(ash::vk::Result),
+
+    /// Shader compilation failed.
+    #[error("Shader compilation failed: {0}")]
+    ShaderCompilation(String),
 }
 
 impl From<ash::vk::Result> for PixelForgeError {

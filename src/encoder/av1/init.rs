@@ -285,14 +285,45 @@ impl AV1Encoder {
         let frame_height_bits = 32 - (height - 1).leading_zeros();
 
         // AV1 color configuration.
+        // Map ColorDescription to AV1 enum constants, defaulting to BT.709.
+        let (av1_color_primaries, av1_transfer, av1_matrix, av1_full_range) = if let Some(cd) =
+            &config.color_description
+        {
+            let primaries = match cd.color_primaries {
+                9 => {
+                    ash::vk::native::StdVideoAV1ColorPrimaries_STD_VIDEO_AV1_COLOR_PRIMARIES_BT_2020
+                }
+                _ => {
+                    ash::vk::native::StdVideoAV1ColorPrimaries_STD_VIDEO_AV1_COLOR_PRIMARIES_BT_709
+                }
+            };
+            let transfer = match cd.transfer_characteristics {
+                    16 => ash::vk::native::StdVideoAV1TransferCharacteristics_STD_VIDEO_AV1_TRANSFER_CHARACTERISTICS_SMPTE_2084,
+                    _ => ash::vk::native::StdVideoAV1TransferCharacteristics_STD_VIDEO_AV1_TRANSFER_CHARACTERISTICS_BT_709,
+                };
+            let matrix = match cd.matrix_coefficients {
+                    9 => ash::vk::native::StdVideoAV1MatrixCoefficients_STD_VIDEO_AV1_MATRIX_COEFFICIENTS_BT_2020_NCL,
+                    _ => ash::vk::native::StdVideoAV1MatrixCoefficients_STD_VIDEO_AV1_MATRIX_COEFFICIENTS_BT_709,
+                };
+            let full_range = if cd.full_range { 1 } else { 0 };
+            (primaries, transfer, matrix, full_range)
+        } else {
+            (
+                    ash::vk::native::StdVideoAV1ColorPrimaries_STD_VIDEO_AV1_COLOR_PRIMARIES_BT_709,
+                    ash::vk::native::StdVideoAV1TransferCharacteristics_STD_VIDEO_AV1_TRANSFER_CHARACTERISTICS_BT_709,
+                    ash::vk::native::StdVideoAV1MatrixCoefficients_STD_VIDEO_AV1_MATRIX_COEFFICIENTS_BT_709,
+                    1, // full range for SDR
+                )
+        };
+
         let color_config_flags = ash::vk::native::StdVideoAV1ColorConfigFlags {
             _bitfield_align_1: [],
             _bitfield_1: ash::vk::native::StdVideoAV1ColorConfigFlags::new_bitfield_1(
-                0, // mono_chrome
-                1, // color_range (full range)
-                0, // separate_uv_delta_q
-                1, // color_description_present_flag (we provide color primaries/transfer/matrix)
-                0, // reserved
+                0,              // mono_chrome
+                av1_full_range, // color_range
+                0,              // separate_uv_delta_q
+                1,              // color_description_present_flag
+                0,              // reserved
             ),
         };
 
@@ -315,9 +346,9 @@ impl AV1Encoder {
             subsampling_x,
             subsampling_y,
             reserved1: 0,
-            color_primaries: ash::vk::native::StdVideoAV1ColorPrimaries_STD_VIDEO_AV1_COLOR_PRIMARIES_BT_709,
-            transfer_characteristics: ash::vk::native::StdVideoAV1TransferCharacteristics_STD_VIDEO_AV1_TRANSFER_CHARACTERISTICS_BT_709,
-            matrix_coefficients: ash::vk::native::StdVideoAV1MatrixCoefficients_STD_VIDEO_AV1_MATRIX_COEFFICIENTS_BT_709,
+            color_primaries: av1_color_primaries,
+            transfer_characteristics: av1_transfer,
+            matrix_coefficients: av1_matrix,
             chroma_sample_position: ash::vk::native::StdVideoAV1ChromaSamplePosition_STD_VIDEO_AV1_CHROMA_SAMPLE_POSITION_UNKNOWN,
         };
 
