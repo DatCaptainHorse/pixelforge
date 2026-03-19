@@ -1,13 +1,6 @@
-//! # PixelForge
-//!
 //! A Vulkan-based video encoding library for Rust, supporting H.264, H.265, and AV1 codecs.
 //!
-//! > ⚠️ **Disclaimer**: This library was developed using AI ("vibe-coding") - partly to
-//! > see if it could be done, partly because I have practically zero experience with Vulkan.
-//! > While the code has been tested and works in my usecase, it may not work in all cases
-//! > and it may not follow best practices. Contributions and improvements are very welcome!
-//!
-//! ## Features
+//! # Features
 //!
 //! - **Hardware-accelerated** video encoding using Vulkan Video extensions.
 //! - **Multiple codec support**: H.264/AVC, H.265/HEVC, AV1.
@@ -21,7 +14,7 @@
 //!
 //! > **Note**: B-frame support is not yet implemented. Setting `b_frame_count > 0` will panic.
 //!
-//! ## Supported Codecs
+//! # Supported Codecs
 //!
 //! | Codec | Encode |
 //! |-------|--------|
@@ -34,11 +27,11 @@
 //! > leads to progressively larger frame sizes over time. Consider using H.264 or HEVC
 //! > until this is resolved.
 //!
-//! ## Requirements
+//! # Requirements
 //!
 //! - A GPU with Vulkan video encoding support (e.g., NVIDIA RTX series, AMD RDNA2+, Intel Arc)
 //!
-//! ## Installation
+//! # Installation
 //!
 //! Add this to your `Cargo.toml`:
 //!
@@ -47,7 +40,7 @@
 //! pixelforge = "0.1"
 //! ```
 //!
-//! ### Optional Features
+//! ## Optional Features
 //!
 //! | Feature | Description |
 //! |---------|-------------|
@@ -60,9 +53,9 @@
 //! pixelforge = { version = "0.1", features = ["dmabuf"] }
 //! ```
 //!
-//! ## Quick Start
+//! # Quick Start
 //!
-//! ### Query Capabilities
+//! ## Query Capabilities
 //!
 //! ```rust,no_run
 //! use pixelforge::{Codec, VideoContextBuilder};
@@ -82,7 +75,7 @@
 //! }
 //! ```
 //!
-//! ### Encoding Video
+//! ## Encoding Video
 //!
 //! ```rust,no_run
 //! use pixelforge::{
@@ -122,7 +115,7 @@
 //! }
 //! ```
 //!
-//! ### Color Conversion (RGB → YUV)
+//! ## Color Conversion (RGB → YUV)
 //!
 //! PixelForge includes a GPU compute shader for converting RGB input to YUV output, supporting multiple color spaces:
 //!
@@ -152,7 +145,7 @@
 //! # }
 //! ```
 //!
-//! ## Examples
+//! # Examples
 //!
 //! Run the examples with:
 //!
@@ -173,16 +166,16 @@
 //! cargo run --example verify_all
 //! ```
 //!
-//! ## TODO's
+//! # TODO's
 //!
 //! 1. [] Decoding.
 //! 1. [] B-frames support.
 //!
-//! ## Contributing
+//! # Contributing
 //!
 //! Contributions are welcome! Please feel free to submit a Pull Request.
 //!
-//! ## Acknowledgement
+//! # Acknowledgement
 //!
 //! This project was heavily inspired by the [vk_video_samples](https://github.com/nvpro-samples/vk_video_samples)
 //! repository by NVIDIA, which provided invaluable reference for Vulkan Video encoding.

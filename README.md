@@ -1,15 +1,10 @@
+# pixelforge
+
 [![CI](https://github.com/hgaiser/pixelforge/workflows/CI/badge.svg)](https://github.com/hgaiser/pixelforge/actions)
 [![Crates.io](https://img.shields.io/crates/v/pixelforge.svg)](https://crates.io/crates/pixelforge)
 [![Documentation](https://docs.rs/pixelforge/badge.svg)](https://docs.rs/pixelforge)
 
-# PixelForge
-
 A Vulkan-based video encoding library for Rust, supporting H.264, H.265, and AV1 codecs.
-
-> ⚠️ **Disclaimer**: This library was developed using AI ("vibe-coding") - partly to
-> see if it could be done, partly because I have practically zero experience with Vulkan.
-> While the code has been tested and works in my usecase, it may not work in all cases
-> and it may not follow best practices. Contributions and improvements are very welcome!
 
 ## Features
 
