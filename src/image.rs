@@ -136,12 +136,20 @@ impl InputImage {
             .map_err(|e| PixelForgeError::MemoryAllocation(e.to_string()))?;
 
         // Create staging buffer for uploads.
-        // Size depends on pixel format and bit depth.
-        let staging_size = pixel_format.frame_size(width, height)
-            * match bit_depth {
-                BitDepth::Eight => 1,
-                BitDepth::Ten => 2, // 2 bytes per sample for 10-bit
-            };
+        // Size depends on pixel format, bit depth, and alignment padding between planes.
+        let bytes_per_sample_init = match bit_depth {
+            BitDepth::Eight => 1usize,
+            BitDepth::Ten => 2,
+        };
+        let luma_pixels = (width * height) as usize;
+        let staging_size = match pixel_format {
+            PixelFormat::Yuv444 => {
+                // Y plane (aligned to 4 bytes) + UV interleaved plane.
+                let y_bytes = luma_pixels * bytes_per_sample_init;
+                crate::align4(y_bytes) + luma_pixels * 2 * bytes_per_sample_init
+            }
+            _ => pixel_format.frame_size(width, height) * bytes_per_sample_init,
+        };
         let buffer_create_info = vk::BufferCreateInfo::default()
             .size(staging_size as vk::DeviceSize)
             .usage(vk::BufferUsageFlags::TRANSFER_SRC)
@@ -547,12 +555,15 @@ impl InputImage {
                     // Copy Y plane directly.
                     dst[..plane_size].copy_from_slice(&yuv_data[..plane_size]);
 
+                    // Align UV plane offset to 4 bytes for VkBufferImageCopy compliance.
+                    let uv_offset = crate::align4(plane_size);
+
                     // Interleave U and V planes for semi-planar format.
                     let u_plane = &yuv_data[plane_size..plane_size * 2];
                     let v_plane = &yuv_data[plane_size * 2..plane_size * 3];
                     for i in 0..plane_size {
-                        dst[plane_size + i * 2] = u_plane[i];
-                        dst[plane_size + i * 2 + 1] = v_plane[i];
+                        dst[uv_offset + i * 2] = u_plane[i];
+                        dst[uv_offset + i * 2 + 1] = v_plane[i];
                     }
                 }
                 BitDepth::Ten => {
@@ -564,12 +575,16 @@ impl InputImage {
                     for i in 0..plane_size {
                         dst[i] = (yuv_data[i] as u16) << 8;
                     }
+
+                    // Align UV plane offset to 4 bytes for VkBufferImageCopy compliance.
+                    let uv_offset_u16 = crate::align4(plane_size * 2) / 2;
+
                     // Interleave and convert U and V planes.
                     let u_plane = &yuv_data[plane_size..plane_size * 2];
                     let v_plane = &yuv_data[plane_size * 2..plane_size * 3];
                     for i in 0..plane_size {
-                        dst[plane_size + i * 2] = (u_plane[i] as u16) << 8;
-                        dst[plane_size + i * 2 + 1] = (v_plane[i] as u16) << 8;
+                        dst[uv_offset_u16 + i * 2] = (u_plane[i] as u16) << 8;
+                        dst[uv_offset_u16 + i * 2 + 1] = (v_plane[i] as u16) << 8;
                     }
                 }
             }
@@ -611,7 +626,15 @@ impl InputImage {
             BitDepth::Eight => 1,
             BitDepth::Ten => 2,
         };
-        let y_plane_size_bytes = (width * height) as usize * bytes_per_sample;
+        // For YUV444, align Y plane size to 4 bytes so the UV plane buffer offset
+        // meets VkBufferImageCopy::bufferOffset alignment requirements.
+        // YUV420 dimensions are always even (required for 4:2:0), so alignment is
+        // naturally satisfied and must not pad to stay consistent with upload functions.
+        let y_plane_bytes = (width * height) as usize * bytes_per_sample;
+        let y_plane_size_bytes = match self.pixel_format {
+            PixelFormat::Yuv444 => crate::align4(y_plane_bytes) as vk::DeviceSize,
+            _ => y_plane_bytes as vk::DeviceSize,
+        };
 
         unsafe {
             device.reset_command_buffer(self.command_buffer, vk::CommandBufferResetFlags::empty())
@@ -676,7 +699,7 @@ impl InputImage {
                         }),
                     // UV plane (interleaved, half resolution).
                     vk::BufferImageCopy::default()
-                        .buffer_offset(y_plane_size_bytes as vk::DeviceSize)
+                        .buffer_offset(y_plane_size_bytes)
                         .buffer_row_length(0)
                         .buffer_image_height(0)
                         .image_subresource(vk::ImageSubresourceLayers {
@@ -715,7 +738,7 @@ impl InputImage {
                         }),
                     // UV plane (interleaved, full resolution for 444).
                     vk::BufferImageCopy::default()
-                        .buffer_offset(y_plane_size_bytes as vk::DeviceSize)
+                        .buffer_offset(y_plane_size_bytes)
                         .buffer_row_length(0)
                         .buffer_image_height(0)
                         .image_subresource(vk::ImageSubresourceLayers {

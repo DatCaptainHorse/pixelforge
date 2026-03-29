@@ -186,6 +186,14 @@ pub mod error;
 pub mod image;
 pub mod vulkan;
 
+/// Align a byte size up to a multiple of 4.
+///
+/// Required for `VkBufferImageCopy::bufferOffset` to meet the texel block alignment
+/// of multi-component plane formats (e.g. R8G8, R16G16).
+pub(crate) const fn align4(size: usize) -> usize {
+    (size + 3) & !3
+}
+
 pub use converter::{ColorConverter, ColorConverterConfig, ColorSpace, InputFormat, OutputFormat};
 pub use encoder::{
     BitDepth as EncodeBitDepth, Codec, ColorDescription, EncodeConfig, EncodedPacket, Encoder,

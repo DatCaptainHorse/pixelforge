@@ -496,6 +496,19 @@ impl Encoder {
             Encoder::AV1(encoder) => encoder.request_idr(),
         }
     }
+
+    /// Update the color description (VUI parameters) for the encoder.
+    ///
+    /// This recreates the video session parameters with an updated SPS/VPS/sequence
+    /// header containing the new color description. The next frame will be encoded as
+    /// an IDR/key frame with the new parameters.
+    pub fn set_color_description(&mut self, desc: ColorDescription) -> Result<()> {
+        match self {
+            Encoder::H264(encoder) => encoder.set_color_description(desc),
+            Encoder::H265(encoder) => encoder.set_color_description(desc),
+            Encoder::AV1(encoder) => encoder.set_color_description(desc),
+        }
+    }
 }
 
 #[cfg(test)]

@@ -6,7 +6,7 @@ use crate::encoder::resources::{
     create_dpb_images, create_image, get_video_format, make_codec_name, map_bitstream_buffer,
     query_supported_video_formats, ClearImageParams,
 };
-use crate::encoder::PixelFormat;
+use crate::encoder::{ColorDescription, PixelFormat};
 use crate::error::{PixelForgeError, Result};
 use crate::vulkan::VideoContext;
 use ash::vk;
@@ -276,187 +276,10 @@ impl AV1Encoder {
         // Allocate session memory.
         let session_memory = allocate_session_memory(&context, session, &video_queue_fn)?;
 
-        // Create AV1 sequence header - similar to H.265 VPS/SPS/PPS but for AV1.
-        // Calculate frame dimension representation bits.
-        // Use actual display dimensions for sequence header (not coded extent).
-        // The video session's max_coded_extent is the upper bound for alignment,
-        // but the sequence header and per-frame coded extents use display dimensions.
-        let frame_width_bits = 32 - (width - 1).leading_zeros();
-        let frame_height_bits = 32 - (height - 1).leading_zeros();
+        let color_desc = config
+            .color_description
+            .unwrap_or(ColorDescription::bt709());
 
-        // AV1 color configuration.
-        // Map ColorDescription to AV1 enum constants, defaulting to BT.709.
-        let (av1_color_primaries, av1_transfer, av1_matrix, av1_full_range) = if let Some(cd) =
-            &config.color_description
-        {
-            let primaries = match cd.color_primaries {
-                9 => {
-                    ash::vk::native::StdVideoAV1ColorPrimaries_STD_VIDEO_AV1_COLOR_PRIMARIES_BT_2020
-                }
-                _ => {
-                    ash::vk::native::StdVideoAV1ColorPrimaries_STD_VIDEO_AV1_COLOR_PRIMARIES_BT_709
-                }
-            };
-            let transfer = match cd.transfer_characteristics {
-                    16 => ash::vk::native::StdVideoAV1TransferCharacteristics_STD_VIDEO_AV1_TRANSFER_CHARACTERISTICS_SMPTE_2084,
-                    _ => ash::vk::native::StdVideoAV1TransferCharacteristics_STD_VIDEO_AV1_TRANSFER_CHARACTERISTICS_BT_709,
-                };
-            let matrix = match cd.matrix_coefficients {
-                    9 => ash::vk::native::StdVideoAV1MatrixCoefficients_STD_VIDEO_AV1_MATRIX_COEFFICIENTS_BT_2020_NCL,
-                    _ => ash::vk::native::StdVideoAV1MatrixCoefficients_STD_VIDEO_AV1_MATRIX_COEFFICIENTS_BT_709,
-                };
-            let full_range = if cd.full_range { 1 } else { 0 };
-            (primaries, transfer, matrix, full_range)
-        } else {
-            (
-                    ash::vk::native::StdVideoAV1ColorPrimaries_STD_VIDEO_AV1_COLOR_PRIMARIES_BT_709,
-                    ash::vk::native::StdVideoAV1TransferCharacteristics_STD_VIDEO_AV1_TRANSFER_CHARACTERISTICS_BT_709,
-                    ash::vk::native::StdVideoAV1MatrixCoefficients_STD_VIDEO_AV1_MATRIX_COEFFICIENTS_BT_709,
-                    1, // full range for SDR
-                )
-        };
-
-        let color_config_flags = ash::vk::native::StdVideoAV1ColorConfigFlags {
-            _bitfield_align_1: [],
-            _bitfield_1: ash::vk::native::StdVideoAV1ColorConfigFlags::new_bitfield_1(
-                0,              // mono_chrome
-                av1_full_range, // color_range
-                0,              // separate_uv_delta_q
-                1,              // color_description_present_flag
-                0,              // reserved
-            ),
-        };
-
-        // Bit depth: 8 for Eight, 10 for Ten
-        let bit_depth = match config.bit_depth {
-            crate::encoder::BitDepth::Eight => 8,
-            crate::encoder::BitDepth::Ten => 10,
-        };
-
-        // Chroma subsampling based on pixel format.
-        let (subsampling_x, subsampling_y) = match config.pixel_format {
-            PixelFormat::Yuv420 => (1u8, 1u8), // 4:2:0
-            PixelFormat::Yuv444 => (0u8, 0u8), // 4:4:4
-            _ => (1u8, 1u8),                   // Default to 4:2:0
-        };
-
-        let color_config = ash::vk::native::StdVideoAV1ColorConfig {
-            flags: color_config_flags,
-            BitDepth: bit_depth,
-            subsampling_x,
-            subsampling_y,
-            reserved1: 0,
-            color_primaries: av1_color_primaries,
-            transfer_characteristics: av1_transfer,
-            matrix_coefficients: av1_matrix,
-            chroma_sample_position: ash::vk::native::StdVideoAV1ChromaSamplePosition_STD_VIDEO_AV1_CHROMA_SAMPLE_POSITION_UNKNOWN,
-        };
-
-        // AV1 sequence header flags - use minimal set to avoid driver issues.
-        // Disable features we're not providing data for (restoration, most inter-frame features).
-        let seq_flags = ash::vk::native::StdVideoAV1SequenceHeaderFlags {
-            _bitfield_align_1: [],
-            _bitfield_1: ash::vk::native::StdVideoAV1SequenceHeaderFlags::new_bitfield_1(
-                0, // still_picture
-                0, // reduced_still_picture_header
-                0, // use_128x128_superblock (use 64x64 superblocks)
-                0, // enable_filter_intra - disable for simplicity
-                0, // enable_intra_edge_filter - disable for simplicity
-                0, // enable_interintra_compound
-                0, // enable_masked_compound
-                0, // enable_warped_motion - disable for simplicity
-                0, // enable_dual_filter - disable for simplicity
-                1, // enable_order_hint - keep for reference frames
-                0, // enable_jnt_comp
-                0, // enable_ref_frame_mvs
-                0, // frame_id_numbers_present_flag
-                0, // enable_superres
-                1, // enable_cdef - keep enabled
-                0, // enable_restoration - DISABLE (we don't provide restoration data)
-                0, // film_grain_params_present
-                0, // timing_info_present_flag
-                0, // initial_display_delay_present_flag
-                0, // reserved
-            ),
-        };
-
-        let av1_sequence_header = ash::vk::native::StdVideoAV1SequenceHeader {
-            flags: seq_flags,
-            seq_profile: profile,
-            frame_width_bits_minus_1: (frame_width_bits - 1) as u8,
-            frame_height_bits_minus_1: (frame_height_bits - 1) as u8,
-            max_frame_width_minus_1: (width - 1) as u16,
-            max_frame_height_minus_1: (height - 1) as u16,
-            delta_frame_id_length_minus_2: 0,
-            additional_frame_id_length_minus_1: 0,
-            order_hint_bits_minus_1: 7, // 8 bits for order hint
-            seq_force_integer_mv: 0,
-            seq_force_screen_content_tools: 0,
-            reserved1: [0; 5],
-            pColorConfig: &color_config,
-            pTimingInfo: ptr::null(), // No timing info
-        };
-
-        // Create decoder model info (zero-initialized like FFmpeg).
-        let decoder_model_info = ash::vk::native::StdVideoEncodeAV1DecoderModelInfo {
-            buffer_delay_length_minus_1: 0,
-            buffer_removal_time_length_minus_1: 0,
-            frame_presentation_time_length_minus_1: 0,
-            reserved1: 0,
-            num_units_in_decoding_tick: 0,
-        };
-
-        // Create operating point info (single operating point like FFmpeg).
-        let operating_point = ash::vk::native::StdVideoEncodeAV1OperatingPointInfo {
-            flags: ash::vk::native::StdVideoEncodeAV1OperatingPointInfoFlags {
-                _bitfield_align_1: [],
-                _bitfield_1:
-                    ash::vk::native::StdVideoEncodeAV1OperatingPointInfoFlags::new_bitfield_1(
-                        0, // decoder_model_present_for_this_op
-                        0, // low_delay_mode_flag
-                        0, // initial_display_delay_present_for_this_op
-                        0, // reserved
-                    ),
-            },
-            operating_point_idc: 0,
-            seq_level_idx: 5, // Level 3.1 (encoded as: 2.0=0, 2.1=1, ... 3.0=4, 3.1=5)
-            seq_tier: 0,
-            initial_display_delay_minus_1: 0,
-            decoder_buffer_delay: 0,
-            encoder_buffer_delay: 0,
-        };
-
-        // Create session parameters with all required structures (matching FFmpeg).
-        let mut av1_session_params_create_info =
-            vk::VideoEncodeAV1SessionParametersCreateInfoKHR::default()
-                .std_sequence_header(&av1_sequence_header)
-                .std_decoder_model_info(&decoder_model_info)
-                .std_operating_points(std::slice::from_ref(&operating_point));
-
-        // Add quality level info to pNext chain (matching FFmpeg).
-        // Chain: SessionParametersCreateInfo -> QualityLevelInfo -> AV1SessionParametersCreateInfo
-        let mut quality_info = vk::VideoEncodeQualityLevelInfoKHR::default().quality_level(0); // Default quality level
-
-        quality_info.p_next = (&mut av1_session_params_create_info
-            as *mut vk::VideoEncodeAV1SessionParametersCreateInfoKHR)
-            .cast();
-
-        let session_params_create_info = vk::VideoSessionParametersCreateInfoKHR {
-            video_session: session,
-            p_next: (&mut quality_info as *mut vk::VideoEncodeQualityLevelInfoKHR).cast(),
-            ..Default::default()
-        };
-
-        let session_params = unsafe {
-            video_queue_fn
-                .create_video_session_parameters(&session_params_create_info, None)
-                .map_err(|e| {
-                    PixelForgeError::SessionParametersCreation(format!(
-                        "Failed to create AV1 session parameters: {:?}",
-                        e
-                    ))
-                })?
-        };
         // Create input image.
         let (input_image, input_image_memory, input_image_view) = create_image(
             &context,
@@ -535,14 +358,14 @@ impl AV1Encoder {
         // Initialize GOP structure.
         let gop = GopStructure::new(config.gop_size, config.b_frame_count, config.gop_size);
 
-        Ok(Self {
+        let mut encoder = Self {
             context,
             config,
             gop,
             video_queue_fn,
             video_encode_fn,
             session,
-            session_params,
+            session_params: vk::VideoSessionParametersKHR::null(),
             session_memory,
             input_frame_num: 0,
             encode_frame_num: 0,
@@ -571,6 +394,10 @@ impl AV1Encoder {
             header_data: None,
             current_dpb_slot: 0,
             references: Vec::new(),
-        })
+        };
+
+        encoder.session_params = encoder.create_session_params(&color_desc)?;
+
+        Ok(encoder)
     }
 }

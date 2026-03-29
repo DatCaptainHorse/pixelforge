@@ -38,7 +38,7 @@ pub fn create_converter(
     let push_constant_range = vk::PushConstantRange::default()
         .stage_flags(vk::ShaderStageFlags::COMPUTE)
         .offset(0)
-        .size(24); // 6 x u32: width, height, input_format, output_format, color_space, full_range
+        .size(28); // 7 x u32: width, height, input_format, output_format, color_space, full_range, sdr_white_nits(f32)
 
     let pipeline_layout_info = vk::PipelineLayoutCreateInfo::default()
         .set_layouts(std::slice::from_ref(&descriptor_set_layout))

@@ -5,6 +5,7 @@
 mod api;
 mod encode;
 mod init;
+mod session_params;
 
 use ash::vk;
 use tracing::debug;
@@ -173,8 +174,10 @@ impl Drop for AV1Encoder {
                     .free_memory(self.dpb_image_memories[i], None);
             }
 
-            self.video_queue_fn
-                .destroy_video_session_parameters(self.session_params, None);
+            if self.session_params != vk::VideoSessionParametersKHR::null() {
+                self.video_queue_fn
+                    .destroy_video_session_parameters(self.session_params, None);
+            }
             self.video_queue_fn
                 .destroy_video_session(self.session, None);
             for mem in &self.session_memory {

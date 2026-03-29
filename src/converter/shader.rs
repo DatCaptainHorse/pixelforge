@@ -42,6 +42,7 @@ layout(push_constant) uniform PushConstants {
     uint output_format;  // 0=NV12, 1=I420, 2=YUV444, 3=P010, 4=YUV444P10
     uint color_space;    // 0=BT.709, 1=BT.2020, 2=sRGB→BT.2020+PQ
     uint full_range;     // 0=limited/studio range, 1=full range
+    float sdr_white_nits; // SDR reference white (nits), used for sRGB→BT.2020+PQ
 } params;
 
 // Source image sampled directly — eliminates the image-to-buffer copy.
@@ -129,8 +130,9 @@ vec3 read_rgb(ivec2 coord) {
         // sRGB→BT.2020+PQ: decode sRGB gamma → linear BT.709 → BT.2020 gamut → PQ.
         vec3 linear_709 = srgb_to_linear(rgba.rgb);
         vec3 linear_2020 = bt709_to_bt2020(linear_709);
-        // SDR reference white at 203 nits (ITU-R BT.2408) → normalize to PQ's 10000 nit scale.
-        return linear_to_pq(linear_2020 * (203.0 / 10000.0));
+        // SDR reference white (configurable, default 203 nits per ITU-R BT.2408)
+        // normalized to PQ's 10000 nit scale.
+        return linear_to_pq(linear_2020 * (params.sdr_white_nits / 10000.0));
     }
     // BT.709 or BT.2020 passthrough: values are already properly encoded.
     return rgba.rgb;
@@ -198,20 +200,20 @@ void main() {
     uint pixel_count = params.width * params.height;
 
     if (params.output_format == 2u) {
-        // YUV444 8-bit: Full resolution, byte-packed into uints.
+        // YUV444 8-bit: 2-plane semi-planar (Y plane + UV interleaved).
         uint y_byte_idx = pixel_idx;
         uint y_word_idx = y_byte_idx / 4u;
         uint y_byte_offset = y_byte_idx % 4u;
         atomicOr(output_data[y_word_idx], q8_y(yuv.x) << (y_byte_offset * 8u));
 
-        uint u_base = pixel_count;
-        uint u_byte_idx = u_base + pixel_idx;
-        uint u_word_idx = u_byte_idx / 4u;
-        uint u_byte_offset = u_byte_idx % 4u;
-        atomicOr(output_data[u_word_idx], q8_c(yuv.y) << (u_byte_offset * 8u));
+        // Align UV plane offset to 4 bytes for VkBufferImageCopy compliance.
+        uint uv_base = (pixel_count + 3u) & ~3u;
+        uint uv_byte_idx = uv_base + pixel_idx * 2u;
+        uint uv_word_idx = uv_byte_idx / 4u;
+        uint uv_byte_offset = uv_byte_idx % 4u;
+        atomicOr(output_data[uv_word_idx], q8_c(yuv.y) << (uv_byte_offset * 8u));
 
-        uint v_base = 2u * pixel_count;
-        uint v_byte_idx = v_base + pixel_idx;
+        uint v_byte_idx = uv_byte_idx + 1u;
         uint v_word_idx = v_byte_idx / 4u;
         uint v_byte_offset = v_byte_idx % 4u;
         atomicOr(output_data[v_word_idx], q8_c(yuv.z) << (v_byte_offset * 8u));
@@ -221,7 +223,8 @@ void main() {
         uint y_packed_idx = pixel_idx / 2u;
         atomicOr(output_data[y_packed_idx], q10_y(yuv.x) << (y_half_offset * 16u));
 
-        uint uv_base_words = pixel_count / 2u;
+        // Align UV base to 4 bytes: Y plane is ceil(pixel_count/2) words.
+        uint uv_base_words = (pixel_count + 1u) / 2u;
         uint uv_word_idx = uv_base_words + pixel_idx;
         uint uv_packed = q10_c(yuv.y) | (q10_c(yuv.z) << 16u);
         output_data[uv_word_idx] = uv_packed;

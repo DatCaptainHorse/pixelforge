@@ -1,7 +1,7 @@
 use super::AV1Encoder;
 
 use crate::encoder::gop::{GopFrameType, GopPosition};
-use crate::encoder::EncodedPacket;
+use crate::encoder::{ColorDescription, EncodedPacket};
 use crate::error::{PixelForgeError, Result};
 use ash::vk;
 use tracing::debug;
@@ -206,5 +206,54 @@ impl AV1Encoder {
                 }
             }
         }
+    }
+
+    /// Update the color description in the AV1 sequence header.
+    ///
+    /// This recreates the video session parameters with a new sequence header
+    /// containing the updated color configuration. The next encoded frame will
+    /// be a key frame with the new sequence header prepended.
+    pub fn set_color_description(&mut self, desc: ColorDescription) -> Result<()> {
+        // Wait for any in-flight encode to complete before modifying session params.
+        // Do NOT reset the fence here — submit_encode_and_read_bitstream() resets it
+        // before queue_submit. Leaving the fence signaled allows consecutive
+        // set_color_description() calls without deadlock.
+        unsafe {
+            self.context
+                .device()
+                .wait_for_fences(&[self.encode_fence], true, u64::MAX)
+                .map_err(|e| {
+                    PixelForgeError::Synchronization(format!(
+                        "Failed to wait for encode fence: {:?}",
+                        e
+                    ))
+                })?;
+        }
+
+        // Save old handle so we can destroy it after successful creation.
+        let old_session_params = self.session_params;
+
+        let new_session_params = self.create_session_params(&desc)?;
+
+        // Destroy old session parameters now that the new ones are created.
+        unsafe {
+            self.video_queue_fn
+                .destroy_video_session_parameters(old_session_params, None);
+        }
+
+        self.session_params = new_session_params;
+        self.config.color_description = Some(desc);
+        self.header_data = None; // Invalidate cached sequence header
+        self.gop.request_idr();
+
+        debug!(
+            "AV1 color description updated: primaries={}, transfer={}, matrix={}, full_range={}",
+            desc.color_primaries,
+            desc.transfer_characteristics,
+            desc.matrix_coefficients,
+            desc.full_range
+        );
+
+        Ok(())
     }
 }

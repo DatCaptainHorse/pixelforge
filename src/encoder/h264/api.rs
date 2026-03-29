@@ -2,7 +2,7 @@ use super::H264Encoder;
 
 use crate::encoder::dpb::{DecodedPictureBufferTrait, DpbConfig, PictureStartInfo, PictureType};
 use crate::encoder::gop::{GopFrameType, GopPosition};
-use crate::encoder::EncodedPacket;
+use crate::encoder::{ColorDescription, EncodedPacket};
 use crate::error::Result;
 use crate::PixelForgeError;
 use ash::vk;
@@ -236,5 +236,60 @@ impl H264Encoder {
                 }
             }
         }
+    }
+
+    /// Update the color description (VUI parameters) in the encoded stream.
+    ///
+    /// This recreates the video session parameters with a new SPS containing the
+    /// updated VUI color primaries, transfer characteristics, and matrix coefficients.
+    /// The next encoded frame will be an IDR with the new SPS/PPS prepended.
+    pub fn set_color_description(&mut self, desc: ColorDescription) -> Result<()> {
+        // Wait for any in-flight encode to complete before modifying session params.
+        // Do NOT reset the fence here — submit_encode_and_read_bitstream() resets it
+        // before queue_submit. Leaving the fence signaled allows consecutive
+        // set_color_description() calls without deadlock.
+        unsafe {
+            self.context
+                .device()
+                .wait_for_fences(&[self.encode_fence], true, u64::MAX)
+                .map_err(|e| {
+                    PixelForgeError::Synchronization(format!(
+                        "Failed to wait for encode fence: {:?}",
+                        e
+                    ))
+                })?;
+        }
+
+        // Save old handle so we can destroy it after successful creation.
+        let old_session_params = self.session_params;
+
+        let new_session_params = self.create_session_params(&desc)?;
+
+        // Destroy old session parameters now that the new ones are created.
+        unsafe {
+            (self
+                .video_queue_fn
+                .fp()
+                .destroy_video_session_parameters_khr)(
+                self.context.device().handle(),
+                old_session_params,
+                std::ptr::null(),
+            );
+        }
+
+        self.session_params = new_session_params;
+        self.config.color_description = Some(desc);
+        self.sps_written = false;
+        self.gop.request_idr();
+
+        debug!(
+            "H.264 color description updated: primaries={}, transfer={}, matrix={}, full_range={}",
+            desc.color_primaries,
+            desc.transfer_characteristics,
+            desc.matrix_coefficients,
+            desc.full_range
+        );
+
+        Ok(())
     }
 }

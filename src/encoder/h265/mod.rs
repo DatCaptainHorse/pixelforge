@@ -5,6 +5,7 @@
 mod api;
 mod encode;
 mod init;
+mod session_params;
 
 use ash::vk;
 use tracing::debug;
@@ -94,6 +95,8 @@ pub struct H265Encoder {
     l0_references: Vec<ReferenceInfo>,
     /// Number of active reference frames.
     active_reference_count: u32,
+    /// H.265 profile IDC (cached from initialization for session parameter recreation).
+    profile_idc: u32,
 
     // DPB slot activation tracking.
     /// Tracks which DPB slots have been activated (used at least once).

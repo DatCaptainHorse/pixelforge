@@ -85,25 +85,35 @@ pub enum OutputFormat {
     NV12,
     /// I420: Y plane, U plane, V plane (4:2:0), 8-bit.
     I420,
-    /// YUV444: Full resolution Y, U, V planes, 8-bit.
+    /// YUV444 8-bit: 2-plane semi-planar (Y plane + interleaved UV) at full resolution.
     YUV444,
     /// P010: Y plane followed by interleaved UV (4:2:0), 10-bit in 16-bit words.
     P010,
-    /// YUV444 10-bit: Full resolution Y, U, V in 16-bit words.
+    /// YUV444 10-bit: 2-plane semi-planar (Y plane + interleaved UV) in 16-bit words.
     YUV444P10,
 }
 
 impl OutputFormat {
     /// Calculate output size in bytes for given dimensions.
+    ///
+    /// The returned size is always a multiple of 4, since the compute shader writes
+    /// to a `uint[]` buffer and `vkCmdFillBuffer` requires 4-byte aligned sizes.
     pub fn output_size(&self, width: u32, height: u32) -> usize {
         let pixel_count = (width * height) as usize;
-        match self {
+        let raw = match self {
             OutputFormat::NV12 | OutputFormat::I420 => pixel_count * 3 / 2,
-            OutputFormat::YUV444 => pixel_count * 3,
+            OutputFormat::YUV444 => {
+                // Y plane (aligned to 4 bytes) + UV interleaved plane.
+                crate::align4(pixel_count) + pixel_count * 2
+            }
             // 10-bit formats use 2 bytes per sample.
             OutputFormat::P010 => pixel_count * 3, // Y (2 bytes) + UV (1 byte each, half res)
-            OutputFormat::YUV444P10 => pixel_count * 6, // Y + U + V, each 2 bytes.
-        }
+            OutputFormat::YUV444P10 => {
+                // Y plane (2 bytes/sample, aligned to 4 bytes) + UV interleaved (4 bytes/pixel).
+                crate::align4(pixel_count * 2) + pixel_count * 4
+            }
+        };
+        crate::align4(raw)
     }
 
     /// Get the Vulkan format for this output format.
@@ -111,7 +121,7 @@ impl OutputFormat {
         match self {
             OutputFormat::NV12 => vk::Format::G8_B8R8_2PLANE_420_UNORM,
             OutputFormat::I420 => vk::Format::G8_B8_R8_3PLANE_420_UNORM,
-            OutputFormat::YUV444 => vk::Format::G8_B8_R8_3PLANE_444_UNORM,
+            OutputFormat::YUV444 => vk::Format::G8_B8R8_2PLANE_444_UNORM,
             OutputFormat::P010 => vk::Format::G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16,
             OutputFormat::YUV444P10 => vk::Format::G10X6_B10X6R10X6_2PLANE_444_UNORM_3PACK16,
         }
@@ -150,6 +160,11 @@ pub struct ColorConverterConfig {
     /// Full range (0-255 luma) or limited/studio range (16-235 luma).
     /// Must match the `full_range` flag in `ColorDescription` for correct playback.
     pub full_range: bool,
+    /// SDR reference white level in nits for the sRGB→BT.2020+PQ conversion.
+    ///
+    /// Per ITU-R BT.2408 the standard value is 203 nits.
+    /// Only used when `color_space` is `SrgbToBt2020Pq`.
+    pub sdr_reference_white_nits: f32,
 }
 
 impl ColorConverterConfig {
@@ -167,6 +182,7 @@ impl ColorConverterConfig {
             output_format,
             color_space: ColorSpace::Bt709,
             full_range: true,
+            sdr_reference_white_nits: 203.0,
         }
     }
 }
@@ -229,6 +245,14 @@ impl ColorConverter {
     /// since the color space is passed via push constants.
     pub fn set_color_space(&mut self, color_space: ColorSpace) {
         self.config.color_space = color_space;
+    }
+
+    /// Set the full-range flag for subsequent conversions.
+    ///
+    /// This takes effect on the next `convert()` call without recreating the pipeline,
+    /// since the full-range flag is passed via push constants.
+    pub fn set_full_range(&mut self, full_range: bool) {
+        self.config.full_range = full_range;
     }
 
     /// Build buffer-to-image copy regions for multi-planar YUV formats.
@@ -341,8 +365,10 @@ impl ColorConverter {
                 ]
             }
             OutputFormat::YUV444 => {
-                // YUV444: Y, U, V planes all at full resolution.
-                let plane_size = (self.config.width * self.config.height) as u64;
+                // YUV444 8-bit 2-plane: Y plane at full resolution, UV interleaved at full resolution.
+                // Align Y plane size to 4 bytes for VkBufferImageCopy::bufferOffset compliance.
+                let y_size =
+                    crate::align4((self.config.width * self.config.height) as usize) as u64;
                 vec![
                     // Y plane.
                     vk::BufferImageCopy {
@@ -362,31 +388,13 @@ impl ColorConverter {
                             depth: 1,
                         },
                     },
-                    // U plane.
+                    // UV plane (interleaved, full resolution).
                     vk::BufferImageCopy {
-                        buffer_offset: plane_size,
+                        buffer_offset: y_size,
                         buffer_row_length: 0,
                         buffer_image_height: 0,
                         image_subresource: vk::ImageSubresourceLayers {
                             aspect_mask: vk::ImageAspectFlags::PLANE_1,
-                            mip_level: 0,
-                            base_array_layer: 0,
-                            layer_count: 1,
-                        },
-                        image_offset: vk::Offset3D { x: 0, y: 0, z: 0 },
-                        image_extent: vk::Extent3D {
-                            width: self.config.width,
-                            height: self.config.height,
-                            depth: 1,
-                        },
-                    },
-                    // V plane.
-                    vk::BufferImageCopy {
-                        buffer_offset: plane_size * 2,
-                        buffer_row_length: 0,
-                        buffer_image_height: 0,
-                        image_subresource: vk::ImageSubresourceLayers {
-                            aspect_mask: vk::ImageAspectFlags::PLANE_2,
                             mip_level: 0,
                             base_array_layer: 0,
                             layer_count: 1,
@@ -446,8 +454,9 @@ impl ColorConverter {
             }
             OutputFormat::YUV444P10 => {
                 // YUV444 10-bit: 2-plane format (Y plane, UV interleaved).
-                // Note: Using 2-plane format as that's what the encoder expects.
-                let y_size = (self.config.width * self.config.height * 2) as u64;
+                // Align Y plane size to 4 bytes for VkBufferImageCopy::bufferOffset compliance.
+                let y_size =
+                    crate::align4((self.config.width * self.config.height * 2) as usize) as u64;
                 vec![
                     // Y plane (16-bit samples).
                     vk::BufferImageCopy {
@@ -628,14 +637,15 @@ impl ColorConverter {
                 &[],
             );
 
-            // Push constants: width, height, input_format, output_format, color_space, full_range.
-            let push_constants: [u32; 6] = [
+            // Push constants: width, height, input_format, output_format, color_space, full_range, sdr_white_nits.
+            let push_constants: [u32; 7] = [
                 self.config.width,
                 self.config.height,
                 self.config.input_format as u32,
                 self.config.output_format as u32,
                 self.config.color_space as u32,
                 self.config.full_range as u32,
+                self.config.sdr_reference_white_nits.to_bits(),
             ];
             let push_constants_bytes: &[u8] = std::slice::from_raw_parts(
                 push_constants.as_ptr() as *const u8,
@@ -989,6 +999,7 @@ mod tests {
             output_format: OutputFormat::NV12,
             color_space: ColorSpace::Bt709,
             full_range: true,
+            sdr_reference_white_nits: 203.0,
         };
 
         let cloned = config.clone();
@@ -1009,6 +1020,7 @@ mod tests {
             output_format: OutputFormat::I420,
             color_space: ColorSpace::Bt709,
             full_range: true,
+            sdr_reference_white_nits: 203.0,
         };
 
         let debug_str = format!("{:?}", config);
@@ -1050,6 +1062,7 @@ mod tests {
             output_format: OutputFormat::NV12,
             color_space: ColorSpace::Bt709,
             full_range: true,
+            sdr_reference_white_nits: 203.0,
         };
 
         let result = ColorConverter::new(context, config);
@@ -1084,6 +1097,7 @@ mod tests {
                     output_format: *output_format,
                     color_space: ColorSpace::Bt709,
                     full_range: true,
+                    sdr_reference_white_nits: 203.0,
                 };
 
                 let result = ColorConverter::new(context.clone(), config);

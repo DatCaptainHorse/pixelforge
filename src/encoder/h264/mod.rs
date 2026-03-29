@@ -5,6 +5,7 @@
 mod api;
 mod encode;
 mod init;
+mod session_params;
 
 use ash::vk;
 use tracing::debug;
@@ -102,6 +103,10 @@ pub struct H264Encoder {
     l0_references: Vec<ReferenceInfo>,
     /// Number of active reference frames (as configured/negotiated).
     active_reference_count: u32,
+    /// H.264 profile IDC (cached from initialization for session parameter recreation).
+    profile_idc: u32,
+    /// Whether CABAC entropy coding is preferred (cached from quality level query).
+    preferred_entropy_cabac: bool,
 }
 
 impl H264Encoder {
