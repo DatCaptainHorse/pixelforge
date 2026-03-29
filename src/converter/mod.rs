@@ -241,6 +241,14 @@ impl ColorConverter {
         self.config.color_space = color_space;
     }
 
+    /// Set the full-range flag for subsequent conversions.
+    ///
+    /// This takes effect on the next `convert()` call without recreating the pipeline,
+    /// since the full-range flag is passed via push constants.
+    pub fn set_full_range(&mut self, full_range: bool) {
+        self.config.full_range = full_range;
+    }
+
     /// Build buffer-to-image copy regions for multi-planar YUV formats.
     ///
     /// For multi-planar formats like NV12, I420, and YUV444, we need separate.
