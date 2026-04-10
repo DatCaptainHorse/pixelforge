@@ -418,7 +418,7 @@ impl VideoContext {
             extension_names.push(ash::ext::image_drm_format_modifier::NAME.as_ptr());
         }
 
-        let mut push_ext = |name: *const i8| {
+        let mut push_ext = |name: *const std::ffi::c_char| {
             if !extension_names.contains(&name) {
                 extension_names.push(name);
             }

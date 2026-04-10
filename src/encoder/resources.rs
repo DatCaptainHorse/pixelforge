@@ -123,13 +123,13 @@ pub(crate) fn get_video_format(pixel_format: PixelFormat, bit_depth: BitDepth) -
 
 /// Create a codec name array for Vulkan from a string.
 ///
-/// This creates a null-terminated i8 array of 256 bytes for use with Vulkan
+/// This creates a null-terminated c_char array of 256 bytes for use with Vulkan
 /// video extensions.
-pub(crate) fn make_codec_name(codec_name: &[u8]) -> [i8; 256] {
-    let mut name = [0i8; 256];
+pub(crate) fn make_codec_name(codec_name: &[u8]) -> [std::ffi::c_char; 256] {
+    let mut name = [0 as std::ffi::c_char; 256];
     for (i, &byte) in codec_name.iter().enumerate() {
         if i < 255 {
-            name[i] = byte as i8;
+            name[i] = byte as std::ffi::c_char;
         }
     }
     name
