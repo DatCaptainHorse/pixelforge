@@ -92,12 +92,17 @@ impl H264Encoder {
         };
 
         // Build StdVideoEncodeH264SliceHeader.
+        // num_ref_idx_active_override_flag is only present in P/B/SP slice headers per the H.264
+        // spec. For P/B slices we set it to 1 so each slice signals the actual available
+        // reference count instead of relying on the PPS default, preventing "Missing reference
+        // picture" errors when the DPB is not yet full.
+        let use_ref_override = !is_idr as u32;
         let slice_header_flags = ash::vk::native::StdVideoEncodeH264SliceHeaderFlags {
             _bitfield_align_1: [],
             _bitfield_1: ash::vk::native::StdVideoEncodeH264SliceHeaderFlags::new_bitfield_1(
-                0, // direct_spatial_mv_pred_flag
-                0, // num_ref_idx_active_override_flag
-                0, // reserved
+                0,                // direct_spatial_mv_pred_flag
+                use_ref_override, // num_ref_idx_active_override_flag
+                0,                // reserved
             ),
         };
 
@@ -173,38 +178,27 @@ impl H264Encoder {
                 (0, 0)
             }
         } else if !is_idr && !self.l0_references.is_empty() {
-            // P-frame: L0 reference list.
-            // WE MUST FILL THE LIST UP TO THE PPS DEFAULT COUNT using duplicates if needed.
+            // P-frame: L0 reference list using actual available references,
+            // clamped to the negotiated active count (which is itself ≤32 at init time).
+            let actual_count = self
+                .l0_references
+                .len()
+                .min(self.active_reference_count as usize)
+                .min(32);
 
-            // Use negotiated active count.
-            let target_count = self.active_reference_count as usize;
-            let count = self.l0_references.len();
-
-            // 1. Fill actual references
-            for (i, ref_info) in self.l0_references.iter().enumerate() {
-                if i < 32 {
-                    ref_list0[i] = ref_info.dpb_slot;
-                }
+            for (i, ref_info) in self.l0_references.iter().take(actual_count).enumerate() {
+                ref_list0[i] = ref_info.dpb_slot;
             }
 
-            // 2. Pad with duplicates of the last reference if needed to reach target_count
-            if count < target_count && count > 0 {
-                let last_slot = ref_list0[count - 1];
-                let end = target_count.min(32);
-                ref_list0[count..end].fill(last_slot);
-            }
-
-            // We provide target_count entries if we have at least 1, otherwise 0.
-            (target_count.min(32), 0)
+            (actual_count, 0)
         } else {
             // IDR: no references.
             (0, 0)
         };
 
-        // Note: num_ref_idx_l0_active_minus1 in ReferenceListsInfo tells the driver/hardware
-        // how many entries in our RefPicList0 array are valid.
-        // Since we ensure 3 entries are valid (by duplicating), we set this to 2.
-
+        // num_ref_idx_l0_active_minus1 tells the driver how many entries in RefPicList0
+        // are valid and is encoded into the slice header (because we set
+        // num_ref_idx_active_override_flag=1 above).
         let ref_lists_info = ash::vk::native::StdVideoEncodeH264ReferenceListsInfo {
             flags: ref_lists_info_flags,
             num_ref_idx_l0_active_minus1: if num_ref_l0 > 0 {
