@@ -1,9 +1,4 @@
 //! Vulkan context and initialization for video encoding.
-//!
-//! Note: Vulkan p_next chaining requires creating default structs and then assigning p_next,
-//! which triggers clippy::field_reassign_with_default. This is the correct pattern for Vulkan.
-#![allow(clippy::field_reassign_with_default)]
-
 use crate::encoder::Codec;
 use crate::error::{PixelForgeError, Result};
 use ash::vk;
@@ -82,6 +77,7 @@ struct VideoContextInner {
     memory_properties: vk::PhysicalDeviceMemoryProperties,
     device_properties: vk::PhysicalDeviceProperties,
     supported_encode_codecs: Vec<Codec>,
+    has_descriptor_buffer: bool,
 }
 
 impl Drop for VideoContextInner {
@@ -157,6 +153,11 @@ impl VideoContext {
     /// Contains information about the GPU such as device name, limits, and supported Vulkan version.
     pub fn device_properties(&self) -> &vk::PhysicalDeviceProperties {
         &self.inner.device_properties
+    }
+
+    /// Returns true if `VK_EXT_descriptor_buffer` is available and enabled.
+    pub fn has_descriptor_buffer(&self) -> bool {
+        self.inner.has_descriptor_buffer
     }
 }
 
@@ -242,6 +243,7 @@ impl VideoContext {
         let mut transfer_queue_family = u32::MAX;
         let mut compute_queue_family = u32::MAX;
         let mut supported_encode_codecs = Vec::new();
+        let mut has_descriptor_buffer_ext = false;
 
         for physical_device in physical_devices {
             let props = unsafe { instance.get_physical_device_properties(physical_device) };
@@ -306,6 +308,9 @@ impl VideoContext {
                         ext_name == name
                     })
                 };
+
+                // Check if descriptor buffer extension is available.
+                has_descriptor_buffer_ext = has_extension(ash::ext::descriptor_buffer::NAME);
 
                 // Only check codec support if the extension exists
                 if has_extension(ash::khr::video_encode_h264::NAME)
@@ -437,6 +442,13 @@ impl VideoContext {
             }
         }
 
+        // Enable VK_EXT_descriptor_buffer extension (required for descriptor buffer API).
+        if has_descriptor_buffer_ext {
+            push_ext(ash::ext::descriptor_buffer::NAME.as_ptr());
+        } else {
+            warn!("VK_EXT_descriptor_buffer not available on this device");
+        }
+
         // Enable synchronization2 feature.
         let mut sync2_features =
             vk::PhysicalDeviceSynchronization2Features::default().synchronization2(true);
@@ -472,6 +484,58 @@ impl VideoContext {
         sync2_features.p_next =
             (&mut ycbcr_features as *mut vk::PhysicalDeviceSamplerYcbcrConversionFeatures).cast();
 
+        // Query descriptor buffer and buffer device address feature support.
+        let mut desc_buf_features = vk::PhysicalDeviceDescriptorBufferFeaturesEXT::default();
+        let mut buffer_device_address_features =
+            vk::PhysicalDeviceBufferDeviceAddressFeatures::default();
+
+        if has_descriptor_buffer_ext {
+            let mut feat2 = vk::PhysicalDeviceFeatures2 {
+                p_next: (&mut desc_buf_features
+                    as *mut vk::PhysicalDeviceDescriptorBufferFeaturesEXT)
+                    .cast(),
+                ..Default::default()
+            };
+            unsafe {
+                instance.get_physical_device_features2(physical_device, &mut feat2);
+            }
+            let desc_buf_supported = desc_buf_features.descriptor_buffer != 0
+                && desc_buf_features.descriptor_buffer_capture_replay != 0;
+
+            // Query buffer device address support.
+            let mut feat2_bda = vk::PhysicalDeviceFeatures2 {
+                p_next: (&mut buffer_device_address_features
+                    as *mut vk::PhysicalDeviceBufferDeviceAddressFeatures)
+                    .cast(),
+                ..Default::default()
+            };
+            unsafe {
+                instance.get_physical_device_features2(physical_device, &mut feat2_bda);
+            }
+
+            if desc_buf_supported && buffer_device_address_features.buffer_device_address != 0 {
+                desc_buf_features.descriptor_buffer = 1;
+                desc_buf_features.descriptor_buffer_capture_replay = 1;
+            } else if desc_buf_supported {
+                warn!("VK_EXT_descriptor_buffer extension present but bufferDeviceAddress not supported; descriptor buffer will not be enabled");
+            }
+        }
+
+        // Build the feature chain: desc_buf_features -> buffer_device_address_features -> sync2_features -> ...
+        // Only chain desc_buf_features if the extension was available.
+        if has_descriptor_buffer_ext {
+            buffer_device_address_features.p_next =
+                (&mut sync2_features as *mut vk::PhysicalDeviceSynchronization2Features).cast();
+            desc_buf_features.p_next = (&mut buffer_device_address_features
+                as *mut vk::PhysicalDeviceBufferDeviceAddressFeatures)
+                .cast();
+        }
+
+        // Store whether descriptor buffer is available for use by callers.
+        let has_descriptor_buffer = has_descriptor_buffer_ext
+            && desc_buf_features.descriptor_buffer != 0
+            && desc_buf_features.descriptor_buffer_capture_replay != 0;
+
         // Log all extensions being enabled
         debug!("Enabling {} device extensions:", extension_names.len());
         for ext_name_ptr in &extension_names {
@@ -484,8 +548,14 @@ impl VideoContext {
             .enabled_extension_names(&extension_names);
 
         // Attach the chain to device_create_info.
-        device_create_info.p_next =
-            (&mut sync2_features as *mut vk::PhysicalDeviceSynchronization2Features).cast();
+        // When descriptor buffer is available, the chain is:
+        //   desc_buf_features -> buffer_device_address_features -> sync2_features -> ...
+        // When descriptor buffer is not available, only sync2_features is chained.
+        device_create_info.p_next = if has_descriptor_buffer_ext {
+            (&mut desc_buf_features as *mut vk::PhysicalDeviceDescriptorBufferFeaturesEXT).cast()
+        } else {
+            (&mut sync2_features as *mut vk::PhysicalDeviceSynchronization2Features).cast()
+        };
 
         let device = unsafe { instance.create_device(physical_device, &device_create_info, None) }
             .map_err(|e| PixelForgeError::DeviceCreation(e.to_string()))?;
@@ -518,6 +588,7 @@ impl VideoContext {
                 memory_properties,
                 device_properties,
                 supported_encode_codecs,
+                has_descriptor_buffer,
             }),
         })
     }
@@ -547,13 +618,15 @@ impl VideoContext {
         profile_info.p_next = (&mut h264_profile as *mut vk::VideoEncodeH264ProfileInfoKHR).cast();
 
         // Create capabilities structures.
-        let mut encode_capabilities = vk::VideoEncodeCapabilitiesKHR::default();
         let mut h264_capabilities = vk::VideoEncodeH264CapabilitiesKHR::default();
-        encode_capabilities.p_next =
-            &mut h264_capabilities as *mut vk::VideoEncodeH264CapabilitiesKHR as *mut _;
-        let mut capabilities = vk::VideoCapabilitiesKHR::default();
-        capabilities.p_next =
-            &mut encode_capabilities as *mut vk::VideoEncodeCapabilitiesKHR as *mut _;
+        let mut encode_capabilities = vk::VideoEncodeCapabilitiesKHR {
+            p_next: &mut h264_capabilities as *mut vk::VideoEncodeH264CapabilitiesKHR as *mut _,
+            ..Default::default()
+        };
+        let mut capabilities = vk::VideoCapabilitiesKHR {
+            p_next: &mut encode_capabilities as *mut vk::VideoEncodeCapabilitiesKHR as *mut _,
+            ..Default::default()
+        };
 
         // Query capabilities.
         let result = unsafe {
@@ -610,13 +683,15 @@ impl VideoContext {
         profile_info.p_next = (&mut h265_profile as *mut vk::VideoEncodeH265ProfileInfoKHR).cast();
 
         // Create capabilities structures.
-        let mut encode_capabilities = vk::VideoEncodeCapabilitiesKHR::default();
         let mut h265_capabilities = vk::VideoEncodeH265CapabilitiesKHR::default();
-        encode_capabilities.p_next =
-            &mut h265_capabilities as *mut vk::VideoEncodeH265CapabilitiesKHR as *mut _;
-        let mut capabilities = vk::VideoCapabilitiesKHR::default();
-        capabilities.p_next =
-            &mut encode_capabilities as *mut vk::VideoEncodeCapabilitiesKHR as *mut _;
+        let mut encode_capabilities = vk::VideoEncodeCapabilitiesKHR {
+            p_next: &mut h265_capabilities as *mut vk::VideoEncodeH265CapabilitiesKHR as *mut _,
+            ..Default::default()
+        };
+        let mut capabilities = vk::VideoCapabilitiesKHR {
+            p_next: &mut encode_capabilities as *mut vk::VideoEncodeCapabilitiesKHR as *mut _,
+            ..Default::default()
+        };
 
         // Query capabilities.
         let result = unsafe {
@@ -672,13 +747,15 @@ impl VideoContext {
         profile_info.p_next = (&mut av1_profile as *mut vk::VideoEncodeAV1ProfileInfoKHR).cast();
 
         // Create capabilities structures.
-        let mut encode_capabilities = vk::VideoEncodeCapabilitiesKHR::default();
         let mut av1_capabilities = vk::VideoEncodeAV1CapabilitiesKHR::default();
-        encode_capabilities.p_next =
-            &mut av1_capabilities as *mut vk::VideoEncodeAV1CapabilitiesKHR as *mut _;
-        let mut capabilities = vk::VideoCapabilitiesKHR::default();
-        capabilities.p_next =
-            &mut encode_capabilities as *mut vk::VideoEncodeCapabilitiesKHR as *mut _;
+        let mut encode_capabilities = vk::VideoEncodeCapabilitiesKHR {
+            p_next: &mut av1_capabilities as *mut vk::VideoEncodeAV1CapabilitiesKHR as *mut _,
+            ..Default::default()
+        };
+        let mut capabilities = vk::VideoCapabilitiesKHR {
+            p_next: &mut encode_capabilities as *mut vk::VideoEncodeCapabilitiesKHR as *mut _,
+            ..Default::default()
+        };
 
         // Query capabilities.
         let result = unsafe {

@@ -1,5 +1,4 @@
 //! Vulkan compute pipeline creation for color conversion.
-
 use super::{ColorConverter, ColorConverterConfig};
 use crate::encoder::resources::find_memory_type;
 use crate::error::{PixelForgeError, Result};
@@ -11,7 +10,15 @@ pub fn create_converter(
     context: VideoContext,
     config: ColorConverterConfig,
 ) -> Result<ColorConverter> {
+    if !context.has_descriptor_buffer() {
+        return Err(PixelForgeError::NoSuitableDevice(
+            "VK_EXT_descriptor_buffer with capture-replay is required but not available on this device".to_string(),
+        ));
+    }
+
     let device = context.device();
+    let instance = context.instance();
+    let physical_device = context.physical_device();
 
     // Create descriptor set layout.
     let bindings = [
@@ -29,7 +36,9 @@ pub fn create_converter(
             .stage_flags(vk::ShaderStageFlags::COMPUTE),
     ];
 
-    let layout_info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
+    let layout_info = vk::DescriptorSetLayoutCreateInfo::default()
+        .flags(vk::DescriptorSetLayoutCreateFlags::DESCRIPTOR_BUFFER_EXT)
+        .bindings(&bindings);
 
     let descriptor_set_layout = unsafe { device.create_descriptor_set_layout(&layout_info, None) }
         .map_err(|e| PixelForgeError::ResourceCreation(e.to_string()))?;
@@ -73,32 +82,6 @@ pub fn create_converter(
     // Destroy shader module (no longer needed after pipeline creation)
     unsafe { device.destroy_shader_module(shader_module, None) };
 
-    // Create descriptor pool.
-    let pool_sizes = [
-        vk::DescriptorPoolSize::default()
-            .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-            .descriptor_count(1),
-        vk::DescriptorPoolSize::default()
-            .ty(vk::DescriptorType::STORAGE_BUFFER)
-            .descriptor_count(1),
-    ];
-
-    let pool_info = vk::DescriptorPoolCreateInfo::default()
-        .flags(vk::DescriptorPoolCreateFlags::FREE_DESCRIPTOR_SET)
-        .max_sets(1)
-        .pool_sizes(&pool_sizes);
-
-    let descriptor_pool = unsafe { device.create_descriptor_pool(&pool_info, None) }
-        .map_err(|e| PixelForgeError::ResourceCreation(e.to_string()))?;
-
-    // Allocate descriptor set.
-    let alloc_info = vk::DescriptorSetAllocateInfo::default()
-        .descriptor_pool(descriptor_pool)
-        .set_layouts(std::slice::from_ref(&descriptor_set_layout));
-
-    let descriptor_set = unsafe { device.allocate_descriptor_sets(&alloc_info) }
-        .map_err(|e| PixelForgeError::ResourceCreation(e.to_string()))?[0];
-
     // Calculate output buffer size.
     let output_size = config
         .output_format
@@ -127,20 +110,87 @@ pub fn create_converter(
         vk::MemoryPropertyFlags::DEVICE_LOCAL,
     )?;
 
-    // Write only the output buffer descriptor now; the source image descriptor
-    // is written per-frame in convert() when we know the actual source ImageView.
-    let output_buffer_info = vk::DescriptorBufferInfo::default()
-        .buffer(output_buffer)
-        .offset(0)
-        .range(output_size as vk::DeviceSize);
+    // Query descriptor buffer properties to determine correct capture sizes.
+    let mut db_props = vk::PhysicalDeviceDescriptorBufferPropertiesEXT::default();
+    let mut props = vk::PhysicalDeviceProperties2 {
+        p_next: &mut db_props as *mut _ as *mut _,
+        ..Default::default()
+    };
+    unsafe {
+        instance.get_physical_device_properties2(physical_device, &mut props);
+    }
+    let sampler_cap_size = db_props.sampler_capture_replay_descriptor_data_size;
+    let image_cap_size = db_props.image_view_capture_replay_descriptor_data_size;
+    let buffer_cap_size = db_props.buffer_capture_replay_descriptor_data_size;
 
-    let writes = [vk::WriteDescriptorSet::default()
-        .dst_set(descriptor_set)
-        .dst_binding(1)
-        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-        .buffer_info(std::slice::from_ref(&output_buffer_info))];
+    // Query descriptor set layout size and binding offsets for correct buffer sizing.
+    let ext_device =
+        ash::ext::descriptor_buffer::Device::load(context.instance(), context.device());
+    let vk_device = context.device().handle();
+    let mut layout_size = 0u64;
+    unsafe {
+        (ext_device.fp().get_descriptor_set_layout_size_ext)(
+            vk_device,
+            descriptor_set_layout,
+            &mut layout_size,
+        );
+    }
+    let binding0_offset = unsafe {
+        let mut offset = 0u64;
+        (ext_device.fp().get_descriptor_set_layout_binding_offset_ext)(
+            vk_device,
+            descriptor_set_layout,
+            0,
+            &mut offset,
+        );
+        offset
+    };
+    let binding1_offset = unsafe {
+        let mut offset = 0u64;
+        (ext_device.fp().get_descriptor_set_layout_binding_offset_ext)(
+            vk_device,
+            descriptor_set_layout,
+            1,
+            &mut offset,
+        );
+        offset
+    };
 
-    unsafe { device.update_descriptor_sets(&writes, &[]) };
+    // Descriptor buffer layout:
+    //   Offset 0:    Sampler + image view capture payload (binding 0)
+    //   Offset X:    Buffer capture payload (binding 1)
+    // The total size is the layout size which accounts for alignment.
+    let descriptor_buffer_size: vk::DeviceSize = layout_size as vk::DeviceSize;
+
+    let (descriptor_buffer, descriptor_buffer_memory) =
+        crate::encoder::resources::create_buffer_with_device_address(
+            device,
+            context.memory_properties(),
+            descriptor_buffer_size,
+            vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS
+                | vk::BufferUsageFlags::RESOURCE_DESCRIPTOR_BUFFER_EXT,
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+        )?;
+
+    // Get the buffer's device address for binding descriptor buffers.
+    // cmdBindDescriptorBuffers requires the buffer's device address, not the memory capture address.
+    let buf_addr_info = vk::BufferDeviceAddressInfo::default().buffer(descriptor_buffer);
+    let descriptor_buffer_address = unsafe { device.get_buffer_device_address(&buf_addr_info) };
+
+    // Persistent map the descriptor buffer (HOST_COHERENT, no flush needed).
+    let descriptor_buffer_ptr = unsafe {
+        device
+            .map_memory(
+                descriptor_buffer_memory,
+                0,
+                vk::WHOLE_SIZE,
+                vk::MemoryMapFlags::empty(),
+            )
+            .map_err(|e| {
+                PixelForgeError::ResourceCreation(format!("map descriptor buffer: {}", e))
+            })?
+    };
+    let descriptor_buffer_ptr = descriptor_buffer_ptr as *mut u8;
 
     // Create command pool for compute queue.
     let pool_info = vk::CommandPoolCreateInfo::default()
@@ -170,8 +220,6 @@ pub fn create_converter(
         descriptor_set_layout,
         pipeline_layout,
         pipeline,
-        descriptor_pool,
-        descriptor_set,
         sampler,
         cached_src_view: None,
         output_buffer,
@@ -179,6 +227,24 @@ pub fn create_converter(
         command_pool,
         command_buffer,
         fence,
+        // Descriptor buffer fields.
+        descriptor_buffer,
+        descriptor_buffer_memory,
+        descriptor_buffer_address,
+        descriptor_buffer_usage: vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS
+            | vk::BufferUsageFlags::RESOURCE_DESCRIPTOR_BUFFER_EXT,
+        descriptor_buffer_ptr,
+        sampler_capture_size: sampler_cap_size as u32,
+        image_capture_size: image_cap_size as u32,
+        buffer_capture_size: buffer_cap_size as u32,
+        // Cached descriptor buffer device and capture buffers.
+        ext_device,
+        sampler_data: vec![0u8; sampler_cap_size],
+        image_data: vec![0u8; image_cap_size],
+        buffer_data: vec![0u8; buffer_cap_size],
+        // Layout info for correct offset computation.
+        binding0_offset,
+        binding1_offset,
     })
 }
 

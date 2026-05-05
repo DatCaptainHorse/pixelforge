@@ -199,8 +199,6 @@ pub struct ColorConverter {
     descriptor_set_layout: vk::DescriptorSetLayout,
     pipeline_layout: vk::PipelineLayout,
     pipeline: vk::Pipeline,
-    descriptor_pool: vk::DescriptorPool,
-    descriptor_set: vk::DescriptorSet,
 
     // Sampler for texelFetch on the source image.
     sampler: vk::Sampler,
@@ -211,6 +209,24 @@ pub struct ColorConverter {
     // Output buffer (compute shader writes here)
     output_buffer: vk::Buffer,
     output_memory: vk::DeviceMemory,
+
+    // Descriptor buffer (holds captured descriptor data).
+    descriptor_buffer: vk::Buffer,
+    descriptor_buffer_memory: vk::DeviceMemory,
+    descriptor_buffer_address: vk::DeviceAddress,
+    descriptor_buffer_usage: vk::BufferUsageFlags,
+    descriptor_buffer_ptr: *mut u8,
+    sampler_capture_size: u32,
+    image_capture_size: u32,
+    buffer_capture_size: u32,
+    // Cached descriptor buffer device and per-frame capture buffers.
+    ext_device: ash::ext::descriptor_buffer::Device,
+    sampler_data: Vec<u8>,
+    image_data: Vec<u8>,
+    buffer_data: Vec<u8>,
+    // Descriptor set layout binding offsets for correct payload placement.
+    binding0_offset: u64,
+    binding1_offset: u64,
 
     // Command resources.
     command_pool: vk::CommandPool,
@@ -539,20 +555,6 @@ impl ColorConverter {
 
         let device = self.context.device();
 
-        // Update descriptor set binding 0 with the source image view.
-        let image_info = vk::DescriptorImageInfo::default()
-            .sampler(self.sampler)
-            .image_view(src_view)
-            .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
-
-        let write = vk::WriteDescriptorSet::default()
-            .dst_set(self.descriptor_set)
-            .dst_binding(0)
-            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-            .image_info(std::slice::from_ref(&image_info));
-
-        unsafe { device.update_descriptor_sets(&[write], &[]) };
-
         // Reset and record command buffer.
         unsafe {
             device
@@ -626,20 +628,105 @@ impl ColorConverter {
                 &[],
             );
 
-            // Bind pipeline and descriptor set.
+            // Bind pipeline.
             device.cmd_bind_pipeline(
                 self.command_buffer,
                 vk::PipelineBindPoint::COMPUTE,
                 self.pipeline,
             );
 
-            device.cmd_bind_descriptor_sets(
+            // --- Opaque capture descriptors into descriptor buffer ---
+            // 1. Capture sampler descriptor data into preallocated buffer.
+            let sampler_capture_info =
+                vk::SamplerCaptureDescriptorDataInfoEXT::default().sampler(self.sampler);
+            self.ext_device
+                .get_sampler_opaque_capture_descriptor_data(
+                    &sampler_capture_info,
+                    self.sampler_data.as_mut_slice(),
+                )
+                .map_err(|e| PixelForgeError::CommandBuffer(format!("sampler capture: {}", e)))?;
+
+            // 2. Capture image view descriptor data into preallocated buffer.
+            let image_capture_info =
+                vk::ImageViewCaptureDescriptorDataInfoEXT::default().image_view(src_view);
+            self.ext_device
+                .get_image_view_opaque_capture_descriptor_data(
+                    &image_capture_info,
+                    self.image_data.as_mut_slice(),
+                )
+                .map_err(|e| {
+                    PixelForgeError::CommandBuffer(format!("image view capture: {}", e))
+                })?;
+
+            // 3. Capture output buffer descriptor data into preallocated buffer.
+            let buffer_capture_info =
+                vk::BufferCaptureDescriptorDataInfoEXT::default().buffer(self.output_buffer);
+            self.ext_device
+                .get_buffer_opaque_capture_descriptor_data(
+                    &buffer_capture_info,
+                    self.buffer_data.as_mut_slice(),
+                )
+                .map_err(|e| PixelForgeError::CommandBuffer(format!("buffer capture: {}", e)))?;
+
+            // 4. Write captured data into descriptor buffer (persistent map, HOST_COHERENT).
+            //
+            // The descriptor buffer capture functions return driver-defined descriptor payloads
+            // in the format expected by the descriptor buffer. For combined image sampler
+            // descriptors (binding 0), the sampler and image view captures are placed
+            // consecutively at the binding's offset.
+            //
+            // Layout:
+            //   Offset binding0_offset: Sampler + image view capture payloads (binding 0)
+            //   Offset binding1_offset: Buffer capture payload (binding 1)
+
+            let sampler_offset = self.binding0_offset as usize;
+            let image_offset = sampler_offset + self.sampler_capture_size as usize;
+            let buffer_offset = self.binding1_offset as usize;
+
+            // Write sampler capture payload.
+            std::ptr::copy_nonoverlapping(
+                self.sampler_data.as_ptr(),
+                self.descriptor_buffer_ptr.add(sampler_offset),
+                self.sampler_capture_size as usize,
+            );
+
+            // Write image view capture payload.
+            std::ptr::copy_nonoverlapping(
+                self.image_data.as_ptr(),
+                self.descriptor_buffer_ptr.add(image_offset),
+                self.image_capture_size as usize,
+            );
+
+            // Write buffer capture payload.
+            std::ptr::copy_nonoverlapping(
+                self.buffer_data.as_ptr(),
+                self.descriptor_buffer_ptr.add(buffer_offset),
+                self.buffer_capture_size as usize,
+            );
+
+            // --- Bind descriptor buffers ---
+            let binding_info = vk::DescriptorBufferBindingInfoEXT::default()
+                .address(self.descriptor_buffer_address)
+                .usage(self.descriptor_buffer_usage);
+
+            self.ext_device.cmd_bind_descriptor_buffers(
+                self.command_buffer,
+                std::slice::from_ref(&binding_info),
+            );
+
+            // Associate set 0 in the pipeline layout with the bound descriptor buffer.
+            // This is required because descriptor buffers use offset-based binding.
+            // The base offset is 0 since all payloads are placed at their binding offsets.
+            let buffer_indices = [0u32];
+            let offsets = [0 as vk::DeviceSize];
+
+            self.ext_device.cmd_set_descriptor_buffer_offsets(
                 self.command_buffer,
                 vk::PipelineBindPoint::COMPUTE,
                 self.pipeline_layout,
-                0,
-                &[self.descriptor_set],
-                &[],
+                0, // first_set
+                &buffer_indices,
+                &offsets,
             );
 
             // Push constants: width, height, input_format, output_format, color_space, full_range, sdr_white_nits.
@@ -846,10 +933,14 @@ impl Drop for ColorConverter {
             device.destroy_buffer(self.output_buffer, None);
             device.free_memory(self.output_memory, None);
 
+            // Destroy descriptor buffer and its memory.
+            device.unmap_memory(self.descriptor_buffer_memory);
+            device.destroy_buffer(self.descriptor_buffer, None);
+            device.free_memory(self.descriptor_buffer_memory, None);
+
             // Destroy pipeline resources.
             device.destroy_pipeline(self.pipeline, None);
             device.destroy_pipeline_layout(self.pipeline_layout, None);
-            device.destroy_descriptor_pool(self.descriptor_pool, None);
             device.destroy_descriptor_set_layout(self.descriptor_set_layout, None);
 
             // Destroy command resources.

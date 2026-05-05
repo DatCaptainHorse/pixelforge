@@ -7,10 +7,7 @@
 //! - Reference picture list construction for P and B frames
 //! - Temporal layer support
 //! - CRA (Clean Random Access) handling
-
-// Many loops in this module use index-based iteration because they access.
-// multiple arrays with the same index or use the index for bit operations.
-#![allow(clippy::needless_range_loop)]
+use std::cmp::Reverse;
 
 use super::entry::{DpbEntry, DpbState, MarkingState};
 use super::reference_lists::{H265ReferenceListBuilder, ReferenceList};
@@ -276,8 +273,12 @@ impl DpbH265 {
         let mut k = 0usize;
 
         // Process S0 (negative)
-        for i in 0..short_term_rps.num_negative_pics as usize {
-            let poc = current_poc + delta_poc_s0[i];
+        for (i, &delta) in delta_poc_s0
+            .iter()
+            .enumerate()
+            .take(short_term_rps.num_negative_pics as usize)
+        {
+            let poc = current_poc + delta;
             if (short_term_rps.used_by_curr_pic_s0_flag >> i) & 1 != 0 {
                 poc_st_curr_before[j] = poc;
                 j += 1;
@@ -290,8 +291,12 @@ impl DpbH265 {
 
         j = 0;
         // Process S1 (positive)
-        for i in 0..short_term_rps.num_positive_pics as usize {
-            let poc = current_poc + delta_poc_s1[i];
+        for (i, &delta) in delta_poc_s1
+            .iter()
+            .enumerate()
+            .take(short_term_rps.num_positive_pics as usize)
+        {
+            let poc = current_poc + delta;
             if (short_term_rps.used_by_curr_pic_s1_flag >> i) & 1 != 0 {
                 poc_st_curr_after[j] = poc;
                 j += 1;
@@ -306,8 +311,12 @@ impl DpbH265 {
         // Process long-term references.
         j = 0;
         k = 0;
-        for i in 0..num_long_term_pics as usize {
-            let poc_lt = long_term_poc_lsb[i] as i32;
+        for (i, &poc_lsb) in long_term_poc_lsb
+            .iter()
+            .enumerate()
+            .take(num_long_term_pics as usize)
+        {
+            let poc_lt = poc_lsb as i32;
             if (used_by_curr_pic_lt >> i) & 1 != 0 {
                 poc_lt_curr[j] = poc_lt;
                 j += 1;
@@ -320,13 +329,17 @@ impl DpbH265 {
 
         // Map POCs to DPB indices.
         // stCurrBefore
-        for i in 0..self.num_poc_st_curr_before as usize {
+        for (i, &poc) in poc_st_curr_before
+            .iter()
+            .enumerate()
+            .take(self.num_poc_st_curr_before as usize)
+        {
             ref_pic_set.st_curr_before[i] = -1;
             for d in 0..self.max_dpb_size as usize {
                 let entry = &self.entries[d];
                 if entry.state == DpbState::InUse
                     && entry.marking == MarkingState::ShortTerm
-                    && entry.pic_order_cnt == poc_st_curr_before[i]
+                    && entry.pic_order_cnt == poc
                 {
                     ref_pic_set.st_curr_before[i] = d as i8;
                     break;
@@ -336,13 +349,17 @@ impl DpbH265 {
         ref_pic_set.num_st_curr_before = self.num_poc_st_curr_before as u8;
 
         // stCurrAfter
-        for i in 0..self.num_poc_st_curr_after as usize {
+        for (i, &poc) in poc_st_curr_after
+            .iter()
+            .enumerate()
+            .take(self.num_poc_st_curr_after as usize)
+        {
             ref_pic_set.st_curr_after[i] = -1;
             for d in 0..self.max_dpb_size as usize {
                 let entry = &self.entries[d];
                 if entry.state == DpbState::InUse
                     && entry.marking == MarkingState::ShortTerm
-                    && entry.pic_order_cnt == poc_st_curr_after[i]
+                    && entry.pic_order_cnt == poc
                 {
                     ref_pic_set.st_curr_after[i] = d as i8;
                     break;
@@ -352,14 +369,18 @@ impl DpbH265 {
         ref_pic_set.num_st_curr_after = self.num_poc_st_curr_after as u8;
 
         // ltCurr
-        for i in 0..self.num_poc_lt_curr as usize {
+        for (i, &poc) in poc_lt_curr
+            .iter()
+            .enumerate()
+            .take(self.num_poc_lt_curr as usize)
+        {
             ref_pic_set.lt_curr[i] = -1;
             let mask = self.max_poc_lsb - 1;
             for d in 0..self.max_dpb_size as usize {
                 let entry = &self.entries[d];
                 if entry.state == DpbState::InUse
                     && entry.marking != MarkingState::Unused
-                    && (entry.pic_order_cnt & mask) == poc_lt_curr[i]
+                    && (entry.pic_order_cnt & mask) == poc
                 {
                     ref_pic_set.lt_curr[i] = d as i8;
                     // Mark as long-term.
@@ -388,8 +409,8 @@ impl DpbH265 {
         }
         // stFoll and ltFoll would also be marked as in_use
 
-        for i in 0..self.max_dpb_size as usize {
-            if !in_use[i] && self.entries[i].marking != MarkingState::Unused {
+        for (i, used) in in_use.iter().enumerate().take(self.max_dpb_size as usize) {
+            if !used && self.entries[i].marking != MarkingState::Unused {
                 self.entries[i].mark_unused();
             }
         }
@@ -442,10 +463,10 @@ impl DpbH265 {
         }
 
         // Sort negative refs by POC descending (closest to current first)
-        negative_refs.sort_by(|a, b| b.0.cmp(&a.0));
+        negative_refs.sort_by_key(|b| Reverse(b.0));
 
         // Sort positive refs by POC ascending (closest to current first)
-        positive_refs.sort_by(|a, b| a.0.cmp(&b.0));
+        positive_refs.sort_by_key(|a| a.0);
 
         // Limit to DPB size - 1.
         let max_refs = (self.max_dpb_size - 1) as usize;
@@ -623,9 +644,14 @@ impl DecodedPictureBufferTrait for DpbH265 {
             // Collect reference POCs and long-term flags first.
             let mut ref_pocs = [0i32; MAX_DPB_SIZE];
             let mut long_term_mask = 0u32;
-            for i in 0..self.max_dpb_size as usize {
-                ref_pocs[i] = self.entries[i].pic_order_cnt;
-                if self.entries[i].marking == MarkingState::LongTerm {
+            for (i, entry) in self
+                .entries
+                .iter()
+                .enumerate()
+                .take(self.max_dpb_size as usize)
+            {
+                ref_pocs[i] = entry.pic_order_cnt;
+                if entry.marking == MarkingState::LongTerm {
                     long_term_mask |= 1 << i;
                 }
             }

@@ -1,7 +1,6 @@
 //! Reference picture list construction and management.
 
-// Loops in this module use index-based iteration because they need the DPB slot index.
-#![allow(clippy::needless_range_loop)]
+use std::cmp::Reverse;
 
 use super::entry::{DpbEntry, DpbState, MarkingState};
 use super::{PictureType, MAX_DPB_SIZE, MAX_REF_LIST_SIZE};
@@ -116,8 +115,7 @@ impl H264ReferenceListBuilder {
         let mut long_term_refs: Vec<ReferencePicture> = Vec::new();
 
         // Collect short-term and long-term references.
-        for i in 0..dpb_size as usize {
-            let entry = &dpb[i];
+        for (i, entry) in dpb.iter().enumerate().take(dpb_size as usize) {
             if entry.state != DpbState::InUse {
                 continue;
             }
@@ -157,10 +155,10 @@ impl H264ReferenceListBuilder {
         }
 
         // Sort short-term by descending PicNum.
-        short_term_refs.sort_by(|a, b| b.pic_num.cmp(&a.pic_num));
+        short_term_refs.sort_by_key(|b| Reverse(b.pic_num));
 
         // Sort long-term by ascending LongTermPicNum.
-        long_term_refs.sort_by(|a, b| a.long_term_pic_num.cmp(&b.long_term_pic_num));
+        long_term_refs.sort_by_key(|a| a.long_term_pic_num);
 
         // Build L0: short-term first, then long-term.
         for r in short_term_refs {
@@ -197,8 +195,7 @@ impl H264ReferenceListBuilder {
         let mut long_term_refs: Vec<ReferencePicture> = Vec::new();
 
         // Collect references categorized by POC.
-        for i in 0..dpb_size as usize {
-            let entry = &dpb[i];
+        for (i, entry) in dpb.iter().enumerate().take(dpb_size as usize) {
             if entry.state != DpbState::InUse {
                 continue;
             }
@@ -237,13 +234,13 @@ impl H264ReferenceListBuilder {
         }
 
         // Sort refs_before by descending POC (closest to current first)
-        refs_before.sort_by(|a, b| b.poc.cmp(&a.poc));
+        refs_before.sort_by_key(|b| Reverse(b.poc));
 
         // Sort refs_after by ascending POC (closest to current first)
-        refs_after.sort_by(|a, b| a.poc.cmp(&b.poc));
+        refs_after.sort_by_key(|a| a.poc);
 
         // Sort long-term by ascending LongTermPicNum.
-        long_term_refs.sort_by(|a, b| a.long_term_pic_num.cmp(&b.long_term_pic_num));
+        long_term_refs.sort_by_key(|a| a.long_term_pic_num);
 
         // Build L0: refs_before, refs_after, long_term.
         for r in &refs_before {
