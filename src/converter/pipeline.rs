@@ -99,18 +99,36 @@ pub fn create_converter(
     let sampler = unsafe { device.create_sampler(&sampler_info, None) }
         .map_err(|e| PixelForgeError::ResourceCreation(format!("sampler creation: {}", e)))?;
 
-    // Create output buffer (device local for compute shader output, transfer source for image copy)
+    // Create output buffer (device local for compute shader output, transfer
+    // source for image copy). Needs SHADER_DEVICE_ADDRESS so we can query a
+    // device address to feed `VkDescriptorAddressInfoEXT` when populating
+    // the storage-buffer descriptor at runtime.
     let (output_buffer, output_memory) = create_buffer(
         device,
         context.memory_properties(),
         output_size as vk::DeviceSize,
         vk::BufferUsageFlags::STORAGE_BUFFER
             | vk::BufferUsageFlags::TRANSFER_SRC
-            | vk::BufferUsageFlags::TRANSFER_DST,
+            | vk::BufferUsageFlags::TRANSFER_DST
+            | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
         vk::MemoryPropertyFlags::DEVICE_LOCAL,
     )?;
 
-    // Query descriptor buffer properties to determine correct capture sizes.
+    // Resolve the output buffer's device address. This goes into the
+    // `VkDescriptorAddressInfoEXT` we pass to `vkGetDescriptorEXT` when
+    // populating the storage-buffer descriptor each frame.
+    let output_buffer_address = unsafe {
+        device.get_buffer_device_address(
+            &vk::BufferDeviceAddressInfo::default().buffer(output_buffer),
+        )
+    };
+
+    // Query descriptor buffer properties to determine correct descriptor sizes.
+    // The bug in the previous implementation was using the *capture-replay*
+    // sizes (e.g. `sampler_capture_replay_descriptor_data_size`) — those are
+    // for capture/replay tooling like RenderDoc and have nothing to do with
+    // runtime descriptor population. The correct sizes for in-buffer
+    // descriptors are the regular `*_descriptor_size` fields.
     let mut db_props = vk::PhysicalDeviceDescriptorBufferPropertiesEXT::default();
     let mut props = vk::PhysicalDeviceProperties2 {
         p_next: &mut db_props as *mut _ as *mut _,
@@ -119,9 +137,8 @@ pub fn create_converter(
     unsafe {
         instance.get_physical_device_properties2(physical_device, &mut props);
     }
-    let sampler_cap_size = db_props.sampler_capture_replay_descriptor_data_size;
-    let image_cap_size = db_props.image_view_capture_replay_descriptor_data_size;
-    let buffer_cap_size = db_props.buffer_capture_replay_descriptor_data_size;
+    let combined_image_sampler_size = db_props.combined_image_sampler_descriptor_size;
+    let storage_buffer_size_descriptor = db_props.storage_buffer_descriptor_size;
 
     // Query descriptor set layout size and binding offsets for correct buffer sizing.
     let ext_device =
@@ -224,6 +241,8 @@ pub fn create_converter(
         cached_src_view: None,
         output_buffer,
         output_memory,
+        output_buffer_size: output_size,
+        output_buffer_address,
         command_pool,
         command_buffer,
         fence,
@@ -234,14 +253,9 @@ pub fn create_converter(
         descriptor_buffer_usage: vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS
             | vk::BufferUsageFlags::RESOURCE_DESCRIPTOR_BUFFER_EXT,
         descriptor_buffer_ptr,
-        sampler_capture_size: sampler_cap_size as u32,
-        image_capture_size: image_cap_size as u32,
-        buffer_capture_size: buffer_cap_size as u32,
-        // Cached descriptor buffer device and capture buffers.
+        combined_image_sampler_descriptor_size: combined_image_sampler_size,
+        storage_buffer_descriptor_size: storage_buffer_size_descriptor,
         ext_device,
-        sampler_data: vec![0u8; sampler_cap_size],
-        image_data: vec![0u8; image_cap_size],
-        buffer_data: vec![0u8; buffer_cap_size],
         // Layout info for correct offset computation.
         binding0_offset,
         binding1_offset,

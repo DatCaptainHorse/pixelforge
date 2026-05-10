@@ -206,25 +206,27 @@ pub struct ColorConverter {
     // Cached ImageView for the source image (avoids per-frame recreation).
     cached_src_view: Option<(vk::Image, vk::ImageView)>,
 
-    // Output buffer (compute shader writes here)
+    // Output buffer (compute shader writes here).
     output_buffer: vk::Buffer,
     output_memory: vk::DeviceMemory,
+    // Output buffer size and device address. The address is fed into
+    // `VkDescriptorAddressInfoEXT` when populating the binding-1 descriptor.
+    output_buffer_size: usize,
+    output_buffer_address: vk::DeviceAddress,
 
-    // Descriptor buffer (holds captured descriptor data).
+    // Descriptor buffer (mapped, descriptors are written here per-frame).
     descriptor_buffer: vk::Buffer,
     descriptor_buffer_memory: vk::DeviceMemory,
     descriptor_buffer_address: vk::DeviceAddress,
     descriptor_buffer_usage: vk::BufferUsageFlags,
     descriptor_buffer_ptr: *mut u8,
-    sampler_capture_size: u32,
-    image_capture_size: u32,
-    buffer_capture_size: u32,
-    // Cached descriptor buffer device and per-frame capture buffers.
+    // Descriptor sizes for each binding type, queried from
+    // `VkPhysicalDeviceDescriptorBufferPropertiesEXT`.
+    combined_image_sampler_descriptor_size: usize,
+    storage_buffer_descriptor_size: usize,
+    // Loaded descriptor-buffer extension device for `vkGetDescriptorEXT`.
     ext_device: ash::ext::descriptor_buffer::Device,
-    sampler_data: Vec<u8>,
-    image_data: Vec<u8>,
-    buffer_data: Vec<u8>,
-    // Descriptor set layout binding offsets for correct payload placement.
+    // Per-binding offsets within the descriptor buffer.
     binding0_offset: u64,
     binding1_offset: u64,
 
@@ -635,74 +637,54 @@ impl ColorConverter {
                 self.pipeline,
             );
 
-            // --- Opaque capture descriptors into descriptor buffer ---
-            // 1. Capture sampler descriptor data into preallocated buffer.
-            let sampler_capture_info =
-                vk::SamplerCaptureDescriptorDataInfoEXT::default().sampler(self.sampler);
-            self.ext_device
-                .get_sampler_opaque_capture_descriptor_data(
-                    &sampler_capture_info,
-                    self.sampler_data.as_mut_slice(),
-                )
-                .map_err(|e| PixelForgeError::CommandBuffer(format!("sampler capture: {}", e)))?;
-
-            // 2. Capture image view descriptor data into preallocated buffer.
-            let image_capture_info =
-                vk::ImageViewCaptureDescriptorDataInfoEXT::default().image_view(src_view);
-            self.ext_device
-                .get_image_view_opaque_capture_descriptor_data(
-                    &image_capture_info,
-                    self.image_data.as_mut_slice(),
-                )
-                .map_err(|e| {
-                    PixelForgeError::CommandBuffer(format!("image view capture: {}", e))
-                })?;
-
-            // 3. Capture output buffer descriptor data into preallocated buffer.
-            let buffer_capture_info =
-                vk::BufferCaptureDescriptorDataInfoEXT::default().buffer(self.output_buffer);
-            self.ext_device
-                .get_buffer_opaque_capture_descriptor_data(
-                    &buffer_capture_info,
-                    self.buffer_data.as_mut_slice(),
-                )
-                .map_err(|e| PixelForgeError::CommandBuffer(format!("buffer capture: {}", e)))?;
-
-            // 4. Write captured data into descriptor buffer (persistent map, HOST_COHERENT).
+            // --- Populate descriptors directly into the descriptor buffer ---
             //
-            // The descriptor buffer capture functions return driver-defined descriptor payloads
-            // in the format expected by the descriptor buffer. For combined image sampler
-            // descriptors (binding 0), the sampler and image view captures are placed
-            // consecutively at the binding's offset.
+            // Use `vkGetDescriptorEXT` for runtime descriptor population. (The
+            // previous implementation mistakenly used the
+            // `vkGet*OpaqueCaptureDescriptorDataEXT` family — those produce
+            // opaque payloads for capture/replay tooling and are NOT the
+            // descriptor data the GPU consumes at binding offsets, which made
+            // the compute shader read garbage and emit constant-Y output —
+            // visible as a green-screen stream.)
             //
-            // Layout:
-            //   Offset binding0_offset: Sampler + image view capture payloads (binding 0)
-            //   Offset binding1_offset: Buffer capture payload (binding 1)
+            // The descriptor buffer is persistent-mapped HOST_COHERENT, so a
+            // plain memcpy via the slice handed to `get_descriptor` is enough.
 
-            let sampler_offset = self.binding0_offset as usize;
-            let image_offset = sampler_offset + self.sampler_capture_size as usize;
-            let buffer_offset = self.binding1_offset as usize;
-
-            // Write sampler capture payload.
-            std::ptr::copy_nonoverlapping(
-                self.sampler_data.as_ptr(),
-                self.descriptor_buffer_ptr.add(sampler_offset),
-                self.sampler_capture_size as usize,
+            // Binding 0: COMBINED_IMAGE_SAMPLER (sampler + image view).
+            let image_info = vk::DescriptorImageInfo::default()
+                .sampler(self.sampler)
+                .image_view(src_view)
+                .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+            let combined_get_info = vk::DescriptorGetInfoEXT::default()
+                .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .data(vk::DescriptorDataEXT {
+                    p_combined_image_sampler: &image_info,
+                });
+            let combined_dst = std::slice::from_raw_parts_mut(
+                self.descriptor_buffer_ptr
+                    .add(self.binding0_offset as usize),
+                self.combined_image_sampler_descriptor_size,
             );
+            self.ext_device
+                .get_descriptor(&combined_get_info, combined_dst);
 
-            // Write image view capture payload.
-            std::ptr::copy_nonoverlapping(
-                self.image_data.as_ptr(),
-                self.descriptor_buffer_ptr.add(image_offset),
-                self.image_capture_size as usize,
+            // Binding 1: STORAGE_BUFFER (output YUV).
+            let buffer_addr_info = vk::DescriptorAddressInfoEXT::default()
+                .address(self.output_buffer_address)
+                .range(self.output_buffer_size as u64)
+                .format(vk::Format::UNDEFINED);
+            let storage_get_info = vk::DescriptorGetInfoEXT::default()
+                .ty(vk::DescriptorType::STORAGE_BUFFER)
+                .data(vk::DescriptorDataEXT {
+                    p_storage_buffer: &buffer_addr_info,
+                });
+            let storage_dst = std::slice::from_raw_parts_mut(
+                self.descriptor_buffer_ptr
+                    .add(self.binding1_offset as usize),
+                self.storage_buffer_descriptor_size,
             );
-
-            // Write buffer capture payload.
-            std::ptr::copy_nonoverlapping(
-                self.buffer_data.as_ptr(),
-                self.descriptor_buffer_ptr.add(buffer_offset),
-                self.buffer_capture_size as usize,
-            );
+            self.ext_device
+                .get_descriptor(&storage_get_info, storage_dst);
 
             // --- Bind descriptor buffers ---
             let binding_info = vk::DescriptorBufferBindingInfoEXT::default()
