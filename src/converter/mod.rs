@@ -7,7 +7,6 @@
 //! CPU round-trips when used with a GPU-based video encoder.
 
 mod pipeline;
-mod shader;
 
 use crate::error::{PixelForgeError, Result};
 use crate::vulkan::VideoContext;

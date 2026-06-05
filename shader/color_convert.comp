@@ -1,36 +1,3 @@
-//! Compute shader for color format conversion.
-//!
-//! This module contains the SPIR-V bytecode for the color conversion compute shader.
-//! The shader converts RGB/BGR formats to various YUV formats using BT.709 (SDR)
-//! or BT.2020 (HDR) coefficients, selected via push constants.
-
-use crate::error::{PixelForgeError, Result};
-use std::sync::OnceLock;
-
-/// Cached compiled SPIR-V bytecode.
-static SPIRV_CACHE: OnceLock<Vec<u32>> = OnceLock::new();
-
-/// Get the SPIR-V bytecode for the color conversion shader.
-///
-/// The shader expects:
-/// - Push constants: width, height, input_format, output_format, color_space, full_range (6 × u32)
-/// - Binding 0: Input image (sampler2D)
-/// - Binding 1: Output buffer (YUV data)
-///
-/// Workgroup size: 8x8x1.
-///
-/// The compiled SPIR-V is cached after the first successful compilation.
-pub fn get_spirv_code() -> Result<Vec<u32>> {
-    if let Some(cached) = SPIRV_CACHE.get() {
-        return Ok(cached.clone());
-    }
-    let spirv = compile_glsl_to_spirv()?;
-    Ok(SPIRV_CACHE.get_or_init(|| spirv).clone())
-}
-
-/// Compile GLSL to SPIR-V at runtime using shaderc.
-fn compile_glsl_to_spirv() -> Result<Vec<u32>> {
-    const SHADER_SOURCE: &str = r#"
 #version 450
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
@@ -214,8 +181,8 @@ void main() {
         atomicOr(output_data[uv_word_idx], q8_c(yuv.y) << (uv_byte_offset * 8u));
 
         uint v_byte_idx = uv_byte_idx + 1u;
-        uint v_word_idx = v_byte_idx / 4u;
-        uint v_byte_offset = v_byte_idx % 4u;
+        uint v_word_idx = uv_byte_idx / 4u;
+        uint v_byte_offset = uv_byte_idx % 4u;
         atomicOr(output_data[v_word_idx], q8_c(yuv.z) << (v_byte_offset * 8u));
     } else if (params.output_format == 4u) {
         // YUV444P10 (10-bit): 2-plane semi-planar format.
@@ -313,25 +280,4 @@ void main() {
             }
         }
     }
-}
-"#;
-
-    let compiler = shaderc::Compiler::new().ok_or_else(|| {
-        PixelForgeError::ShaderCompilation("failed to create shaderc compiler".into())
-    })?;
-    let options = shaderc::CompileOptions::new().ok_or_else(|| {
-        PixelForgeError::ShaderCompilation("failed to create compile options".into())
-    })?;
-
-    let artifact = compiler
-        .compile_into_spirv(
-            SHADER_SOURCE,
-            shaderc::ShaderKind::Compute,
-            "color_convert.comp",
-            "main",
-            Some(&options),
-        )
-        .map_err(|e| PixelForgeError::ShaderCompilation(e.to_string()))?;
-
-    Ok(artifact.as_binary().to_vec())
 }

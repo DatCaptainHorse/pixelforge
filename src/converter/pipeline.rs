@@ -1,9 +1,32 @@
 //! Vulkan compute pipeline creation for color conversion.
+//!
+//! This module handles the creation of the color converter's Vulkan resources,
+//! including the compute pipeline built from the precompiled SPIR-V shader.
+
 use super::{ColorConverter, ColorConverterConfig};
 use crate::encoder::resources::find_memory_type;
 use crate::error::{PixelForgeError, Result};
 use crate::vulkan::VideoContext;
 use ash::vk;
+
+/// Precompiled SPIR-V bytecode for the color conversion compute shader.
+const COLOR_CONVERT_SPIRV_BYTES: &[u8] = include_bytes!("../../shader/color_convert.spv");
+
+/// Get the SPIR-V bytecode for the color conversion shader.
+///
+/// The shader expects:
+/// - Push constants: width, height, input_format, output_format, color_space, full_range (6 × u32)
+/// - Binding 0: Input image (sampler2D)
+/// - Binding 1: Output buffer (YUV data)
+///
+/// Workgroup size: 8x8x1.
+pub fn get_spirv_code() -> Result<Vec<u32>> {
+    let words = COLOR_CONVERT_SPIRV_BYTES
+        .chunks_exact(4)
+        .map(|chunk| u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+        .collect();
+    Ok(words)
+}
 
 /// Create a color converter with all Vulkan resources.
 pub fn create_converter(
@@ -57,7 +80,7 @@ pub fn create_converter(
         .map_err(|e| PixelForgeError::ResourceCreation(e.to_string()))?;
 
     // Create compute shader module.
-    let shader_code = super::shader::get_spirv_code()?;
+    let shader_code = get_spirv_code()?;
     let shader_info = vk::ShaderModuleCreateInfo::default().code(&shader_code);
 
     let shader_module = unsafe { device.create_shader_module(&shader_info, None) }
