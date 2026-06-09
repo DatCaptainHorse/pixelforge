@@ -25,6 +25,10 @@ pub enum ColorSpace {
     /// Used for SDR content during HDR streaming sessions.
     /// Applies: inverse sRGB EOTF → BT.709→BT.2020 gamut mapping → PQ OETF.
     SrgbToBt2020Pq,
+    /// scRGB input (linear BT.709, FP16) converted to BT.2020 + PQ output.
+    /// Used for HDR games submitting a `VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT` swapchain.
+    /// Applies: BT.709→BT.2020 gamut mapping → PQ OETF. No EOTF decode — input is already linear.
+    Bt709LinearToBt2020Pq,
 }
 
 /// Supported input pixel formats for color conversion.
@@ -46,10 +50,13 @@ pub enum InputFormat {
     /// Maps to DRM_FORMAT_ABGR16161616F / VK_FORMAT_R16G16B16A16_SFLOAT.
     ///
     /// The converter treats FP16 data the same as other formats: passthrough
-    /// for `ColorSpace::Bt709` / `Bt2020`, and sRGB→BT.2020+PQ conversion
-    /// for `ColorSpace::SrgbToBt2020Pq`. No linear→PQ transfer function is
-    /// applied automatically; if the source is PQ-encoded (e.g. via the
-    /// gamescope WSI layer), use `ColorSpace::Bt2020` for passthrough.
+    /// for `ColorSpace::Bt709` / `Bt2020`, sRGB→BT.2020+PQ conversion for
+    /// `ColorSpace::SrgbToBt2020Pq`, and scRGB-linear→BT.2020+PQ for
+    /// `ColorSpace::Bt709LinearToBt2020Pq` (the natural pairing for FP16 input
+    /// from an `EXTENDED_SRGB_LINEAR_EXT` swapchain). No linear→PQ transfer
+    /// function is applied automatically; if the source is PQ-encoded
+    /// (e.g. via the gamescope WSI layer), use `ColorSpace::Bt2020` for
+    /// passthrough.
     RGBA16F,
 }
 
@@ -162,7 +169,8 @@ pub struct ColorConverterConfig {
     /// SDR reference white level in nits for the sRGB→BT.2020+PQ conversion.
     ///
     /// Per ITU-R BT.2408 the standard value is 203 nits.
-    /// Only used when `color_space` is `SrgbToBt2020Pq`.
+    /// Only used when `color_space` is `SrgbToBt2020Pq` or `Bt709LinearToBt2020Pq`
+    /// (for the latter, the scRGB spec defines 1.0 == 80 cd/m²).
     pub sdr_reference_white_nits: f32,
 }
 
@@ -275,6 +283,15 @@ impl ColorConverter {
     /// since the full-range flag is passed via push constants.
     pub fn set_full_range(&mut self, full_range: bool) {
         self.config.full_range = full_range;
+    }
+
+    /// Set the SDR reference white level for subsequent conversions.
+    ///
+    /// This takes effect on the next `convert()` call without recreating the pipeline,
+    /// since the value is passed via push constants.  Only consumed by the
+    /// `SrgbToBt2020Pq` and `Bt709LinearToBt2020Pq` color spaces.
+    pub fn set_sdr_reference_white_nits(&mut self, nits: f32) {
+        self.config.sdr_reference_white_nits = nits;
     }
 
     /// Build buffer-to-image copy regions for multi-planar YUV formats.
@@ -983,10 +1000,11 @@ mod tests {
     #[test]
     fn test_color_space_enum_values() {
         // Verify enum values match shader push constant expectations:
-        // 0=BT.709, 1=BT.2020, 2=sRGB→BT.2020+PQ.
+        // 0=BT.709, 1=BT.2020, 2=sRGB→BT.2020+PQ, 3=scRGB (BT.709 linear)→BT.2020+PQ.
         assert_eq!(ColorSpace::Bt709 as u32, 0);
         assert_eq!(ColorSpace::Bt2020 as u32, 1);
         assert_eq!(ColorSpace::SrgbToBt2020Pq as u32, 2);
+        assert_eq!(ColorSpace::Bt709LinearToBt2020Pq as u32, 3);
     }
 
     // ========================
