@@ -10,7 +10,7 @@ A Vulkan-based video encoding library for Rust, supporting H.264, H.265, and AV1
 
 - **Hardware-accelerated** video encoding using Vulkan Video extensions.
 - **Multiple codec support**: H.264/AVC, H.265/HEVC, AV1.
-- **GPU color conversion**: RGB/BGR → YUV via Vulkan compute shaders (BT.709, BT.2020, sRGB→BT.2020+PQ).
+- **GPU color conversion**: RGB/BGR → YUV via Vulkan compute shaders (BT.709, BT.2020, sRGB→BT.2020+PQ, scRGB-linear→BT.2020+PQ).
 - **HDR support**: 10-bit encoding (P010, YUV444P10), PQ transfer function, BT.2020 color space.
 - **GPU-native API**: Encode directly from Vulkan images (`vk::Image`).
 - **Flexible configuration**: Rate control (CBR, VBR, CQP), quality levels, GOP settings.
@@ -130,6 +130,7 @@ PixelForge includes a GPU compute shader for converting RGB input to YUV output,
 | `Bt709` | Standard SDR (BT.709 coefficients) |
 | `Bt2020` | HDR passthrough (BT.2020 coefficients, PQ-encoded input) |
 | `SrgbToBt2020Pq` | SDR-in-HDR (sRGB → linear → BT.2020 gamut → PQ OETF) |
+| `Bt709LinearToBt2020Pq` | scRGB HDR (linear BT.709 → BT.2020 gamut → PQ OETF). `sdr_reference_white_nits` sets the interpretation of 1.0; per the scRGB spec (IEC 61966-2-2), 80 nits. |
 
 Supported input formats: BGRx, RGBx, BGRA, RGBA, ABGR2101010 (10-bit packed), RGBA16F (FP16).
 Supported output formats: NV12 (8-bit), I420 (8-bit), YUV444 (8-bit), P010 (10-bit), YUV444P10 (10-bit).
