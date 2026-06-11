@@ -49,6 +49,16 @@ impl H264Encoder {
         let luma_bit_depth: vk::VideoComponentBitDepthFlagsKHR = config.bit_depth.into();
         let chroma_bit_depth: vk::VideoComponentBitDepthFlagsKHR = config.bit_depth.into();
 
+        // Get encoder tuning mode, usage and content hints.
+        let encode_usage_hint: vk::VideoEncodeUsageFlagsKHR = config.encode_usage_hint.into();
+        let encode_content_hint: vk::VideoEncodeContentFlagsKHR = config.encode_content_hint.into();
+        let encoder_tuning_mode: vk::VideoEncodeTuningModeKHR = config.encoder_tuning_mode.into();
+
+        let mut video_encode_usage_info = vk::VideoEncodeUsageInfoKHR::default()
+            .video_usage_hints(encode_usage_hint)
+            .video_content_hints(encode_content_hint)
+            .tuning_mode(encoder_tuning_mode);
+
         // Select H.264 profile based on pixel format.
         // - High profile for YUV420
         // - High 4:4:4 Predictive profile for YUV444
@@ -72,7 +82,8 @@ impl H264Encoder {
             .chroma_subsampling(chroma_subsampling)
             .luma_bit_depth(luma_bit_depth)
             .chroma_bit_depth(chroma_bit_depth)
-            .push(&mut h264_profile_info);
+            .push(&mut h264_profile_info)
+            .push(&mut video_encode_usage_info);
 
         // Query encode capabilities for the selected profile and use them to derive a safe
         // coded extent and DPB limits. This mirrors vk_video_samples and avoids device loss

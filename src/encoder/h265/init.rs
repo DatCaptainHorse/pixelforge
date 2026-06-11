@@ -49,6 +49,16 @@ impl H265Encoder {
         let bit_depth_flags: vk::VideoComponentBitDepthFlagsKHR = config.bit_depth.into();
         let video_format = get_video_format(config.pixel_format, config.bit_depth);
 
+        // Get encoder tuning mode, usage and content hints.
+        let encode_usage_hint: vk::VideoEncodeUsageFlagsKHR = config.encode_usage_hint.into();
+        let encode_content_hint: vk::VideoEncodeContentFlagsKHR = config.encode_content_hint.into();
+        let encoder_tuning_mode: vk::VideoEncodeTuningModeKHR = config.encoder_tuning_mode.into();
+
+        let mut video_encode_usage_info = vk::VideoEncodeUsageInfoKHR::default()
+            .video_usage_hints(encode_usage_hint)
+            .video_content_hints(encode_content_hint)
+            .tuning_mode(encoder_tuning_mode);
+
         // Select profile based on pixel format and bit depth:
         // - Main for YUV420 8-bit
         // - Main 10 for YUV420 10-bit
@@ -84,7 +94,8 @@ impl H265Encoder {
             .chroma_subsampling(chroma_subsampling)
             .luma_bit_depth(bit_depth_flags)
             .chroma_bit_depth(bit_depth_flags)
-            .push(&mut h265_profile_info);
+            .push(&mut h265_profile_info)
+            .push(&mut video_encode_usage_info);
 
         // Query capabilities to determine limits.
         let video_queue_instance =

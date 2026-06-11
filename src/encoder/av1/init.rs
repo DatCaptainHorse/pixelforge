@@ -45,6 +45,16 @@ impl AV1Encoder {
         let luma_bit_depth: vk::VideoComponentBitDepthFlagsKHR = config.bit_depth.into();
         let chroma_bit_depth: vk::VideoComponentBitDepthFlagsKHR = config.bit_depth.into();
 
+        // Get encoder tuning mode, usage and content hints.
+        let encode_usage_hint: vk::VideoEncodeUsageFlagsKHR = config.encode_usage_hint.into();
+        let encode_content_hint: vk::VideoEncodeContentFlagsKHR = config.encode_content_hint.into();
+        let encoder_tuning_mode: vk::VideoEncodeTuningModeKHR = config.encoder_tuning_mode.into();
+
+        let mut video_encode_usage_info = vk::VideoEncodeUsageInfoKHR::default()
+            .video_usage_hints(encode_usage_hint)
+            .video_content_hints(encode_content_hint)
+            .tuning_mode(encoder_tuning_mode);
+
         // AV1 profile selection based on chroma subsampling (not bit depth).
         // Main profile: 8/10-bit, 4:2:0 only.
         // High profile: 8/10-bit, 4:2:0 and 4:4:4.
@@ -64,7 +74,8 @@ impl AV1Encoder {
             .chroma_subsampling(chroma_subsampling)
             .luma_bit_depth(luma_bit_depth)
             .chroma_bit_depth(chroma_bit_depth)
-            .push(&mut av1_profile_info);
+            .push(&mut av1_profile_info)
+            .push(&mut video_encode_usage_info);
 
         // Query encode capabilities.
         let video_queue_instance =

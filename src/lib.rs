@@ -202,9 +202,10 @@ pub(crate) const fn align4(size: usize) -> usize {
 
 pub use converter::{ColorConverter, ColorConverterConfig, ColorSpace, InputFormat, OutputFormat};
 pub use encoder::{
-    BitDepth as EncodeBitDepth, Codec, ColorDescription, EncodeConfig, EncodedPacket, Encoder,
-    FrameType, PixelFormat, RateControlMode, DEFAULT_FRAME_RATE, DEFAULT_GOP_SIZE, DEFAULT_H264_QP,
-    DEFAULT_H265_QP, DEFAULT_MAX_BITRATE, DEFAULT_MAX_REFERENCE_FRAMES, DEFAULT_TARGET_BITRATE,
+    BitDepth as EncodeBitDepth, Codec, ColorDescription, EncodeConfig, EncodeContentHint,
+    EncodeUsageHint, EncodedPacket, Encoder, EncoderTuningMode, FrameType, PixelFormat,
+    RateControlMode, DEFAULT_FRAME_RATE, DEFAULT_GOP_SIZE, DEFAULT_H264_QP, DEFAULT_H265_QP,
+    DEFAULT_MAX_BITRATE, DEFAULT_MAX_REFERENCE_FRAMES, DEFAULT_TARGET_BITRATE,
 };
 pub use error::PixelForgeError;
 pub use image::InputImage;
