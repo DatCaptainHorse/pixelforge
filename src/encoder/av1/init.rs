@@ -341,8 +341,8 @@ impl AV1Encoder {
             vk::QueryPoolCreateInfo::default()
                 .query_type(vk::QueryType::VIDEO_ENCODE_FEEDBACK_KHR)
                 .query_count(1)
-                .extend(&mut query_feedback_info)
-                .push(&mut profile_info)
+                .push(&mut query_feedback_info)
+                .extend(&mut profile_info)
         };
 
         let query_pool = unsafe {
