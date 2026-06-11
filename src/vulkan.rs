@@ -517,16 +517,18 @@ impl VideoContext {
             .enabled_extension_names(&extension_names)
             .push(&mut sync2_features);
 
+        if supported_encode_codecs.contains(&Codec::AV1) {
+            device_create_info = device_create_info.push(&mut av1_encode_features);
+        }
+
         // Attach the chain to device_create_info.
         // When descriptor buffer is available, the chain is:
         //   desc_buf_features -> buffer_device_address_features -> sync2_features -> ...
         // When descriptor buffer is not available, only sync2_features is chained.
         if has_descriptor_buffer_ext {
-            device_create_info = device_create_info.push(&mut desc_buf_features);
-            if supported_encode_codecs.contains(&Codec::AV1) {
-                device_create_info = device_create_info.push(&mut av1_encode_features);
-            }
             device_create_info = device_create_info
+                .push(&mut desc_buf_features)
+                .push(&mut buffer_device_address_features)
                 .push(&mut ycbcr_features)
                 .push(&mut ycbcr_2plane_444_features);
         }

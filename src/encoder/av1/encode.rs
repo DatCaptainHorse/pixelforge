@@ -392,17 +392,26 @@ impl AV1Encoder {
         // Begin video coding with rate control info for non-first frames.
         let is_first_frame = self.encode_frame_num == 0;
 
+        // AV1-specific rate control info.
+        let mut av1_rc_info = vk::VideoEncodeAV1RateControlInfoKHR::default()
+            .gop_frame_count(self.config.gop_size)
+            .key_frame_period(self.config.gop_size)
+            .consecutive_bipredictive_frame_count(0)
+            .temporal_layer_count(1);
+
         let begin_coding_info = if is_first_frame {
             vk::VideoBeginCodingInfoKHR::default()
                 .video_session(self.session)
                 .video_session_parameters(self.session_params)
                 .reference_slots(&all_reference_slots)
+                .push(&mut av1_rc_info)
         } else {
             vk::VideoBeginCodingInfoKHR::default()
                 .video_session(self.session)
                 .video_session_parameters(self.session_params)
                 .reference_slots(&all_reference_slots)
                 .push(&mut rc_info)
+                .push(&mut av1_rc_info)
         };
 
         unsafe {
@@ -414,13 +423,6 @@ impl AV1Encoder {
         // Combine RESET + RATE_CONTROL + QUALITY_LEVEL into a single control command.
         // This matches the H265 approach and is required for AMD RADV.
         if is_first_frame {
-            // AV1-specific rate control info.
-            let mut av1_rc_info = vk::VideoEncodeAV1RateControlInfoKHR::default()
-                .gop_frame_count(self.config.gop_size)
-                .key_frame_period(self.config.gop_size)
-                .consecutive_bipredictive_frame_count(0)
-                .temporal_layer_count(1);
-
             let mut quality_level_info =
                 vk::VideoEncodeQualityLevelInfoKHR::default().quality_level(0);
 

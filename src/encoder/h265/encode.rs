@@ -447,27 +447,29 @@ impl H265Encoder {
 
         if has_l0_ref {
             for ref_info in &self.l0_references {
-                let h265_slot_info = slot_infos_iter.next().unwrap();
+                if let Some(h265_slot_info) = slot_infos_iter.next() {
+                    let ref_slot = vk::VideoReferenceSlotInfoKHR::default()
+                        .slot_index(ref_info.dpb_slot as i32)
+                        .picture_resource(&ref_resources[stored_indices_count])
+                        .push(h265_slot_info);
+
+                    reference_slots.push(ref_slot);
+                    reference_slots_for_begin.push(ref_slot);
+                    stored_indices_count += 1;
+                }
+            }
+        }
+
+        if has_l1_ref {
+            if let Some(h265_slot_info) = slot_infos_iter.next() {
                 let ref_slot = vk::VideoReferenceSlotInfoKHR::default()
-                    .slot_index(ref_info.dpb_slot as i32)
+                    .slot_index(self.backward_reference_dpb_slot as i32)
                     .picture_resource(&ref_resources[stored_indices_count])
                     .push(h265_slot_info);
 
                 reference_slots.push(ref_slot);
                 reference_slots_for_begin.push(ref_slot);
-                stored_indices_count += 1;
             }
-        }
-
-        if has_l1_ref {
-            let h265_slot_info = slot_infos_iter.next().unwrap();
-            let ref_slot = vk::VideoReferenceSlotInfoKHR::default()
-                .slot_index(self.backward_reference_dpb_slot as i32)
-                .picture_resource(&ref_resources[stored_indices_count])
-                .push(h265_slot_info);
-
-            reference_slots.push(ref_slot);
-            reference_slots_for_begin.push(ref_slot);
         }
 
         // Rate control setup.
