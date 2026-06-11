@@ -122,6 +122,89 @@ pub enum RateControlMode {
     Vbr,
 }
 
+/// Encode usage hints.
+/// Allows encoder to potentially make smarter choices with appropriate usage hint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum EncodeUsageHint {
+    /// Default usage - no specific usage hint given to encoder.
+    #[default]
+    Default,
+    /// Transcoding usage - hint that encoding will be done in conjunction with decoding.
+    Transcoding,
+    /// Streaming usage - hint that the output will be sent over network.
+    Streaming,
+    /// Recording usage - hint that the output will be used for offline consumption.
+    Recording,
+    /// Conferencing usage - hint that the output will be used for video conferencing.
+    Conferencing,
+}
+
+impl From<EncodeUsageHint> for vk::VideoEncodeUsageFlagsKHR {
+    fn from(hint: EncodeUsageHint) -> Self {
+        match hint {
+            EncodeUsageHint::Default => vk::VideoEncodeUsageFlagsKHR::DEFAULT,
+            EncodeUsageHint::Transcoding => vk::VideoEncodeUsageFlagsKHR::TRANSCODING,
+            EncodeUsageHint::Streaming => vk::VideoEncodeUsageFlagsKHR::STREAMING,
+            EncodeUsageHint::Recording => vk::VideoEncodeUsageFlagsKHR::RECORDING,
+            EncodeUsageHint::Conferencing => vk::VideoEncodeUsageFlagsKHR::CONFERENCING,
+        }
+    }
+}
+
+/// Encode content hints.
+/// Allows encoder to potentially make smarter choices with appropriate content hint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum EncodeContentHint {
+    /// Default content - no specific content hint given to encoder.
+    #[default]
+    Default,
+    /// Camera content - hint that the content is from a camera.
+    Camera,
+    /// Desktop content - hint that the content is from desktop.
+    Desktop,
+    /// Rendered content - hint that the content is rendered (i.e. game).
+    Rendered,
+}
+
+impl From<EncodeContentHint> for vk::VideoEncodeContentFlagsKHR {
+    fn from(hint: EncodeContentHint) -> Self {
+        match hint {
+            EncodeContentHint::Default => vk::VideoEncodeContentFlagsKHR::DEFAULT,
+            EncodeContentHint::Camera => vk::VideoEncodeContentFlagsKHR::CAMERA,
+            EncodeContentHint::Desktop => vk::VideoEncodeContentFlagsKHR::DESKTOP,
+            EncodeContentHint::Rendered => vk::VideoEncodeContentFlagsKHR::RENDERED,
+        }
+    }
+}
+
+/// Encoder tuning modes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum EncoderTuningMode {
+    /// Default mode - encoder specific default tuning.
+    #[default]
+    Default,
+    /// High-quality mode - focus on quality over encoding speed.
+    HighQuality,
+    /// Low-latency mode - focus on encoding speed over quality.
+    LowLatency,
+    /// Ultra-low-latency mode - focus on highest encoding speed with a hit to quality.
+    UltraLowLatency,
+    /// Lossless mode - tune encoder for lossless output.
+    Lossless,
+}
+
+impl From<EncoderTuningMode> for vk::VideoEncodeTuningModeKHR {
+    fn from(mode: EncoderTuningMode) -> Self {
+        match mode {
+            EncoderTuningMode::Default => vk::VideoEncodeTuningModeKHR::DEFAULT,
+            EncoderTuningMode::HighQuality => vk::VideoEncodeTuningModeKHR::HIGH_QUALITY,
+            EncoderTuningMode::LowLatency => vk::VideoEncodeTuningModeKHR::LOW_LATENCY,
+            EncoderTuningMode::UltraLowLatency => vk::VideoEncodeTuningModeKHR::ULTRA_LOW_LATENCY,
+            EncoderTuningMode::Lossless => vk::VideoEncodeTuningModeKHR::LOSSLESS,
+        }
+    }
+}
+
 /// Frame types in encoded stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FrameType {
@@ -226,6 +309,12 @@ pub struct EncodeConfig {
     /// Color description for VUI signaling.
     /// Defaults to BT.709 (full-range) when `None`.
     pub color_description: Option<ColorDescription>,
+    /// Usage hint for encoding.
+    pub encode_usage_hint: EncodeUsageHint,
+    /// Content hint for encoding.
+    pub encode_content_hint: EncodeContentHint,
+    /// Encoder tuning mode.
+    pub encoder_tuning_mode: EncoderTuningMode,
 }
 
 impl EncodeConfig {
@@ -251,6 +340,9 @@ impl EncodeConfig {
             virtual_buffer_size_ms: 1000,
             initial_virtual_buffer_size_ms: 1000,
             color_description: None,
+            encode_usage_hint: EncodeUsageHint::Default,
+            encode_content_hint: EncodeContentHint::Default,
+            encoder_tuning_mode: EncoderTuningMode::Default,
         }
     }
 
@@ -276,6 +368,9 @@ impl EncodeConfig {
             virtual_buffer_size_ms: 1000,
             initial_virtual_buffer_size_ms: 1000,
             color_description: None,
+            encode_usage_hint: EncodeUsageHint::Default,
+            encode_content_hint: EncodeContentHint::Default,
+            encoder_tuning_mode: EncoderTuningMode::Default,
         }
     }
 
@@ -301,6 +396,9 @@ impl EncodeConfig {
             virtual_buffer_size_ms: 1000,
             initial_virtual_buffer_size_ms: 1000,
             color_description: None,
+            encode_usage_hint: EncodeUsageHint::Default,
+            encode_content_hint: EncodeContentHint::Default,
+            encoder_tuning_mode: EncoderTuningMode::Default,
         }
     }
 
@@ -383,6 +481,24 @@ impl EncodeConfig {
     /// Set the color description for VUI signaling.
     pub fn with_color_description(mut self, desc: ColorDescription) -> Self {
         self.color_description = Some(desc);
+        self
+    }
+
+    /// Set the usage hint for encoding.
+    pub fn with_encode_usage_hint(mut self, hint: EncodeUsageHint) -> Self {
+        self.encode_usage_hint = hint;
+        self
+    }
+
+    /// Set the content hint for encoding.
+    pub fn with_encode_content_hint(mut self, hint: EncodeContentHint) -> Self {
+        self.encode_content_hint = hint;
+        self
+    }
+
+    /// Set the encoder tuning mode.
+    pub fn with_encoder_tuning_mode(mut self, mode: EncoderTuningMode) -> Self {
+        self.encoder_tuning_mode = mode;
         self
     }
 }

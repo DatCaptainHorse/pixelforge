@@ -47,6 +47,16 @@ impl H265 {
         let chroma_subsampling: vk::VideoChromaSubsamplingFlagsKHR = config.pixel_format.into();
         let bit_depth: vk::VideoComponentBitDepthFlagsKHR = config.bit_depth.into();
 
+        // Get encoder tuning mode, usage and content hints.
+        let encode_usage_hint: vk::VideoEncodeUsageFlagsKHR = config.encode_usage_hint.into();
+        let encode_content_hint: vk::VideoEncodeContentFlagsKHR = config.encode_content_hint.into();
+        let encoder_tuning_mode: vk::VideoEncodeTuningModeKHR = config.encoder_tuning_mode.into();
+
+        let mut video_encode_usage_info = vk::VideoEncodeUsageInfoKHR::default()
+            .video_usage_hints(encode_usage_hint)
+            .video_content_hints(encode_content_hint)
+            .tuning_mode(encoder_tuning_mode);
+
         let mut h265_profile_info =
             vk::VideoEncodeH265ProfileInfoKHR::default().std_profile_idc(profile_idc);
         let profile_info = vk::VideoProfileInfoKHR::default()
@@ -54,7 +64,8 @@ impl H265 {
             .chroma_subsampling(chroma_subsampling)
             .luma_bit_depth(bit_depth)
             .chroma_bit_depth(bit_depth)
-            .push(&mut h265_profile_info);
+            .push(&mut h265_profile_info)
+            .push(&mut video_encode_usage_info);
 
         // Query device capabilities with the H.265-specific capability struct
         // chained in (required by the driver).
