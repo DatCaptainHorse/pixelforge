@@ -69,10 +69,6 @@ impl AV1Encoder {
             self.order_hint = 0;
             // Reset references for key frames.
             self.references.clear();
-            // Reset DPB slot activation tracking on key frame - all slots become inactive.
-            for active in &mut self.dpb_slot_active {
-                *active = false;
-            }
         }
 
         let mut encoded_data = Vec::new();
@@ -107,29 +103,42 @@ impl AV1Encoder {
         self.frame_num += 1;
         self.order_hint = (self.order_hint + 1) & 0xFF; // 8-bit order hint
 
-        // Only KEY frames are stored as references. P frames all reference the KEY frame
-        // and don't update any reference buffer, avoiding P→P which produces corrupt output
-        // on NVIDIA AV1 encoders.
-        if is_key_frame {
-            let ref_info = super::ReferenceInfo {
-                dpb_slot: self.current_dpb_slot,
-                order_hint: encoded_order_hint,
-                frame_type: ash::vk::native::StdVideoAV1FrameType_STD_VIDEO_AV1_FRAME_TYPE_KEY,
-            };
-            self.references.clear();
-            self.references.push(ref_info);
+        // Update reference frames and DPB slot management
+        // Key frames refresh all reference slots. Inter frames refresh only their own slot,
+        //  becoming the new LAST_FRAME for the next inter frame
+        let ref_info = super::ReferenceInfo {
+            dpb_slot: self.current_dpb_slot,
+            order_hint: encoded_order_hint,
+            frame_type: if is_key_frame {
+                ash::vk::native::StdVideoAV1FrameType_STD_VIDEO_AV1_FRAME_TYPE_KEY
+            } else {
+                ash::vk::native::StdVideoAV1FrameType_STD_VIDEO_AV1_FRAME_TYPE_INTER
+            },
+        };
 
-            // KEY frame uses the current DPB slot; pick a different one for P frames.
-            let used_slots: Vec<u8> = self.references.iter().map(|r| r.dpb_slot).collect();
+        // Store the encoded frame as the most recent reference
+        if is_key_frame {
+            self.references.clear();
+        }
+        self.references.insert(0, ref_info);
+        // Keep only the most recent reference for single-reference prediction
+        self.references.truncate(1);
+
+        // Cycle to next available DPB slot for the next frame
+        let used_slots: Vec<u8> = self.references.iter().map(|r| r.dpb_slot).collect();
+        let mut next_slot = (self.current_dpb_slot + 1) % self.dpb_slot_count as u8;
+
+        // If the next slot is in use, find the first available slot
+        if used_slots.contains(&next_slot) {
             for i in 0..self.dpb_slot_count as u8 {
                 if !used_slots.contains(&i) {
-                    self.current_dpb_slot = i;
+                    next_slot = i;
                     break;
                 }
             }
         }
-        // P frames reuse the same scratch DPB slot (current_dpb_slot stays unchanged
-        // between P frames since it's always different from the KEY frame's slot).
+
+        self.current_dpb_slot = next_slot;
 
         Ok(EncodedPacket {
             data: encoded_data,

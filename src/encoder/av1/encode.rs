@@ -107,6 +107,7 @@ impl AV1Encoder {
             .coded_extent(frame_extent)
             .base_array_layer(0)
             .image_view_binding(self.dpb_image_views[self.current_dpb_slot as usize]);
+
         // AV1 reference info for the setup slot.
         let reference_info_flags = ash::vk::native::StdVideoEncodeAV1ReferenceInfoFlags {
             _bitfield_align_1: [],
@@ -132,7 +133,7 @@ impl AV1Encoder {
         let mut setup_av1_dpb_info =
             vk::VideoEncodeAV1DpbSlotInfoKHR::default().std_reference_info(&std_reference_info);
 
-        let mut setup_av1_dpb_info_ref0 = setup_av1_dpb_info.clone();
+        let mut setup_av1_dpb_info_ref0 = setup_av1_dpb_info;
         let setup_reference_slot = vk::VideoReferenceSlotInfoKHR::default()
             .slot_index(self.current_dpb_slot as i32)
             .picture_resource(&setup_picture_resource)
@@ -243,24 +244,10 @@ impl AV1Encoder {
         // Note: If this causes issues, we may need to re-enable it with proper values.
 
         // Build ref_frame_idx, ref_order_hint, refresh_frame_flags, and primary_ref_frame.
-        //
-        // All P frames reference only the KEY frame (stored in buffer 0).
-        // P frames set refresh_frame_flags=0x00 (don't update any reference buffer).
-        // This avoids P→P references which produce corrupt output on NVIDIA AV1 encoders.
+        // For key frames: refresh all slots, all refs point to slot 0.
+        // For inter frames: LAST_FRAME points to most recent past frame, refresh only current slot.
         let (ref_frame_idx, ref_order_hint, primary_ref_frame, refresh_frame_flags) =
-            if !is_key_frame && !self.references.is_empty() {
-                // All reference names point to buffer 0 (where KEY frame lives).
-                let ref_idx = [0i8; 7];
-                let ref_info = &self.references[0];
-                let mut order_hints = [0u8; 8];
-                order_hints[0] = ref_info.order_hint as u8;
-
-                // P frames don't refresh any reference buffer.
-                (ref_idx, order_hints, 0u8, 0x00u8)
-            } else {
-                // KEY frame: refresh all buffers.
-                ([0i8; 7], [0u8; 8], 7u8, 0xFFu8)
-            };
+            self.calculate_reference_frame_mapping(is_key_frame);
 
         // AV1 encode picture info.
         let std_picture_info = ash::vk::native::StdVideoEncodeAV1PictureInfo {
@@ -548,5 +535,34 @@ impl AV1Encoder {
         self.dpb_slot_active[self.current_dpb_slot as usize] = true;
 
         Ok(encoded_data)
+    }
+
+    /// Calculate proper reference frame mapping for AV1 encoding.
+    fn calculate_reference_frame_mapping(&self, is_key_frame: bool) -> ([i8; 7], [u8; 8], u8, u8) {
+        if is_key_frame {
+            // Key frame refreshes all 8 reference slots
+            // All named references (LAST_FRAME, LAST2_FRAME, etc.) point to slot 0
+            ([0i8; 7], [0u8; 8], 7u8, 0xFFu8)
+        } else if !self.references.is_empty() {
+            let mut ref_frame_idx = [0i8; 7];
+            let mut ref_order_hint = [0u8; 8];
+
+            // Map LAST_FRAME (index 0) to our most recent reference's DPB slot
+            let last_ref = &self.references[0];
+            ref_frame_idx[0] = last_ref.dpb_slot as i8;
+            ref_order_hint[0] = last_ref.order_hint as u8;
+
+            // Other reference slots remain 0 (unused/pointing to nothing active)
+            // They'll be ignored since we're using SINGLE_REFERENCE prediction mode
+
+            // Refresh only the current DPB slot so this frame becomes the new LAST_FRAME
+            let refresh_flags = 1u8 << self.current_dpb_slot;
+
+            // primary_ref_frame = 0 means LAST_FRAME is our primary reference
+            (ref_frame_idx, ref_order_hint, 0u8, refresh_flags)
+        } else {
+            // No references available (shouldn't happen for inter frames)
+            ([0i8; 7], [0u8; 8], 7u8, 0x00u8)
+        }
     }
 }

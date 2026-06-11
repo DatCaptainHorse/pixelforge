@@ -82,8 +82,8 @@ impl H264Encoder {
         let mut h264_capabilities = vk::VideoEncodeH264CapabilitiesKHR::default();
         let mut encode_capabilities = vk::VideoEncodeCapabilitiesKHR::default();
 
-        let h264_capabilities_dbg = h264_capabilities.clone();
-        let encode_capabilities_dbg = encode_capabilities.clone();
+        let h264_capabilities_dbg = h264_capabilities;
+        let encode_capabilities_dbg = encode_capabilities;
 
         let mut capabilities = vk::VideoCapabilitiesKHR::default()
             .push(&mut encode_capabilities)
