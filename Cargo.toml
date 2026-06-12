@@ -1,6 +1,6 @@
 [package]
 name = "pixelforge"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2021"
 description = "A Vulkan-based video encoding library for Rust"
 license = "BSD-2-Clause"

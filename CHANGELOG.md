@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-06-12
+
+### Added
+- CI check for README.md consistency in GitHub Actions workflow.
+
+### Changed
+- Cleaner `p_next` chain handling — replaced manual pointer arithmetic with safer `extend`-based construction across H.265 init, session parameters, resources, and Vulkan utilities.
+
+### Fixed
+- AV1 reference-frame handling — corrected reference frame list population and cleared clippy warnings.
+- AV1 CBR/VBR modes no longer set `min_q_index`/`max_q_index`, which are incompatible with those rate-control modes.
+- Missing rate-control push entries in `VkVideoCodingControlInfoKHR` for H.264, H.265, and AV1 encoders.
+- AV1 init now uses `extend` for proper `VkVideoEncodeInfoKHR` construction.
+
 ## [0.5.0] - 2026-06-09
 
 ### Added
