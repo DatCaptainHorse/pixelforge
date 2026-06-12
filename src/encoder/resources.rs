@@ -273,6 +273,19 @@ pub(crate) fn create_encode_feedback_query_pool(
     .map_err(|e| PixelForgeError::QueryPool(e.to_string()))
 }
 
+pub(crate) fn create_encode_timestamp_query_pool(context: &VideoContext) -> Result<vk::QueryPool> {
+    let timestamp_query_pool_create_info = vk::QueryPoolCreateInfo::default()
+        .query_type(vk::QueryType::TIMESTAMP)
+        .query_count(2); // start and end
+
+    unsafe {
+        context
+            .device()
+            .create_query_pool(&timestamp_query_pool_create_info, None)
+    }
+    .map_err(|e| PixelForgeError::QueryPool(e.to_string()))
+}
+
 /// Create an image for video encoding (input or DPB).
 ///
 /// This creates a VkImage suitable for use with a video encoder.
@@ -1581,6 +1594,54 @@ pub(crate) fn get_encoded_session_params(
             }
         }
     }
+}
+
+/// Resets and writes first timestamp command
+pub(crate) unsafe fn reset_start_timestamp(
+    device: &ash::Device,
+    command_buffer: vk::CommandBuffer,
+    query_pool: vk::QueryPool,
+) {
+    device.cmd_reset_query_pool(command_buffer, query_pool, 0, 2);
+    device.cmd_write_timestamp(
+        command_buffer,
+        vk::PipelineStageFlags::TOP_OF_PIPE,
+        query_pool,
+        0, // query index 0 = start
+    );
+}
+
+pub(crate) unsafe fn end_timestamp(
+    device: &ash::Device,
+    command_buffer: vk::CommandBuffer,
+    query_pool: vk::QueryPool,
+) {
+    device.cmd_write_timestamp(
+        command_buffer,
+        vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+        query_pool,
+        1, // query index 1 = end
+    );
+}
+
+/// Queries and possibly returns the difference between reset_start_timestamp and end_timestamp calls
+pub(crate) unsafe fn query_timestamp_diff(
+    device: &ash::Device,
+    query_pool: vk::QueryPool,
+    mut timestamps: [u64; 2],
+    timestamp_period: f32,
+) -> Option<u64> {
+    let mut encode_time_ns: Option<u64> = None;
+    let result = device.get_query_pool_results(
+        query_pool,
+        0,               // first_query
+        &mut timestamps, // data slice (length 2)
+        vk::QueryResultFlags::WAIT | vk::QueryResultFlags::TYPE_64,
+    );
+    if result.is_ok() {
+        encode_time_ns = Some(((timestamps[1] - timestamps[0]) as f32 * timestamp_period) as u64);
+    }
+    return encode_time_ns;
 }
 
 #[cfg(test)]

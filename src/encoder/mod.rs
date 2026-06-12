@@ -505,6 +505,15 @@ impl EncodeConfig {
 
 pub use pipeline::EncodeFuture;
 
+/// Statistic about the encoded video packet.
+#[derive(Debug, Clone)]
+pub struct EncodedPacketStats {
+    /// GPU encode time in nanoseconds
+    pub gpu_time_ns: u64,
+    /// CPU wall time in nanoseconds (submission + fence wait + readback)
+    pub cpu_wall_time_ns: u64,
+}
+
 /// Encoded video packet.
 #[derive(Debug, Clone)]
 pub struct EncodedPacket {
@@ -518,6 +527,8 @@ pub struct EncodedPacket {
     pub pts: u64,
     /// Decode timestamp.
     pub dts: u64,
+    /// Optional stats about the packet
+    pub stats: Option<EncodedPacketStats>,
 }
 
 /// The codec-erased operations every [`codec::CodecEncoder`] exposes.
@@ -950,6 +961,7 @@ mod tests {
                 is_key_frame: true,
                 pts: 0,
                 dts: 0,
+                stats: None,
             };
 
             assert!(packet.is_key_frame);

@@ -324,6 +324,8 @@ impl<C: VideoCodec> CodecEncoder<C> {
             pts: plan.display_order,
             dts: plan.encode_index,
             header: setup.header,
+            timestamps: [0; 2],
+            now: std::time::Instant::now(),
         });
 
         let future = self.codec.record_picture(&mut self.common, &plan)?;
