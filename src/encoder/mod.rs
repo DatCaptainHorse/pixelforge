@@ -501,6 +501,17 @@ impl EncodeConfig {
     }
 }
 
+/// Statistic about encoded video packet.
+#[derive(Debug, Clone)]
+pub struct EncodingStats {
+    /// GPU encode time in nanoseconds
+    pub gpu_time_ns: u64,
+    /// CPU wall time in nanoseconds (submission + fence wait + readback)
+    pub cpu_wall_time_ns: u64,
+    /// The frame type this measurement is for
+    pub frame_type: FrameType,
+}
+
 /// Encoded video packet.
 #[derive(Debug, Clone)]
 pub struct EncodedPacket {
@@ -514,6 +525,8 @@ pub struct EncodedPacket {
     pub pts: u64,
     /// Decode timestamp.
     pub dts: u64,
+    /// Optional stats about the encoded packet
+    pub encoding_stats: Option<EncodingStats>,
 }
 
 /// Video encoder supporting multiple codecs.
@@ -909,6 +922,7 @@ mod tests {
                 is_key_frame: true,
                 pts: 0,
                 dts: 0,
+                encoding_stats: None,
             };
 
             assert!(packet.is_key_frame);

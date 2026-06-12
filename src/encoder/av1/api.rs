@@ -1,7 +1,7 @@
 use super::AV1Encoder;
 
 use crate::encoder::gop::{GopFrameType, GopPosition};
-use crate::encoder::{ColorDescription, EncodedPacket};
+use crate::encoder::{ColorDescription, EncodedPacket, EncodingStats};
 use crate::error::{PixelForgeError, Result};
 use ash::vk;
 use tracing::debug;
@@ -95,7 +95,11 @@ impl AV1Encoder {
             }
         }
 
-        encoded_data.extend_from_slice(&self.encode_frame_internal(gop_position, is_key_frame)?);
+        let cpu_start = std::time::Instant::now();
+        let (slice_data, encode_time_ns) =
+            self.encode_frame_internal(gop_position, is_key_frame)?;
+        let cpu_elapsed = cpu_start.elapsed();
+        encoded_data.extend_from_slice(&slice_data);
 
         // Save the order_hint used during encoding BEFORE incrementing.
         let encoded_order_hint = self.order_hint;
@@ -140,12 +144,22 @@ impl AV1Encoder {
 
         self.current_dpb_slot = next_slot;
 
+        let mut encoding_stats: Option<EncodingStats> = None;
+        if let Some(encode_time_ns) = encode_time_ns {
+            encoding_stats = Some(EncodingStats {
+                gpu_time_ns: encode_time_ns,
+                cpu_wall_time_ns: cpu_elapsed.as_nanos() as u64,
+                frame_type,
+            });
+        }
+
         Ok(EncodedPacket {
             data: encoded_data,
             frame_type,
             is_key_frame,
             pts: display_order,
             dts: self.encode_frame_num - 1,
+            encoding_stats,
         })
     }
 

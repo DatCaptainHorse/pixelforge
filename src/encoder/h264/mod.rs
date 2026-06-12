@@ -85,6 +85,11 @@ pub struct H264Encoder {
     encode_fence: vk::Fence,
     query_pool: vk::QueryPool,
 
+    // Timestamping resources
+    timestamp_query_pool: vk::QueryPool,
+    gpu_timestamps: [u64; 2], // start and end timestamps
+    timestamp_period: f32,    // nanoseconds per timestamp unit
+
     // SPS/PPS written flag.
     sps_written: bool,
 
@@ -159,6 +164,10 @@ impl Drop for H264Encoder {
             if let Some(q) = self.context.video_encode_queue() {
                 let _ = self.context.device().queue_wait_idle(q);
             }
+            // TODO(dathorse): Move into destroy_encoder_resources as EncoderResources field..
+            self.context
+                .device()
+                .destroy_query_pool(self.timestamp_query_pool, None);
             destroy_encoder_resources(
                 self.context.device(),
                 &self.video_queue_fn,

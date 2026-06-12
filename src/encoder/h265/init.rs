@@ -419,6 +419,26 @@ impl H265Encoder {
         }
         .map_err(|e| PixelForgeError::QueryPool(e.to_string()))?;
 
+        // Create timestamping query pool and resources
+        let timestamp_query_pool_create_info = vk::QueryPoolCreateInfo::default()
+            .query_type(vk::QueryType::TIMESTAMP)
+            .query_count(2); // start and end
+
+        let timestamp_query_pool = unsafe {
+            context
+                .device()
+                .create_query_pool(&timestamp_query_pool_create_info, None)
+        }
+        .map_err(|e| PixelForgeError::QueryPool(e.to_string()))?;
+
+        let timestamp_period = unsafe {
+            context
+                .instance()
+                .get_physical_device_properties(context.physical_device())
+                .limits
+                .timestamp_period
+        };
+
         // Create DPB and GOP structure
         let mut dpb = DecodedPictureBuffer::new();
         let dpb_config = DpbConfig {
@@ -481,6 +501,9 @@ impl H265Encoder {
             encode_command_buffer,
             encode_fence,
             query_pool,
+            timestamp_query_pool,
+            gpu_timestamps: [0; 2],
+            timestamp_period,
             header_data: None,
             has_backward_reference: false,
             backward_reference_poc: 0,

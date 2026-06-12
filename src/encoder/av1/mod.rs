@@ -79,6 +79,11 @@ pub struct AV1Encoder {
     encode_fence: vk::Fence,
     query_pool: vk::QueryPool,
 
+    // Timestamping resources
+    timestamp_query_pool: vk::QueryPool,
+    gpu_timestamps: [u64; 2], // start and end timestamps
+    timestamp_period: f32,    // nanoseconds per timestamp unit
+
     // Cached AV1 sequence header OBU (retrieved from session parameters).
     header_data: Option<Vec<u8>>,
 
@@ -131,6 +136,10 @@ impl Drop for AV1Encoder {
     fn drop(&mut self) {
         unsafe {
             let _ = self.context.device().device_wait_idle();
+            // TODO(dathorse): Move into destroy_encoder_resources as EncoderResources field..
+            self.context
+                .device()
+                .destroy_query_pool(self.timestamp_query_pool, None);
             self.context
                 .device()
                 .destroy_query_pool(self.query_pool, None);

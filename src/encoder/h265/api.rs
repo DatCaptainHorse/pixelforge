@@ -2,7 +2,7 @@ use super::H265Encoder;
 
 use crate::encoder::dpb::{DecodedPictureBufferTrait, DpbConfig, PictureStartInfo, PictureType};
 use crate::encoder::gop::{GopFrameType, GopPosition};
-use crate::encoder::{ColorDescription, EncodedPacket};
+use crate::encoder::{ColorDescription, EncodedPacket, EncodingStats};
 use crate::error::Result;
 use crate::PixelForgeError;
 use ash::vk;
@@ -121,7 +121,10 @@ impl H265Encoder {
             }
         }
 
-        let slice_data = self.encode_frame_internal(gop_position, pic_order_cnt, is_idr)?;
+        let cpu_start = std::time::Instant::now();
+        let (slice_data, encode_time_ns) =
+            self.encode_frame_internal(gop_position, pic_order_cnt, is_idr)?;
+        let cpu_elapsed = cpu_start.elapsed();
         // Debug: print first few bytes of slice data.
         debug!(
             "H.265 slice ({} bytes): {:02X?}",
@@ -181,12 +184,22 @@ impl H265Encoder {
             }
         }
 
+        let mut encoding_stats: Option<EncodingStats> = None;
+        if let Some(encode_time_ns) = encode_time_ns {
+            encoding_stats = Some(EncodingStats {
+                gpu_time_ns: encode_time_ns,
+                cpu_wall_time_ns: cpu_elapsed.as_nanos() as u64,
+                frame_type,
+            });
+        }
+
         Ok(EncodedPacket {
             data: encoded_data,
             frame_type,
             is_key_frame: is_idr,
             pts: display_order,
             dts: self.encode_frame_num - 1,
+            encoding_stats,
         })
     }
 

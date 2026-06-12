@@ -15,7 +15,7 @@ impl AV1Encoder {
         &mut self,
         _gop_position: &GopPosition,
         is_key_frame: bool,
-    ) -> Result<Vec<u8>> {
+    ) -> Result<(Vec<u8>, Option<u64>)> {
         // All frames need a setup reference slot (DPB write) per Vulkan spec when maxDpbSlots > 0.
         let is_reference = true;
 
@@ -56,6 +56,22 @@ impl AV1Encoder {
                 self.encode_command_buffer,
                 self.query_pool,
             )?;
+        }
+
+        // Reset and write start timestamp
+        unsafe {
+            self.context.device().cmd_reset_query_pool(
+                self.encode_command_buffer,
+                self.timestamp_query_pool,
+                0,
+                2,
+            );
+            self.context.device().cmd_write_timestamp(
+                self.encode_command_buffer,
+                vk::PipelineStageFlags::TOP_OF_PIPE,
+                self.timestamp_query_pool,
+                0, // query index 0 = start
+            );
         }
 
         // Transition DPB images for encode.
@@ -477,6 +493,16 @@ impl AV1Encoder {
                 .cmd_end_query(self.encode_command_buffer, self.query_pool, 0);
         }
 
+        // Write end timestamp
+        unsafe {
+            self.context.device().cmd_write_timestamp(
+                self.encode_command_buffer,
+                vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                self.timestamp_query_pool,
+                1, // query index 1 = end
+            );
+        }
+
         // Add DPB synchronization barrier after encoding.
         unsafe {
             record_post_encode_dpb_barrier(
@@ -516,8 +542,6 @@ impl AV1Encoder {
             self.current_dpb_slot
         );
 
-        let gpu_start = std::time::Instant::now();
-
         let encoded_data = unsafe {
             submit_encode_and_read_bitstream(
                 self.context.device(),
@@ -529,12 +553,27 @@ impl AV1Encoder {
             )?
         };
 
-        debug!("GPU encode took {:?}", gpu_start.elapsed());
+        let mut encode_time_ns: Option<u64> = None;
+        // Read GPU timestamps (fence already signaled from submit)
+        unsafe {
+            let result = self.context.device().get_query_pool_results(
+                self.timestamp_query_pool,
+                0,                        // first_query
+                &mut self.gpu_timestamps, // data slice (length 2)
+                vk::QueryResultFlags::WAIT | vk::QueryResultFlags::TYPE_64,
+            );
+            if result.is_ok() {
+                encode_time_ns = Some(
+                    ((self.gpu_timestamps[1] - self.gpu_timestamps[0]) as f32
+                        * self.timestamp_period) as u64,
+                );
+            }
+        }
 
         // Mark current DPB slot as active.
         self.dpb_slot_active[self.current_dpb_slot as usize] = true;
 
-        Ok(encoded_data)
+        Ok((encoded_data, encode_time_ns))
     }
 
     /// Calculate proper reference frame mapping for AV1 encoding.

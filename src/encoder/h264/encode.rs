@@ -17,7 +17,7 @@ impl H264Encoder {
         frame_num: u32,
         pic_order_cnt: i32,
         is_idr: bool,
-    ) -> Result<Vec<u8>> {
+    ) -> Result<(Vec<u8>, Option<u64>)> {
         let is_b_frame = gop_position.frame_type == GopFrameType::B;
         let is_reference = gop_position.is_reference;
 
@@ -59,6 +59,22 @@ impl H264Encoder {
                 self.encode_command_buffer,
                 self.query_pool,
             )?;
+        }
+
+        // Reset and write start timestamp
+        unsafe {
+            self.context.device().cmd_reset_query_pool(
+                self.encode_command_buffer,
+                self.timestamp_query_pool,
+                0,
+                2,
+            );
+            self.context.device().cmd_write_timestamp(
+                self.encode_command_buffer,
+                vk::PipelineStageFlags::TOP_OF_PIPE,
+                self.timestamp_query_pool,
+                0, // query index 0 = start
+            );
         }
 
         // Transition DPB images for encode.
@@ -584,6 +600,16 @@ impl H264Encoder {
             );
         }
 
+        // Write end timestamp
+        unsafe {
+            self.context.device().cmd_write_timestamp(
+                self.encode_command_buffer,
+                vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                self.timestamp_query_pool,
+                1, // query index 1 = end
+            );
+        }
+
         // End query.
         unsafe {
             self.context
@@ -624,9 +650,26 @@ impl H264Encoder {
             )?
         };
 
+        let mut encode_time_ns: Option<u64> = None;
+        // Read GPU timestamps (fence already signaled from submit)
+        unsafe {
+            let result = self.context.device().get_query_pool_results(
+                self.timestamp_query_pool,
+                0,                        // first_query
+                &mut self.gpu_timestamps, // data slice (length 2)
+                vk::QueryResultFlags::WAIT | vk::QueryResultFlags::TYPE_64,
+            );
+            if result.is_ok() {
+                encode_time_ns = Some(
+                    ((self.gpu_timestamps[1] - self.gpu_timestamps[0]) as f32
+                        * self.timestamp_period) as u64,
+                );
+            }
+        }
+
         // Mark DPB slot as active.
         self.dpb_slot_active[self.current_dpb_slot as usize] = true;
 
-        Ok(encoded_data)
+        Ok((encoded_data, encode_time_ns))
     }
 }
