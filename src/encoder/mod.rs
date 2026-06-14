@@ -386,6 +386,11 @@ impl EncodeConfig {
     }
 }
 
+/// Channel receiver for encoded packets, produced by the encoder's background
+/// readback thread. Obtained via [`Encoder::take_packet_receiver`] for
+/// out-of-band (push) consumption from a dedicated thread.
+pub type EncodedPacketReceiver = std::sync::mpsc::Receiver<Result<EncodedPacket>>;
+
 /// Encoded video packet.
 #[derive(Debug, Clone)]
 pub struct EncodedPacket {
@@ -446,9 +451,12 @@ impl Encoder {
     ///
     /// This accepts a source NV12 (YUV420) or planar YUV444 image on the GPU and encodes it directly.
     /// The source image must match the format and dimensions in the encoder configuration.
-    /// Encoders may return packets from earlier submitted frames because encode
-    /// readback is pipelined. Call [`Encoder::flush`] at end-of-stream to drain
-    /// any remaining packets.
+    ///
+    /// Encoding is asynchronous: this submits the frame without blocking and
+    /// returns immediately. Encoded packets are produced by a background readback
+    /// thread and retrieved via [`Encoder::poll_packet`] (or [`Encoder::flush`]
+    /// at end-of-stream). The call only blocks if every pipeline slot is still in
+    /// flight (backpressure).
     ///
     /// Use `InputImage` to create an image from YUV data:
     /// ```no_run
@@ -470,16 +478,46 @@ impl Encoder {
     /// # let yuv_data = vec![0u8; 1920 * 1080 * 3 / 2];
     /// input.upload_yuv420(&yuv_data)?;
     ///
-    /// // Encode the image
-    /// let packets = encoder.encode(input.image())?;
+    /// // Submit the frame, then drain any ready packets.
+    /// encoder.encode(input.image())?;
+    /// while let Some(packet) = encoder.poll_packet()? {
+    ///     // ... use packet.data ...
+    /// }
     /// # Ok(())
     /// # }
     /// ```
-    pub fn encode(&mut self, src_image: vk::Image) -> Result<Vec<EncodedPacket>> {
+    pub fn encode(&mut self, src_image: vk::Image) -> Result<()> {
         match self {
             Encoder::H264(encoder) => encoder.encode(src_image),
             Encoder::H265(encoder) => encoder.encode(src_image),
             Encoder::AV1(encoder) => encoder.encode(src_image),
+        }
+    }
+
+    /// Try to receive a finished encoded packet without blocking.
+    ///
+    /// Returns `Ok(None)` when no packet is currently ready. Encoded packets are
+    /// produced asynchronously after [`Encoder::encode`]; poll until `None` to
+    /// drain everything currently available.
+    pub fn poll_packet(&self) -> Result<Option<EncodedPacket>> {
+        match self {
+            Encoder::H264(encoder) => encoder.poll_packet(),
+            Encoder::H265(encoder) => encoder.poll_packet(),
+            Encoder::AV1(encoder) => encoder.poll_packet(),
+        }
+    }
+
+    /// Take ownership of the encoded-packet receiver for out-of-band (push)
+    /// consumption from a dedicated thread.
+    ///
+    /// After this is called, [`Encoder::poll_packet`] and [`Encoder::flush`] no
+    /// longer yield packets — they are delivered to the returned receiver
+    /// instead. Returns `None` if the receiver has already been taken.
+    pub fn take_packet_receiver(&mut self) -> Option<EncodedPacketReceiver> {
+        match self {
+            Encoder::H264(encoder) => encoder.take_packet_receiver(),
+            Encoder::H265(encoder) => encoder.take_packet_receiver(),
+            Encoder::AV1(encoder) => encoder.take_packet_receiver(),
         }
     }
 

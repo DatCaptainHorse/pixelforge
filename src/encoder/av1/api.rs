@@ -13,7 +13,21 @@ impl AV1Encoder {
     /// This image can be used as a target for `ColorConverter::convert` to avoid
     /// an intermediate copy.
     pub fn input_image(&self) -> vk::Image {
-        self.pipeline.input_image(self.context.device())
+        self.pipeline.input_image()
+    }
+
+    /// Try to receive a finished encoded packet without blocking.
+    ///
+    /// Encoding is asynchronous (see [`Self::encode`]); packets are produced by
+    /// a background readback thread and surfaced here. Returns `None` when no
+    /// packet is currently ready.
+    pub fn poll_packet(&self) -> Result<Option<EncodedPacket>> {
+        self.pipeline.poll_packet().transpose()
+    }
+
+    /// Take ownership of the encoded-packet receiver for out-of-band consumption.
+    pub fn take_packet_receiver(&mut self) -> Option<crate::encoder::EncodedPacketReceiver> {
+        self.pipeline.take_packet_receiver()
     }
 
     /// Encode a frame from a GPU image.
@@ -22,18 +36,21 @@ impl AV1Encoder {
     /// any CPU-side data copies. The source image must be in the correct format
     /// with the same dimensions as the encoder configuration, and should be in GENERAL layout.
     ///
-    /// Encoding is pipelined (depth 2): this submits the given frame to the encode
-    /// queue without blocking, then returns the packet for a *previously* submitted
-    /// frame. The first call returns an empty `Vec` while the pipeline fills, and
-    /// thereafter one packet per call. Call [`Self::flush`] at end-of-stream to drain
-    /// the remaining in-flight frames.
+    /// Encoding is asynchronous and pipelined (depth 2): this submits the given
+    /// frame to the encode queue without blocking and returns immediately. The
+    /// encoded packet is produced by a background readback thread and retrieved
+    /// via [`Self::poll_packet`] (or [`Self::flush`] at end-of-stream). This call
+    /// only blocks if all pipeline slots are still in flight (backpressure).
     ///
     /// # Panics
     ///
     /// The encoder will panic at creation time if B-frames are enabled (b_frame_count > 0),
     /// as B-frame encoding is not yet supported.
-    pub fn encode(&mut self, src_image: vk::Image) -> Result<Vec<EncodedPacket>> {
-        let drained_packet = self.pipeline.drain_current(self.context.device())?;
+    pub fn encode(&mut self, src_image: vk::Image) -> Result<()> {
+        // Ensure the slot we are about to record over and reuse has been read
+        // back by the completion thread.
+        self.pipeline.wait_current_free();
+
         let gop_position = self.gop.get_next_frame();
         let display_order = self.input_frame_num;
         self.input_frame_num += 1;
@@ -50,7 +67,7 @@ impl AV1Encoder {
 
         self.pipeline.advance();
 
-        Ok(drained_packet.into_iter().collect())
+        Ok(())
     }
 
     /// Internal method to encode the current frame already uploaded to input_image.
@@ -104,15 +121,10 @@ impl AV1Encoder {
             }
         }
 
-        self.encode_frame_internal(gop_position, is_key_frame)?;
-
-        // Save the order_hint used during encoding BEFORE incrementing.
-        let encoded_order_hint = self.order_hint;
+        // Record packet metadata before submitting: `submit_current` hands it to
+        // the readback thread together with the bitstream. `dts` reads the
+        // pre-increment encode counter (also used by `encode_frame_internal`).
         let dts = self.encode_frame_num;
-        self.encode_frame_num += 1;
-        self.frame_num += 1;
-        self.order_hint = (self.order_hint + 1) & 0xFF; // 8-bit order hint
-
         self.pipeline.set_pending_metadata(SlotPacketMetadata {
             frame_type,
             is_key_frame,
@@ -120,6 +132,14 @@ impl AV1Encoder {
             dts,
             header: Some(header),
         });
+
+        self.encode_frame_internal(gop_position, is_key_frame)?;
+
+        // Save the order_hint used during encoding BEFORE incrementing.
+        let encoded_order_hint = self.order_hint;
+        self.encode_frame_num += 1;
+        self.frame_num += 1;
+        self.order_hint = (self.order_hint + 1) & 0xFF; // 8-bit order hint
 
         // Update reference frames and DPB slot management
         // Key frames refresh all reference slots. Inter frames refresh only their own slot,
@@ -163,7 +183,7 @@ impl AV1Encoder {
 
     /// Flush the encoder and get any remaining packets.
     pub fn flush(&mut self) -> Result<Vec<EncodedPacket>> {
-        self.pipeline.flush(self.context.device())
+        self.pipeline.flush()
     }
 
     /// Request that the next frame be an IDR/key frame.
@@ -234,20 +254,9 @@ impl AV1Encoder {
     /// containing the updated color configuration. The next encoded frame will
     /// be a key frame with the new sequence header prepended.
     pub fn set_color_description(&mut self, desc: ColorDescription) -> Result<()> {
-        // Wait for any in-flight encode to complete before modifying session params.
-        // Do not reset the fences here; submit resets each slot fence before reuse.
-        let fences = self.pipeline.encode_fences();
-        unsafe {
-            self.context
-                .device()
-                .wait_for_fences(&fences, true, u64::MAX)
-                .map_err(|e| {
-                    PixelForgeError::Synchronization(format!(
-                        "Failed to wait for encode fences: {:?}",
-                        e
-                    ))
-                })?;
-        }
+        // Wait for all in-flight encodes to be read back before modifying the
+        // shared session parameters.
+        self.pipeline.wait_all_free();
 
         // Save old handle so we can destroy it after successful creation.
         let old_session_params = self.session_params;

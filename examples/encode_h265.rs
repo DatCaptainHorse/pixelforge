@@ -98,8 +98,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Upload YUV420 data to the input image.
         input_image.upload_yuv420(frame)?;
 
-        // Encode the image.
-        for packet in encoder.encode(input_image.image())? {
+        // Encode the image (async); drain any packets that are ready.
+        encoder.encode(input_image.image())?;
+        while let Some(packet) = encoder.poll_packet()? {
             total_bytes += packet.data.len();
             output.write_all(&packet.data)?;
             println!(

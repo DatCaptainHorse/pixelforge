@@ -171,7 +171,8 @@ fn run_test(
                 _ => return Err("Unsupported format".into()),
             }
 
-            for packet in encoder.encode(encoder_image)? {
+            encoder.encode(encoder_image)?;
+            while let Some(packet) = encoder.poll_packet()? {
                 output_file.write_all(&packet.data)?;
             }
         }
