@@ -214,10 +214,16 @@ impl EncodePipeline {
                 config.profile_info,
             )?;
 
-            let (bitstream_buffer, bitstream_buffer_memory) =
-                create_bitstream_buffer(context, config.bitstream_buffer_size, config.profile_info)?;
-            let bitstream_buffer_ptr =
-                map_bitstream_buffer(context, bitstream_buffer_memory, config.bitstream_buffer_size)?;
+            let (bitstream_buffer, bitstream_buffer_memory) = create_bitstream_buffer(
+                context,
+                config.bitstream_buffer_size,
+                config.profile_info,
+            )?;
+            let bitstream_buffer_ptr = map_bitstream_buffer(
+                context,
+                bitstream_buffer_memory,
+                config.bitstream_buffer_size,
+            )?;
 
             // Zero the padding between the user dimensions and the aligned coded
             // extent so the first frame has no undefined samples.
