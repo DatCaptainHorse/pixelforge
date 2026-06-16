@@ -1641,7 +1641,7 @@ pub(crate) unsafe fn query_timestamp_diff(
     if result.is_ok() {
         encode_time_ns = Some(((timestamps[1] - timestamps[0]) as f32 * timestamp_period) as u64);
     }
-    return encode_time_ns;
+    encode_time_ns
 }
 
 #[cfg(test)]
