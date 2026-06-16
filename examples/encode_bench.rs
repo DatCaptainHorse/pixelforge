@@ -149,10 +149,11 @@ fn run_encode_test(
         // Upload YUV420 data to the input image.
         input_image.upload_yuv420(frame)?;
 
-        // Encode the image.
-        for packet in encoder.encode(input_image.image())? {
+        // Encode the image (async); drain any packets that are ready.
+        encoder.encode(input_image.image())?;
+        while let Some(packet) = encoder.poll_packet()? {
             total_bytes += packet.data.len();
-            if let Some(stats) = packet.encoding_stats {
+            if let Some(stats) = packet.stats {
                 gpu_durations.push(Duration::from_nanos(stats.gpu_time_ns));
                 cpu_durations.push(Duration::from_nanos(stats.cpu_wall_time_ns));
             }
