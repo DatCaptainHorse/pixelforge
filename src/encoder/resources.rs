@@ -123,20 +123,6 @@ pub(crate) fn get_video_format(pixel_format: PixelFormat, bit_depth: BitDepth) -
     }
 }
 
-/// Create a codec name array for Vulkan from a string.
-///
-/// This creates a null-terminated c_char array of 256 bytes for use with Vulkan
-/// video extensions.
-pub(crate) fn make_codec_name(codec_name: &[u8]) -> [std::ffi::c_char; 256] {
-    let mut name = [0 as std::ffi::c_char; 256];
-    for (i, &byte) in codec_name.iter().enumerate() {
-        if i < 255 {
-            name[i] = byte as std::ffi::c_char;
-        }
-    }
-    name
-}
-
 /// Create a buffer that requires device addresses (SHADER_DEVICE_ADDRESS usage).
 ///
 /// This allocates memory with `VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT` so that
@@ -1408,12 +1394,17 @@ pub(crate) unsafe fn submit_encode_only(
 /// # Safety
 ///
 /// The bitstream buffer pointer must be valid and persistently mapped.
+/// Wait for the encode to finish, then append its bitstream directly onto `dst`
+/// (which already holds any codec header). Appending in place means the encoded
+/// bytes are copied out of the mapped buffer exactly once — there is no
+/// intermediate owned `Vec`.
 pub(crate) unsafe fn wait_and_read_bitstream(
     device: &ash::Device,
     fence: vk::Fence,
     query_pool: vk::QueryPool,
     bitstream_buffer_ptr: *const u8,
-) -> Result<Vec<u8>> {
+    dst: &mut Vec<u8>,
+) -> Result<()> {
     device
         .wait_for_fences(&[fence], true, u64::MAX)
         .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
@@ -1450,11 +1441,122 @@ pub(crate) unsafe fn wait_and_read_bitstream(
 
     tracing::debug!("Encoded frame: offset={}, size={}", offset, size);
 
-    let mut encoded_data = vec![0u8; size];
     let src = std::slice::from_raw_parts(bitstream_buffer_ptr.add(offset), size);
-    encoded_data.copy_from_slice(src);
+    dst.extend_from_slice(src);
 
-    Ok(encoded_data)
+    Ok(())
+}
+
+/// The per-codec Vulkan resources torn down on `Drop`, other than the encode
+/// pipeline (which the engine owns and destroys). Bundled so the identical
+/// teardown lives in one place; see [`destroy_encoder_resources`].
+pub(crate) struct EncoderTeardown<'a> {
+    pub command_pool: vk::CommandPool,
+    pub upload_command_pool: vk::CommandPool,
+    pub upload_fence: vk::Fence,
+    pub dpb_images: &'a [vk::Image],
+    pub dpb_image_views: &'a [vk::ImageView],
+    pub dpb_image_memories: &'a [vk::DeviceMemory],
+    pub session: vk::VideoSessionKHR,
+    pub session_params: vk::VideoSessionParametersKHR,
+    pub session_memory: &'a [vk::DeviceMemory],
+}
+
+/// Destroy the common encoder resources (command pools, upload fence, DPB
+/// images, and the video session). Identical across codecs.
+///
+/// # Safety
+///
+/// All queues that may reference these resources must be idle.
+pub(crate) unsafe fn destroy_encoder_resources(
+    device: &ash::Device,
+    video_queue_fn: &ash::khr::video_queue::Device,
+    res: &EncoderTeardown,
+) {
+    device.destroy_fence(res.upload_fence, None);
+    device.destroy_command_pool(res.command_pool, None);
+    if res.upload_command_pool != res.command_pool {
+        device.destroy_command_pool(res.upload_command_pool, None);
+    }
+
+    for &view in res.dpb_image_views {
+        device.destroy_image_view(view, None);
+    }
+    for &image in res.dpb_images {
+        device.destroy_image(image, None);
+    }
+    for &memory in res.dpb_image_memories {
+        device.free_memory(memory, None);
+    }
+
+    if res.session_params != vk::VideoSessionParametersKHR::null() {
+        (video_queue_fn.fp().destroy_video_session_parameters_khr)(
+            device.handle(),
+            res.session_params,
+            std::ptr::null(),
+        );
+    }
+    (video_queue_fn.fp().destroy_video_session_khr)(device.handle(), res.session, std::ptr::null());
+    for &memory in res.session_memory {
+        device.free_memory(memory, None);
+    }
+}
+
+/// Retrieve driver-encoded video session parameters (H.264 SPS/PPS, H.265
+/// VPS/SPS/PPS, or AV1 sequence header) into a byte buffer, retrying on
+/// `INCOMPLETE`.
+///
+/// The codec-specific `*GetInfoKHR` and feedback structs are built by the caller
+/// and chained into `get_info`/`feedback`; this owns only the identical query
+/// loop. A preallocated buffer is always provided because some drivers misbehave
+/// on a size-only query (`pData == NULL`), notably for 4:4:4 profiles.
+pub(crate) fn get_encoded_session_params(
+    context: &VideoContext,
+    video_encode_fn: &ash::khr::video_encode_queue::Device,
+    get_info: &vk::VideoEncodeSessionParametersGetInfoKHR,
+    feedback: &mut vk::VideoEncodeSessionParametersFeedbackInfoKHR,
+) -> Result<Vec<u8>> {
+    let mut data = vec![0u8; 4096];
+    let mut data_size: usize = data.len();
+    let mut attempts = 0;
+    loop {
+        attempts += 1;
+        let result = unsafe {
+            (video_encode_fn
+                .fp()
+                .get_encoded_video_session_parameters_khr)(
+                context.device().handle(),
+                get_info,
+                feedback,
+                &mut data_size,
+                data.as_mut_ptr() as *mut std::ffi::c_void,
+            )
+        };
+
+        match result {
+            vk::Result::SUCCESS => {
+                if data_size == 0 {
+                    return Err(PixelForgeError::SessionParametersCreation(
+                        "Encoded session parameters size is 0".to_string(),
+                    ));
+                }
+                data.truncate(data_size);
+                return Ok(data);
+            }
+            // Driver indicates the buffer was too small; resize to the reported
+            // required size (or grow conservatively if it is not provided).
+            vk::Result::INCOMPLETE if attempts < 3 => {
+                let new_size = data_size.max(data.len() * 2).max(1);
+                data.resize(new_size, 0);
+                data_size = data.len();
+            }
+            err => {
+                return Err(PixelForgeError::SessionParametersCreation(format!(
+                    "Failed to get encoded session parameters: {err:?}"
+                )));
+            }
+        }
+    }
 }
 
 #[cfg(test)]

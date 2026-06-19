@@ -1,29 +1,29 @@
-use super::AV1Encoder;
+//! AV1 sequence-header generation and OBU retrieval.
 
+use super::Av1;
+
+use crate::encoder::codec::EncoderCommon;
+use crate::encoder::resources::get_encoded_session_params;
 use crate::encoder::{BitDepth, ColorDescription, PixelFormat};
 use crate::error::{PixelForgeError, Result};
 use ash::vk;
 use ash::vk::TaggedStructure;
 use std::ptr;
 
-impl AV1Encoder {
-    /// Build AV1 sequence header and create Vulkan video session parameters.
-    ///
-    /// This is used both during initial encoder creation and by
-    /// `set_color_description()` to rebuild session parameters with
-    /// updated color configuration. Keeping a single implementation
-    /// ensures the sequence header stays bit-for-bit consistent.
-    pub(crate) fn create_session_params(
+impl Av1 {
+    /// Build the AV1 sequence header and create Vulkan video session parameters.
+    pub(super) fn build_session_params(
         &self,
+        common: &EncoderCommon,
         desc: &ColorDescription,
     ) -> Result<vk::VideoSessionParametersKHR> {
-        let width = self.config.dimensions.width;
-        let height = self.config.dimensions.height;
+        let config = &common.config;
+        let width = config.dimensions.width;
+        let height = config.dimensions.height;
 
         let frame_width_bits = 32 - (width - 1).leading_zeros();
         let frame_height_bits = 32 - (height - 1).leading_zeros();
 
-        // Map ColorDescription to AV1 enum constants.
         let av1_color_primaries = match desc.color_primaries {
             9 => ash::vk::native::StdVideoAV1ColorPrimaries_STD_VIDEO_AV1_COLOR_PRIMARIES_BT_2020,
             _ => ash::vk::native::StdVideoAV1ColorPrimaries_STD_VIDEO_AV1_COLOR_PRIMARIES_BT_709,
@@ -49,16 +49,15 @@ impl AV1Encoder {
             ),
         };
 
-        let bit_depth = match self.config.bit_depth {
+        let bit_depth = match config.bit_depth {
             BitDepth::Eight => 8,
             BitDepth::Ten => 10,
         };
 
-        // Chroma subsampling based on pixel format.
-        let (subsampling_x, subsampling_y) = match self.config.pixel_format {
-            PixelFormat::Yuv420 => (1u8, 1u8), // 4:2:0
-            PixelFormat::Yuv444 => (0u8, 0u8), // 4:4:4
-            _ => (1u8, 1u8),                   // Default to 4:2:0
+        let (subsampling_x, subsampling_y) = match config.pixel_format {
+            PixelFormat::Yuv420 => (1u8, 1u8),
+            PixelFormat::Yuv444 => (0u8, 0u8),
+            _ => (1u8, 1u8),
         };
 
         let color_config = ash::vk::native::StdVideoAV1ColorConfig {
@@ -73,18 +72,18 @@ impl AV1Encoder {
             chroma_sample_position: ash::vk::native::StdVideoAV1ChromaSamplePosition_STD_VIDEO_AV1_CHROMA_SAMPLE_POSITION_UNKNOWN,
         };
 
-        let profile = match self.config.pixel_format {
+        let profile = match config.pixel_format {
             PixelFormat::Yuv420 => ash::vk::native::StdVideoAV1Profile_STD_VIDEO_AV1_PROFILE_MAIN,
             _ => ash::vk::native::StdVideoAV1Profile_STD_VIDEO_AV1_PROFILE_HIGH,
         };
 
-        // AV1 sequence header flags - use minimal set to avoid driver issues.
+        // Minimal sequence-header flags (avoid driver issues).
         let seq_flags = ash::vk::native::StdVideoAV1SequenceHeaderFlags {
             _bitfield_align_1: [],
             _bitfield_1: ash::vk::native::StdVideoAV1SequenceHeaderFlags::new_bitfield_1(
                 0, // still_picture
                 0, // reduced_still_picture_header
-                0, // use_128x128_superblock (use 64x64 superblocks)
+                0, // use_128x128_superblock
                 0, // enable_filter_intra
                 0, // enable_intra_edge_filter
                 0, // enable_interintra_compound
@@ -122,7 +121,6 @@ impl AV1Encoder {
             pTimingInfo: ptr::null(),
         };
 
-        // Create decoder model info (zero-initialized like FFmpeg).
         let decoder_model_info = ash::vk::native::StdVideoEncodeAV1DecoderModelInfo {
             buffer_delay_length_minus_1: 0,
             buffer_removal_time_length_minus_1: 0,
@@ -131,7 +129,6 @@ impl AV1Encoder {
             num_units_in_decoding_tick: 0,
         };
 
-        // Create operating point info (single operating point like FFmpeg).
         let operating_point = ash::vk::native::StdVideoEncodeAV1OperatingPointInfo {
             flags: ash::vk::native::StdVideoEncodeAV1OperatingPointInfoFlags {
                 _bitfield_align_1: [],
@@ -156,21 +153,35 @@ impl AV1Encoder {
 
         let mut quality_info = vk::VideoEncodeQualityLevelInfoKHR::default().quality_level(0);
         let session_params_create_info = vk::VideoSessionParametersCreateInfoKHR::default()
-            .video_session(self.session)
+            .video_session(common.session)
             .push(&mut quality_info)
             .push(&mut av1_session_params_create_info);
 
-        let session_params = unsafe {
-            self.video_queue_fn
+        unsafe {
+            common
+                .video_queue_fn
                 .create_video_session_parameters(&session_params_create_info, None)
                 .map_err(|e| {
                     PixelForgeError::SessionParametersCreation(format!(
                         "Failed to create AV1 session parameters: {:?}",
                         e
                     ))
-                })?
-        };
+                })
+        }
+    }
 
-        Ok(session_params)
+    /// Retrieve the driver-generated sequence-header OBU for key frames.
+    pub(super) fn build_header(&self, common: &EncoderCommon) -> Result<Vec<u8>> {
+        let get_info = vk::VideoEncodeSessionParametersGetInfoKHR {
+            video_session_parameters: common.session_params,
+            ..Default::default()
+        };
+        let mut feedback = vk::VideoEncodeSessionParametersFeedbackInfoKHR::default();
+        get_encoded_session_params(
+            &common.context,
+            &common.video_encode_fn,
+            &get_info,
+            &mut feedback,
+        )
     }
 }

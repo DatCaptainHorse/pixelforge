@@ -1,40 +1,40 @@
-use super::H265Encoder;
+//! H.265 parameter-set generation: VPS/SPS/PPS construction and header retrieval.
 
+use super::H265;
+
+use crate::encoder::codec::EncoderCommon;
+use crate::encoder::resources::get_encoded_session_params;
 use crate::encoder::{BitDepth, ColorDescription, PixelFormat};
 use crate::error::{PixelForgeError, Result};
 use ash::vk;
 use ash::vk::TaggedStructure;
 use std::ptr;
 
-impl H265Encoder {
+impl H265 {
     /// Build VPS/SPS/PPS and create Vulkan video session parameters.
-    ///
-    /// This is used both during initial encoder creation and by
-    /// `set_color_description()` to rebuild session parameters with
-    /// updated VUI color metadata. Keeping a single implementation
-    /// ensures the parameter sets stay bit-for-bit consistent.
-    pub(crate) fn create_session_params(
+    pub(super) fn build_session_params(
         &self,
+        common: &EncoderCommon,
         desc: &ColorDescription,
     ) -> Result<vk::VideoSessionParametersKHR> {
-        // CTB/CB size constants.
+        let config = &common.config;
+
         let ctb_log2_size_y: u8 = 5;
         let min_cb_log2_size_y: u8 = 4;
         let log2_min_transform_block_size: u8 = 2;
         let log2_max_transform_block_size: u8 = 5;
 
-        let pic_width_in_luma_samples = self.aligned_width;
-        let pic_height_in_luma_samples = self.aligned_height;
+        let pic_width_in_luma_samples = common.aligned_width;
+        let pic_height_in_luma_samples = common.aligned_height;
 
-        let (sub_width_c, sub_height_c) = match self.config.pixel_format {
+        let (sub_width_c, sub_height_c) = match config.pixel_format {
             PixelFormat::Yuv420 => (2u32, 2u32),
             PixelFormat::Yuv444 => (1u32, 1u32),
             _ => (2u32, 2u32),
         };
-        let conf_win_right_offset =
-            (self.aligned_width - self.config.dimensions.width) / sub_width_c;
+        let conf_win_right_offset = (common.aligned_width - config.dimensions.width) / sub_width_c;
         let conf_win_bottom_offset =
-            (self.aligned_height - self.config.dimensions.height) / sub_height_c;
+            (common.aligned_height - config.dimensions.height) / sub_height_c;
         let conformance_window_flag = conf_win_right_offset > 0 || conf_win_bottom_offset > 0;
 
         let profile_tier_level = ash::vk::native::StdVideoH265ProfileTierLevel {
@@ -45,13 +45,13 @@ impl H265Encoder {
                 ),
                 __bindgen_padding_0: [0; 3],
             },
-            general_profile_idc: self.profile_idc,
+            general_profile_idc: self.profile_idc(),
             general_level_idc: ash::vk::native::StdVideoH265LevelIdc_STD_VIDEO_H265_LEVEL_IDC_5_1,
         };
 
         let dec_pic_buf_mgr = ash::vk::native::StdVideoH265DecPicBufMgr {
             max_latency_increase_plus1: [0; 7],
-            max_dec_pic_buffering_minus1: [(self.dpb_slot_count - 1) as u8, 0, 0, 0, 0, 0, 0],
+            max_dec_pic_buffering_minus1: [(common.dpb_slot_count - 1) as u8, 0, 0, 0, 0, 0, 0],
             max_num_reorder_pics: [0; 7],
         };
 
@@ -174,12 +174,12 @@ impl H265Encoder {
             pHrdParameters: ptr::null(),
         };
 
-        let bit_depth_minus8: u8 = match self.config.bit_depth {
+        let bit_depth_minus8: u8 = match config.bit_depth {
             BitDepth::Eight => 0,
             BitDepth::Ten => 2,
         };
 
-        let chroma_format_idc = match self.config.pixel_format {
+        let chroma_format_idc = match config.pixel_format {
             PixelFormat::Yuv420 => {
                 ash::vk::native::StdVideoH265ChromaFormatIdc_STD_VIDEO_H265_CHROMA_FORMAT_IDC_420
             }
@@ -189,7 +189,7 @@ impl H265Encoder {
             _ => {
                 return Err(PixelForgeError::InvalidInput(format!(
                     "Unsupported pixel format for H.265: {:?}",
-                    self.config.pixel_format
+                    config.pixel_format
                 )));
             }
         };
@@ -336,14 +336,17 @@ impl H265Encoder {
         let mut quality_level_info = vk::VideoEncodeQualityLevelInfoKHR::default().quality_level(0);
 
         let params_create_info = vk::VideoSessionParametersCreateInfoKHR::default()
-            .video_session(self.session)
+            .video_session(common.session)
             .push(&mut h265_params_create_info)
             .push(&mut quality_level_info);
 
         let mut session_params = vk::VideoSessionParametersKHR::null();
         let result = unsafe {
-            (self.video_queue_fn.fp().create_video_session_parameters_khr)(
-                self.context.device().handle(),
+            (common
+                .video_queue_fn
+                .fp()
+                .create_video_session_parameters_khr)(
+                common.device().handle(),
                 &params_create_info,
                 ptr::null(),
                 &mut session_params,
@@ -355,7 +358,29 @@ impl H265Encoder {
                 result
             )));
         }
-
         Ok(session_params)
+    }
+
+    /// Retrieve the encoded VPS/SPS/PPS NAL units to prepend to an IDR frame.
+    pub(super) fn build_header(&self, common: &EncoderCommon) -> Result<Vec<u8>> {
+        let mut h265_get_info = vk::VideoEncodeH265SessionParametersGetInfoKHR::default()
+            .write_std_vps(true)
+            .write_std_sps(true)
+            .write_std_pps(true)
+            .std_vps_id(0)
+            .std_sps_id(0)
+            .std_pps_id(0);
+        let get_info = vk::VideoEncodeSessionParametersGetInfoKHR::default()
+            .video_session_parameters(common.session_params)
+            .push(&mut h265_get_info);
+        let mut h265_feedback = vk::VideoEncodeH265SessionParametersFeedbackInfoKHR::default();
+        let mut feedback =
+            vk::VideoEncodeSessionParametersFeedbackInfoKHR::default().push(&mut h265_feedback);
+        get_encoded_session_params(
+            &common.context,
+            &common.video_encode_fn,
+            &get_info,
+            &mut feedback,
+        )
     }
 }
