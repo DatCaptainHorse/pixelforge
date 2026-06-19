@@ -262,6 +262,22 @@ pub(crate) trait VideoCodec: Sized + Send {
     /// DPB slot. Runs after submission.
     fn end_picture(&mut self, common: &mut EncoderCommon, plan: &FramePlan);
 
+    /// Reference frame invalidation: drop every held reference the client can no
+    /// longer decode and arrange for the next frame to predict from a surviving
+    /// one.
+    ///
+    /// `first_lost_display_order` is the display order (the `pts` reported on
+    /// encoded packets) of the earliest frame the client lost. In a linear P
+    /// chain every reference at or after that frame is transitively undecodable,
+    /// so all of them are dropped. Returns `true` if a usable reference survives
+    /// (the next P-frame can be predicted from it); `false` if none remain and
+    /// the caller must fall back to an IDR.
+    fn invalidate_references(
+        &mut self,
+        common: &mut EncoderCommon,
+        first_lost_display_order: u64,
+    ) -> bool;
+
     /// Build the codec parameter sets and create Vulkan session parameters.
     /// Used at init and by `set_color_description`.
     fn create_session_params(
@@ -326,6 +342,18 @@ impl<C: VideoCodec> CodecEncoder<C> {
     /// Force the next frame to be an IDR/key frame.
     pub fn request_idr(&mut self) {
         self.common.gop.request_idr();
+    }
+
+    /// Reference frame invalidation: drop references the client lost and predict
+    /// the next frame from a surviving reference, falling back to an IDR when no
+    /// reference survives. See [`crate::Encoder::invalidate_reference_frames`].
+    pub fn invalidate_reference_frames(&mut self, first_lost_display_order: u64) {
+        if !self
+            .codec
+            .invalidate_references(&mut self.common, first_lost_display_order)
+        {
+            self.common.gop.request_idr();
+        }
     }
 
     /// Rebuild session parameters with a new color description; the next frame is

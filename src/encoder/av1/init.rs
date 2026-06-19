@@ -64,6 +64,7 @@ impl Av1 {
             // AV1 reference handling here does not use a layered DPB.
             allow_layered_dpb: false,
         })?;
+        let active_reference_count = init.active_reference_count;
         let common = init.common;
 
         let codec = Av1 {
@@ -71,6 +72,7 @@ impl Av1 {
             order_hint: 0,
             header_data: None,
             references: Vec::new(),
+            active_reference_count,
         };
 
         let mut encoder = CodecEncoder { common, codec };

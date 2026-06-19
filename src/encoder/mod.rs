@@ -413,6 +413,7 @@ trait EncoderApi: Send {
     fn encode(&mut self, src_image: vk::Image) -> Result<EncodeFuture>;
     fn flush(&mut self) -> Result<()>;
     fn request_idr(&mut self);
+    fn invalidate_reference_frames(&mut self, first_lost_display_order: u64);
     fn set_color_description(&mut self, desc: ColorDescription) -> Result<()>;
 }
 
@@ -428,6 +429,9 @@ impl<C: codec::VideoCodec> EncoderApi for codec::CodecEncoder<C> {
     }
     fn request_idr(&mut self) {
         codec::CodecEncoder::request_idr(self)
+    }
+    fn invalidate_reference_frames(&mut self, first_lost_display_order: u64) {
+        codec::CodecEncoder::invalidate_reference_frames(self, first_lost_display_order)
     }
     fn set_color_description(&mut self, desc: ColorDescription) -> Result<()> {
         codec::CodecEncoder::set_color_description(self, desc)
@@ -513,6 +517,27 @@ impl Encoder {
     /// Request that the next frame be an IDR frame.
     pub fn request_idr(&mut self) {
         self.0.request_idr()
+    }
+
+    /// Recover from packet loss without a full IDR (reference frame invalidation).
+    ///
+    /// When a client reports that it could not decode a range of frames, every
+    /// reference picture the encoder still holds from the earliest lost frame
+    /// onward is transitively undecodable on the client. This drops those
+    /// references so the next P-frame is predicted from the most recent
+    /// *surviving* reference instead — a much cheaper recovery than re-sending a
+    /// full keyframe. If no reference survives (the loss covers the encoder's
+    /// whole reference window), it transparently falls back to forcing an IDR.
+    ///
+    /// `first_lost_display_order` is the display order — the `pts` reported on
+    /// [`EncodedPacket`]s — of the earliest frame the client lost.
+    ///
+    /// Effective recovery requires the encoder to keep more than one reference
+    /// (see [`EncodeConfig::with_max_reference_frames`]); with a single
+    /// reference this necessarily falls back to an IDR. Codecs that predict from
+    /// a single reference (AV1 here) likewise fall back to an IDR.
+    pub fn invalidate_reference_frames(&mut self, first_lost_display_order: u64) {
+        self.0.invalidate_reference_frames(first_lost_display_order)
     }
 
     /// Update the color description (VUI parameters) for the encoder.

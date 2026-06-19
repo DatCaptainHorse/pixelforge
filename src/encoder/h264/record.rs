@@ -41,6 +41,45 @@ impl H264 {
 
         let rc = RateControlPlan::new(&common.config, 26);
 
+        // Reference frame invalidation: emit MMCO "unmark short-term" operations
+        // for references dropped since the last frame, so the decoder evicts the
+        // same pictures we did and its default reference list re-anchors to the
+        // surviving reference. Only valid on a non-IDR reference picture (an IDR
+        // resets the DPB on its own). Kept alive for the whole `record` call so
+        // the pointer handed to the encoder stays valid.
+        let ref_pic_marking_ops: Vec<ash::vk::native::StdVideoEncodeH264RefPicMarkingEntry> =
+            if !is_idr && is_reference && !self.pending_unmark_frame_nums.is_empty() {
+                self.pending_unmark_frame_nums
+                    .iter()
+                    .map(|&tainted_frame_num| {
+                        // CurrPicNum is frame_num for a (non-field) frame. A
+                        // short-term ref's PicNumX is its FrameNumWrap; a tainted
+                        // frame_num greater than the current one has wrapped past
+                        // MaxFrameNum (256 here, log2_max_frame_num_minus4 = 4).
+                        let curr = frame_num as i32;
+                        let mut pic_num_x = tainted_frame_num as i32;
+                        if pic_num_x > curr {
+                            pic_num_x -= 256;
+                        }
+                        let diff = (curr - pic_num_x).max(1);
+                        ash::vk::native::StdVideoEncodeH264RefPicMarkingEntry {
+                            memory_management_control_operation:
+                                ash::vk::native::StdVideoH264MemMgmtControlOp_STD_VIDEO_H264_MEM_MGMT_CONTROL_OP_UNMARK_SHORT_TERM,
+                            difference_of_pic_nums_minus1: (diff - 1) as u16,
+                            long_term_pic_num: 0,
+                            long_term_frame_idx: 0,
+                            max_long_term_frame_idx_plus1: 0,
+                        }
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+        let use_adaptive_marking = !ref_pic_marking_ops.is_empty();
+        if use_adaptive_marking {
+            self.pending_unmark_frame_nums.clear();
+        }
+
         // Prepare command buffer and transition DPB images for encode.
         unsafe {
             prepare_encode_command_buffer(common.device(), command_buffer, query_pool)?;
@@ -117,7 +156,7 @@ impl H264 {
                 if is_reference { 1 } else { 0 }, // is_reference
                 0,                                // no_output_of_prior_pics_flag
                 0,                                // long_term_reference_flag
-                0,                                // adaptive_ref_pic_marking_mode_flag
+                use_adaptive_marking as u32,      // adaptive_ref_pic_marking_mode_flag
                 0,                                // reserved
             ),
         };
@@ -176,11 +215,15 @@ impl H264 {
             RefPicList1: ref_list1,
             refList0ModOpCount: 0,
             refList1ModOpCount: 0,
-            refPicMarkingOpCount: 0,
+            refPicMarkingOpCount: ref_pic_marking_ops.len() as u8,
             reserved1: [0; 7],
             pRefList0ModOperations: std::ptr::null(),
             pRefList1ModOperations: std::ptr::null(),
-            pRefPicMarkingOperations: std::ptr::null(),
+            pRefPicMarkingOperations: if ref_pic_marking_ops.is_empty() {
+                std::ptr::null()
+            } else {
+                ref_pic_marking_ops.as_ptr()
+            },
         };
 
         let picture_info = ash::vk::native::StdVideoEncodeH264PictureInfo {
@@ -193,7 +236,7 @@ impl H264 {
             PicOrderCnt: pic_order_cnt,
             temporal_id: 0,
             reserved1: [0; 3],
-            pRefLists: if !is_idr && !self.l0_references.is_empty() {
+            pRefLists: if !is_idr && (!self.l0_references.is_empty() || use_adaptive_marking) {
                 &ref_lists_info
             } else {
                 std::ptr::null()

@@ -24,6 +24,8 @@ pub const CTB_SIZE: u32 = 32;
 pub(crate) struct ReferenceInfo {
     pub dpb_slot: u8,
     pub poc: i32,
+    /// Display order (`pts`) of this reference, for reference frame invalidation.
+    pub display_order: u64,
 }
 
 /// H.265-specific encoder state.
@@ -114,6 +116,7 @@ impl VideoCodec for H265 {
             ReferenceInfo {
                 dpb_slot: common.current_dpb_slot,
                 poc: pic_order_cnt,
+                display_order: plan.display_order,
             },
         );
         while self.l0_references.len() > self.active_reference_count as usize {
@@ -129,6 +132,24 @@ impl VideoCodec for H265 {
                 }
             }
         }
+    }
+
+    fn invalidate_references(
+        &mut self,
+        _common: &mut EncoderCommon,
+        first_lost_display_order: u64,
+    ) -> bool {
+        // Every reference at or after the first lost frame is transitively
+        // undecodable on the client; keep only older survivors. H.265 declares
+        // its short-term reference picture set explicitly every frame from
+        // `l0_references` (see `record`), so dropping entries here is enough for
+        // the decoder to follow — no extra bitstream marking is required.
+        self.l0_references
+            .retain(|r| r.display_order < first_lost_display_order);
+        // A backward (L1) reference may also be tainted; B-frames are the only
+        // consumer of it, so simply forget it on invalidation.
+        self.has_backward_reference = false;
+        !self.l0_references.is_empty()
     }
 
     fn create_session_params(

@@ -95,6 +95,7 @@ impl H264 {
             backward_reference_dpb_slot: 2,
             l0_references: Vec::new(),
             active_reference_count,
+            pending_unmark_frame_nums: Vec::new(),
             profile_idc,
             preferred_entropy_cabac,
         };

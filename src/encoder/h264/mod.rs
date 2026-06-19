@@ -26,6 +26,8 @@ pub(crate) struct ReferenceInfo {
     pub dpb_slot: u8,
     pub frame_num: u32,
     pub poc: i32,
+    /// Display order (`pts`) of this reference, for reference frame invalidation.
+    pub display_order: u64,
 }
 
 /// H.264-specific encoder state (everything the generic encoder doesn't own).
@@ -45,6 +47,10 @@ pub(crate) struct H264 {
     l0_references: Vec<ReferenceInfo>,
     /// Negotiated number of active references.
     active_reference_count: u32,
+    /// `frame_num`s of references dropped by reference frame invalidation that
+    /// still need to be marked unused-for-reference (via MMCO) in the next
+    /// P-frame's slice header, so the decoder's DPB matches the encoder's.
+    pending_unmark_frame_nums: Vec<u32>,
     /// Profile IDC (cached for parameter-set recreation).
     profile_idc: u32,
     /// Whether CABAC entropy coding is preferred (from quality-level query).
@@ -72,6 +78,9 @@ impl VideoCodec for H264 {
             self.dpb.h264.sequence_start(dpb_config);
             self.l0_references.clear();
             self.has_backward_reference = false;
+            // An IDR resets the decoder's whole DPB, so any deferred
+            // unused-reference markings are moot.
+            self.pending_unmark_frame_nums.clear();
         }
 
         let header = if plan.is_idr() {
@@ -130,6 +139,7 @@ impl VideoCodec for H264 {
                     dpb_slot: common.current_dpb_slot,
                     frame_num,
                     poc: pic_order_cnt,
+                    display_order: plan.display_order,
                 },
             );
             while self.l0_references.len() > self.active_reference_count as usize {
@@ -145,6 +155,31 @@ impl VideoCodec for H264 {
                 }
             }
         }
+    }
+
+    fn invalidate_references(
+        &mut self,
+        _common: &mut EncoderCommon,
+        first_lost_display_order: u64,
+    ) -> bool {
+        // Keep references older than the loss; every newer one is transitively
+        // undecodable on the client. H.264 maintains the DPB with an implicit
+        // sliding window, which would keep those newer pictures and desync the
+        // decoder's reference list from ours — so each dropped reference is
+        // queued to be explicitly marked unused-for-reference (MMCO) in the next
+        // P-frame (see `record`).
+        let mut survivors = Vec::with_capacity(self.l0_references.len());
+        for r in self.l0_references.drain(..) {
+            if r.display_order < first_lost_display_order {
+                survivors.push(r);
+            } else {
+                self.pending_unmark_frame_nums.push(r.frame_num);
+            }
+        }
+        self.l0_references = survivors;
+        // A backward (L1) reference may also be tainted; only B-frames use it.
+        self.has_backward_reference = false;
+        !self.l0_references.is_empty()
     }
 
     fn create_session_params(

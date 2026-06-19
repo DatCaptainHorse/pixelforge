@@ -1,8 +1,14 @@
 //! AV1 codec: the differences from the generic encoder.
 //!
 //! Shared machinery lives in [`crate::encoder::codec`]; this folder holds only
-//! AV1's single-reference tracking ([`Av1`]), its per-frame StdVideo* graph
-//! (`record`), and its sequence-header generation (`session_params`).
+//! AV1's reference tracking ([`Av1`]), its per-frame StdVideo* graph (`record`),
+//! and its sequence-header generation (`session_params`).
+//!
+//! Inter frames predict from up to [`Av1::active_reference_count`] recent
+//! references, mapped onto the forward AV1 reference names. Keeping a window of
+//! references (rather than just the previous frame) is what lets reference frame
+//! invalidation recover from loss by re-anchoring to an older surviving frame
+//! instead of forcing a key frame.
 
 mod init;
 mod record;
@@ -25,16 +31,20 @@ pub(crate) struct ReferenceInfo {
     pub dpb_slot: u8,
     pub order_hint: u32,
     pub frame_type: u32,
+    /// Display order (`pts`) of this reference, for reference frame invalidation.
+    pub display_order: u64,
 }
 
-/// AV1-specific encoder state (single-reference prediction).
+/// AV1-specific encoder state (multi-reference prediction).
 pub(crate) struct Av1 {
     frame_num: u32,
     order_hint: u32,
     /// Cached sequence-header OBU (invalidated when session params change).
     header_data: Option<Vec<u8>>,
-    /// Active references, most-recent first (only the first is used).
+    /// Active references, most-recent first.
     references: Vec<ReferenceInfo>,
+    /// Negotiated number of active references kept for prediction.
+    active_reference_count: u32,
 }
 
 impl VideoCodec for Av1 {
@@ -86,6 +96,7 @@ impl VideoCodec for Av1 {
         let ref_info = ReferenceInfo {
             dpb_slot: common.current_dpb_slot,
             order_hint: encoded_order_hint,
+            display_order: plan.display_order,
             frame_type: if is_key {
                 ash::vk::native::StdVideoAV1FrameType_STD_VIDEO_AV1_FRAME_TYPE_KEY
             } else {
@@ -97,8 +108,11 @@ impl VideoCodec for Av1 {
             self.references.clear();
         }
         self.references.insert(0, ref_info);
-        // Single-reference prediction keeps only the most recent reference.
-        self.references.truncate(1);
+        // Keep a sliding window of the most recent references for prediction and
+        // loss recovery.
+        while self.references.len() > self.active_reference_count.max(1) as usize {
+            self.references.pop();
+        }
 
         // Cycle to the next available DPB slot.
         let used_slots: Vec<u8> = self.references.iter().map(|r| r.dpb_slot).collect();
@@ -112,6 +126,19 @@ impl VideoCodec for Av1 {
             }
         }
         common.current_dpb_slot = next_slot;
+    }
+
+    fn invalidate_references(
+        &mut self,
+        _common: &mut EncoderCommon,
+        first_lost_display_order: u64,
+    ) -> bool {
+        // This AV1 path predicts from a single reference. If that reference is at
+        // or after the first lost frame it is undecodable on the client and no
+        // older survivor is kept, so recovery can only be a full key frame.
+        self.references
+            .retain(|r| r.display_order < first_lost_display_order);
+        !self.references.is_empty()
     }
 
     fn create_session_params(
@@ -152,6 +179,7 @@ mod tests {
             dpb_slot: 2,
             order_hint: 42,
             frame_type: 0,
+            display_order: 0,
         };
         assert_eq!(ref_info.dpb_slot, 2);
         assert_eq!(ref_info.order_hint, 42);
@@ -178,6 +206,7 @@ mod tests {
                 dpb_slot: i % max_refs as u8,
                 order_hint: i as u32,
                 frame_type: 0,
+                display_order: 0,
             };
             references.insert(0, ref_info);
             while references.len() > max_refs {
@@ -199,6 +228,7 @@ mod tests {
                     dpb_slot: i,
                     order_hint: i as u32,
                     frame_type: 0,
+                    display_order: 0,
                 },
             );
         }
@@ -211,6 +241,7 @@ mod tests {
                 dpb_slot: 0,
                 order_hint: 0,
                 frame_type: 0,
+                display_order: 0,
             },
         );
         assert_eq!(references.len(), 1);
@@ -242,6 +273,7 @@ mod tests {
                 dpb_slot: 0,
                 order_hint: 0,
                 frame_type: 0,
+                display_order: 0,
             },
         );
         while references.len() > max_refs {
@@ -256,6 +288,7 @@ mod tests {
                 dpb_slot: 1,
                 order_hint: 1,
                 frame_type: 0,
+                display_order: 0,
             },
         );
         while references.len() > max_refs {
@@ -270,6 +303,7 @@ mod tests {
                 dpb_slot: 2,
                 order_hint: 2,
                 frame_type: 0,
+                display_order: 0,
             },
         );
         while references.len() > max_refs {
@@ -287,6 +321,7 @@ mod tests {
                 dpb_slot: 0,
                 order_hint: 3,
                 frame_type: 0,
+                display_order: 0,
             },
         );
         while references.len() > max_refs {
@@ -318,6 +353,7 @@ mod tests {
                 dpb_slot: 0,
                 order_hint: 0,
                 frame_type: 0,
+                display_order: 0,
             },
         );
         while references.len() > max_refs {
@@ -332,6 +368,7 @@ mod tests {
                 dpb_slot: 1,
                 order_hint: 1,
                 frame_type: 0,
+                display_order: 0,
             },
         );
         while references.len() > max_refs {
@@ -348,6 +385,7 @@ mod tests {
                 dpb_slot: 0,
                 order_hint: 2,
                 frame_type: 0,
+                display_order: 0,
             },
         );
         while references.len() > max_refs {

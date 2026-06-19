@@ -112,14 +112,23 @@ impl Av1 {
             .picture_resource(&setup_picture_resource)
             .push(&mut setup_av1_dpb_info_ref0);
 
-        // Reference frames for inter frames.
-        let mut reference_slots = Vec::new();
-        let mut av1_reference_infos = Vec::new();
-        let mut ref_picture_resources = Vec::new();
-        let mut ref_std_infos = Vec::new();
+        // Reference frames for inter frames: declare each distinct DPB slot we
+        // still hold, most-recent first. The vectors hold the data so the
+        // pointers the slot infos take into them stay stable.
+        //
+        // `distinct_refs` dedups by DPB slot (a reference can be mapped to more
+        // than one AV1 reference name below, but each slot is declared once).
+        let mut distinct_refs: Vec<&super::ReferenceInfo> = Vec::new();
+        if !is_key_frame {
+            for r in &self.references {
+                if !distinct_refs.iter().any(|d| d.dpb_slot == r.dpb_slot) {
+                    distinct_refs.push(r);
+                }
+            }
+        }
 
-        if !is_key_frame && !self.references.is_empty() {
-            let ref_info = &self.references[0];
+        let mut ref_std_infos = Vec::with_capacity(distinct_refs.len());
+        for ref_info in &distinct_refs {
             ref_std_infos.push(ash::vk::native::StdVideoEncodeAV1ReferenceInfo {
                 flags: reference_info_flags,
                 frame_type: ref_info.frame_type,
@@ -128,9 +137,10 @@ impl Av1 {
                 reserved1: [0; 3],
                 pExtensionHeader: std::ptr::null(),
             });
-            av1_reference_infos.push(vk::VideoEncodeAV1DpbSlotInfoKHR::default());
-            av1_reference_infos[0] = av1_reference_infos[0].std_reference_info(&ref_std_infos[0]);
+        }
 
+        let mut ref_picture_resources = Vec::with_capacity(distinct_refs.len());
+        for ref_info in &distinct_refs {
             ref_picture_resources.push(
                 vk::VideoPictureResourceInfoKHR::default()
                     .coded_offset(vk::Offset2D { x: 0, y: 0 })
@@ -138,12 +148,26 @@ impl Av1 {
                     .base_array_layer(0)
                     .image_view_binding(common.dpb_image_views[ref_info.dpb_slot as usize]),
             );
+        }
 
-            let ref_slot = vk::VideoReferenceSlotInfoKHR::default()
-                .slot_index(ref_info.dpb_slot as i32)
-                .picture_resource(&ref_picture_resources[0]);
-            reference_slots.push(ref_slot);
-            reference_slots[0] = reference_slots[0].push(&mut av1_reference_infos[0]);
+        let mut av1_reference_infos = Vec::with_capacity(distinct_refs.len());
+        for std_info in &ref_std_infos {
+            av1_reference_infos
+                .push(vk::VideoEncodeAV1DpbSlotInfoKHR::default().std_reference_info(std_info));
+        }
+
+        let mut reference_slots = Vec::with_capacity(distinct_refs.len());
+        for ((ref_info, resource), dpb_info) in distinct_refs
+            .iter()
+            .zip(ref_picture_resources.iter())
+            .zip(av1_reference_infos.iter_mut())
+        {
+            reference_slots.push(
+                vk::VideoReferenceSlotInfoKHR::default()
+                    .slot_index(ref_info.dpb_slot as i32)
+                    .picture_resource(resource)
+                    .push(dpb_info),
+            );
         }
 
         // Quantization (FFmpeg-style defaults).
@@ -218,10 +242,17 @@ impl Av1 {
             pBufferRemovalTimes: std::ptr::null(),
         };
 
-        // Map AV1 reference names to DPB slots (SINGLE_REFERENCE uses LAST_FRAME).
+        // Map the 7 AV1 reference names to DPB slots. The N most-recent
+        // references take the first N forward names (LAST, LAST2, LAST3,
+        // GOLDEN, ...); any remaining names reuse the oldest surviving
+        // reference so every name resolves to a valid, decodable DPB slot. This
+        // must mirror `ref_frame_idx` from `calculate_reference_frame_mapping`.
         let mut reference_name_slot_indices = [-1i32; 7];
         if !is_key_frame && !self.references.is_empty() {
-            reference_name_slot_indices[0] = self.references[0].dpb_slot as i32;
+            let n = self.references.len();
+            for (name, idx) in reference_name_slot_indices.iter_mut().enumerate() {
+                *idx = self.references[name.min(n - 1)].dpb_slot as i32;
+            }
         }
 
         let (prediction_mode, rate_control_group) = if is_key_frame {
@@ -392,24 +423,42 @@ impl Av1 {
 
     /// Build `ref_frame_idx`, `ref_order_hint`, `primary_ref_frame` and
     /// `refresh_frame_flags` for the current frame.
+    ///
+    /// `ref_frame_idx[name]` is the DPB frame-buffer slot for AV1 reference
+    /// `name` (0 = LAST … 6 = ALTREF) and must mirror the
+    /// `reference_name_slot_indices` handed to the encoder. `ref_order_hint` is
+    /// indexed by DPB slot (not reference name) and carries each stored
+    /// reference's order hint, which the decoder needs because the sequence
+    /// header enables order hints. `STD_VIDEO_AV1_PRIMARY_REF_NONE` is 7.
     fn calculate_reference_frame_mapping(
         &self,
         is_key_frame: bool,
         current_dpb_slot: u8,
     ) -> ([i8; 7], [u8; 8], u8, u8) {
+        const PRIMARY_REF_NONE: u8 = 7;
         if is_key_frame {
             // Key frame refreshes all 8 reference slots; all names point to slot 0.
-            ([0i8; 7], [0u8; 8], 7u8, 0xFFu8)
-        } else if let Some(last_ref) = self.references.first() {
-            let mut ref_frame_idx = [0i8; 7];
-            let mut ref_order_hint = [0u8; 8];
-            ref_frame_idx[0] = last_ref.dpb_slot as i8;
-            ref_order_hint[0] = last_ref.order_hint as u8;
-            // Refresh only the current slot so this frame becomes the new LAST_FRAME.
-            let refresh_flags = 1u8 << current_dpb_slot;
-            (ref_frame_idx, ref_order_hint, 0u8, refresh_flags)
-        } else {
-            ([0i8; 7], [0u8; 8], 7u8, 0x00u8)
+            return ([0i8; 7], [0u8; 8], PRIMARY_REF_NONE, 0xFFu8);
         }
+        if self.references.is_empty() {
+            return ([0i8; 7], [0u8; 8], PRIMARY_REF_NONE, 0x00u8);
+        }
+
+        let mut ref_frame_idx = [0i8; 7];
+        let mut ref_order_hint = [0u8; 8];
+        let n = self.references.len();
+        // Most-recent references take the first forward names; surplus names
+        // reuse the oldest survivor. Matches `reference_name_slot_indices`.
+        for (name, idx) in ref_frame_idx.iter_mut().enumerate() {
+            *idx = self.references[name.min(n - 1)].dpb_slot as i8;
+        }
+        // Order hints keyed by DPB slot.
+        for r in &self.references {
+            ref_order_hint[r.dpb_slot as usize] = r.order_hint as u8;
+        }
+        // Load the frame context from the most recent (LAST) reference, and
+        // refresh only the current slot so this frame becomes the new LAST.
+        let refresh_flags = 1u8 << current_dpb_slot;
+        (ref_frame_idx, ref_order_hint, 0u8, refresh_flags)
     }
 }
