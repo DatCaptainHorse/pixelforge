@@ -95,8 +95,14 @@ fn run_codec(
     .with_b_frames(0);
 
     let mut encoder = Encoder::new(context.clone(), config)?;
-    let mut input_image =
-        InputImage::new(context.clone(), codec, WIDTH, HEIGHT, EncodeBitDepth::Eight, PixelFormat::Yuv420)?;
+    let mut input_image = InputImage::new(
+        context.clone(),
+        codec,
+        WIDTH,
+        HEIGHT,
+        EncodeBitDepth::Eight,
+        PixelFormat::Yuv420,
+    )?;
 
     let mut yuv_data = Vec::new();
     File::open(input_path)?.read_to_end(&mut yuv_data)?;
@@ -107,8 +113,8 @@ fn run_codec(
     let mut recovery_is_key: Option<bool> = None;
 
     let drain_one = |pending: &mut VecDeque<pixelforge::EncodeFuture>,
-                         output_file: &mut File,
-                         recovery_is_key: &mut Option<bool>|
+                     output_file: &mut File,
+                     recovery_is_key: &mut Option<bool>|
      -> Result<(), Box<dyn std::error::Error>> {
         let packet = pollster::block_on(pending.pop_front().unwrap())?;
         if packet.pts == INVALIDATE_AT {
@@ -180,20 +186,54 @@ fn decode_and_psnr(
 ) -> Result<f64, Box<dyn std::error::Error>> {
     let status = Command::new("ffmpeg")
         .args([
-            "-hide_banner", "-loglevel", "error", "-y", "-i", bitstream, "-pix_fmt", "yuv420p",
-            "-f", "rawvideo", decoded,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-i",
+            bitstream,
+            "-pix_fmt",
+            "yuv420p",
+            "-f",
+            "rawvideo",
+            decoded,
         ])
         .output()?;
     if !status.status.success() {
-        return Err(format!("ffmpeg decode failed: {}", String::from_utf8_lossy(&status.stderr)).into());
+        return Err(format!(
+            "ffmpeg decode failed: {}",
+            String::from_utf8_lossy(&status.stderr)
+        )
+        .into());
     }
 
     let size = format!("{WIDTH}x{HEIGHT}");
     let output = Command::new("ffmpeg")
         .args([
-            "-hide_banner", "-loglevel", "info", "-s", &size, "-pix_fmt", "yuv420p", "-f",
-            "rawvideo", "-i", source, "-s", &size, "-pix_fmt", "yuv420p", "-f", "rawvideo", "-i",
-            decoded, "-lavfi", "psnr", "-f", "null", "-",
+            "-hide_banner",
+            "-loglevel",
+            "info",
+            "-s",
+            &size,
+            "-pix_fmt",
+            "yuv420p",
+            "-f",
+            "rawvideo",
+            "-i",
+            source,
+            "-s",
+            &size,
+            "-pix_fmt",
+            "yuv420p",
+            "-f",
+            "rawvideo",
+            "-i",
+            decoded,
+            "-lavfi",
+            "psnr",
+            "-f",
+            "null",
+            "-",
         ])
         .output()?;
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -212,8 +252,16 @@ fn ensure_test_data(pix_fmt: &str, path: &str) -> Result<(), Box<dyn std::error:
     println!("Generating {path}...");
     let status = Command::new("ffmpeg")
         .args([
-            "-f", "lavfi", "-i", &format!("testsrc=duration=1:size={WIDTH}x{HEIGHT}:rate=30"),
-            "-pix_fmt", pix_fmt, "-f", "rawvideo", "-y", path,
+            "-f",
+            "lavfi",
+            "-i",
+            &format!("testsrc=duration=1:size={WIDTH}x{HEIGHT}:rate=30"),
+            "-pix_fmt",
+            pix_fmt,
+            "-f",
+            "rawvideo",
+            "-y",
+            path,
         ])
         .output()?;
     if !status.status.success() {
