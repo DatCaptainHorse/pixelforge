@@ -534,8 +534,10 @@ impl Encoder {
     ///
     /// Effective recovery requires the encoder to keep more than one reference
     /// (see [`EncodeConfig::with_max_reference_frames`]); with a single
-    /// reference this necessarily falls back to an IDR. Codecs that predict from
-    /// a single reference (AV1 here) likewise fall back to an IDR.
+    /// reference this necessarily falls back to an IDR. This applies uniformly
+    /// across H.264, H.265, and AV1 — each keeps a multi-reference window and
+    /// re-anchors prediction to the most recent survivor, falling back to an
+    /// IDR (AV1: key frame) only when the loss covers the entire window.
     pub fn invalidate_reference_frames(&mut self, first_lost_display_order: u64) {
         self.0.invalidate_reference_frames(first_lost_display_order)
     }

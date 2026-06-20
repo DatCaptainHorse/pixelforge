@@ -76,9 +76,6 @@ impl H264 {
                 Vec::new()
             };
         let use_adaptive_marking = !ref_pic_marking_ops.is_empty();
-        if use_adaptive_marking {
-            self.pending_unmark_frame_nums.clear();
-        }
 
         // Prepare command buffer and transition DPB images for encode.
         unsafe {
@@ -531,6 +528,14 @@ impl H264 {
                 .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
         }
 
-        common.submit_frame()
+        let future = common.submit_frame()?;
+        // Clear the unmark queue only after the encode is committed to the GPU.
+        // If any fallible step above had failed, the MMCO ops would still live
+        // in `pending_unmark_frame_nums` so a retry re-emits them — otherwise the
+        // encoder would silently desync from the decoder's reference state.
+        if use_adaptive_marking {
+            self.pending_unmark_frame_nums.clear();
+        }
+        Ok(future)
     }
 }

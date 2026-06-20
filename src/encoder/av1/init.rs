@@ -59,7 +59,12 @@ impl Av1 {
             profile_info: &profile_info,
             caps: &caps,
             align_unit: SUPERBLOCK_SIZE,
-            max_active_refs_cap: 8,
+            // AV1 has NUM_REF_FRAMES = 8 DPB slots, and `refresh_frame_flags`
+            // is an 8-bit syntax element. `build_encoder_common` adds one setup
+            // slot on top of the active count, so cap active refs at 7 to keep
+            // every DPB slot index in 0..=7 (the range the [u8; 8] order-hint
+            // array and `1 << slot` refresh mask can represent).
+            max_active_refs_cap: 7,
             bitstream_buffer_size,
             // AV1 reference handling here does not use a layered DPB.
             allow_layered_dpb: false,

@@ -133,9 +133,11 @@ impl VideoCodec for Av1 {
         _common: &mut EncoderCommon,
         first_lost_display_order: u64,
     ) -> bool {
-        // This AV1 path predicts from a single reference. If that reference is at
-        // or after the first lost frame it is undecodable on the client and no
-        // older survivor is kept, so recovery can only be a full key frame.
+        // Drop every reference at or after the first lost frame: those are
+        // transitively undecodable on the client. Older survivors are kept, so
+        // the next P-frame re-anchors LAST_FRAME to the most recent of them (see
+        // `calculate_reference_frame_mapping`). Returns false only when no
+        // reference survives, in which case the caller forces a full key frame.
         self.references
             .retain(|r| r.display_order < first_lost_display_order);
         !self.references.is_empty()
