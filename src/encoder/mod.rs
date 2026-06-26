@@ -441,7 +441,7 @@ impl<C: codec::VideoCodec> EncoderApi for codec::CodecEncoder<C> {
 /// Video encoder supporting multiple codecs.
 ///
 /// Constructed via [`Encoder::new`], which selects the codec from the config and
-/// boxes the corresponding [`codec::CodecEncoder`]. All codecs share one generic
+/// boxes the corresponding `codec::CodecEncoder`. All codecs share one generic
 /// implementation; this type just erases which one is in use.
 pub struct Encoder(Box<dyn EncoderApi>);
 

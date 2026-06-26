@@ -47,7 +47,7 @@ use crate::encoder::{BitDepth, EncodedPacket, FrameType, PixelFormat};
 use crate::error::{PixelForgeError, Result};
 use crate::vulkan::VideoContext;
 
-/// A handle to the packet a single [`EncodePipeline::submit_current`] will
+/// A handle to the packet a single `EncodePipeline::submit_current` will
 /// eventually produce.
 ///
 /// Returned by `Encoder::encode`, one per submitted frame. Awaiting it yields

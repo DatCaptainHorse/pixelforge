@@ -1,7 +1,7 @@
 //! H.265/HEVC codec: the differences from the generic encoder.
 //!
-//! Shared machinery lives in [`crate::encoder::codec`]; this folder holds only
-//! H.265's reference tracking ([`H265`]), its per-frame StdVideo* graph
+//! Shared machinery lives in `crate::encoder::codec`; this folder holds only
+//! H.265's reference tracking (`H265`), its per-frame StdVideo* graph
 //! (`record`), and its VPS/SPS/PPS generation (`session_params`).
 
 mod init;

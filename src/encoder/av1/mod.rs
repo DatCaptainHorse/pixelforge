@@ -1,10 +1,10 @@
 //! AV1 codec: the differences from the generic encoder.
 //!
-//! Shared machinery lives in [`crate::encoder::codec`]; this folder holds only
-//! AV1's reference tracking ([`Av1`]), its per-frame StdVideo* graph (`record`),
+//! Shared machinery lives in `crate::encoder::codec`; this folder holds only
+//! AV1's reference tracking (`Av1`), its per-frame StdVideo* graph (`record`),
 //! and its sequence-header generation (`session_params`).
 //!
-//! Inter frames predict from up to [`Av1::active_reference_count`] recent
+//! Inter frames predict from up to `Av1::active_reference_count` recent
 //! references, mapped onto the forward AV1 reference names. Keeping a window of
 //! references (rather than just the previous frame) is what lets reference frame
 //! invalidation recover from loss by re-anchoring to an older surviving frame

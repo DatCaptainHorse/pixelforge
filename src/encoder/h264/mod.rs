@@ -1,8 +1,8 @@
 //! H.264/AVC codec: the differences from the generic encoder.
 //!
-//! The shared session/DPB/pipeline machinery lives in [`crate::encoder::codec`];
+//! The shared session/DPB/pipeline machinery lives in `crate::encoder::codec`;
 //! this folder holds only what is specific to H.264: its reference-picture
-//! tracking and syntax counters ([`H264`]), the per-frame StdVideo* graph
+//! tracking and syntax counters (`H264`), the per-frame StdVideo* graph
 //! (`record`), and the SPS/PPS generation (`session_params`).
 
 mod init;
