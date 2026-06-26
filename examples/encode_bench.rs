@@ -11,7 +11,7 @@ use pixelforge::{
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, Layer};
+use tracing_subscriber::{Layer, layer::SubscriberExt, util::SubscriberInitExt};
 
 use std::time::Duration;
 
@@ -36,7 +36,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let test_path = Path::new(TEST_FRAMES_PATH);
     if !test_path.exists() {
         eprintln!("Test frames not found at '{TEST_FRAMES_PATH}'");
-        eprintln!("Generate with: ffmpeg -f lavfi -i testsrc=duration=5:size=1920x1080:rate=60 -pix_fmt yuv420p -f rawvideo testdata/test_frames_1080p.yuv");
+        eprintln!(
+            "Generate with: ffmpeg -f lavfi -i testsrc=duration=5:size=1920x1080:rate=60 -pix_fmt yuv420p -f rawvideo testdata/test_frames_1080p.yuv"
+        );
         return Ok(());
     }
 
@@ -142,27 +144,38 @@ fn run_encode_test(
     let mut gpu_durations: Vec<Duration> = Vec::new();
     let mut cpu_durations: Vec<Duration> = Vec::new();
 
-    // Encode frames.
+    let mut pending: std::collections::VecDeque<pixelforge::EncodeFuture> =
+        std::collections::VecDeque::new();
+
+    let mut write_packet = |packet: pixelforge::EncodedPacket| {
+        total_bytes += packet.data.len();
+        if let Some(stats) = packet.stats {
+            gpu_durations.push(Duration::from_nanos(stats.gpu_time_ns));
+            cpu_durations.push(Duration::from_nanos(stats.cpu_wall_time_ns));
+        }
+        Ok::<(), Box<dyn std::error::Error>>(())
+    };
+
+    // Encode frames
     for i in 0..num_frames {
         let frame = &yuv_data[i * frame_size..(i + 1) * frame_size];
 
-        // Upload YUV420 data to the input image.
+        // Upload YUV420 data to the input image
         input_image.upload_yuv420(frame)?;
 
-        // Encode the image (async); drain any packets that are ready.
-        encoder.encode(input_image.image())?;
-        while let Some(packet) = encoder.poll_packet()? {
-            total_bytes += packet.data.len();
-            if let Some(stats) = packet.stats {
-                gpu_durations.push(Duration::from_nanos(stats.gpu_time_ns));
-                cpu_durations.push(Duration::from_nanos(stats.cpu_wall_time_ns));
-            }
+        // Submit the frame (async) and keep the pipeline at most ~2 deep
+        pending.push_back(encoder.encode(input_image.image())?);
+        while pending.len() > 2 {
+            let packet = pollster::block_on(pending.pop_front().unwrap())?;
+            write_packet(packet)?;
         }
     }
 
-    // Flush remaining frames.
-    for packet in encoder.flush()? {
-        total_bytes += packet.data.len();
+    // Flush remaining frames
+    encoder.flush()?;
+    while let Some(future) = pending.pop_front() {
+        let packet = pollster::block_on(future)?;
+        write_packet(packet)?;
     }
 
     let ratio = (num_frames * frame_size) as f64 / total_bytes as f64;

@@ -1602,13 +1602,15 @@ pub(crate) unsafe fn reset_start_timestamp(
     command_buffer: vk::CommandBuffer,
     query_pool: vk::QueryPool,
 ) {
-    device.cmd_reset_query_pool(command_buffer, query_pool, 0, 2);
-    device.cmd_write_timestamp(
-        command_buffer,
-        vk::PipelineStageFlags::TOP_OF_PIPE,
-        query_pool,
-        0, // query index 0 = start
-    );
+    unsafe {
+        device.cmd_reset_query_pool(command_buffer, query_pool, 0, 2);
+        device.cmd_write_timestamp(
+            command_buffer,
+            vk::PipelineStageFlags::TOP_OF_PIPE,
+            query_pool,
+            0, // query index 0 = start
+        );
+    }
 }
 
 pub(crate) unsafe fn end_timestamp(
@@ -1616,12 +1618,14 @@ pub(crate) unsafe fn end_timestamp(
     command_buffer: vk::CommandBuffer,
     query_pool: vk::QueryPool,
 ) {
-    device.cmd_write_timestamp(
-        command_buffer,
-        vk::PipelineStageFlags::BOTTOM_OF_PIPE,
-        query_pool,
-        1, // query index 1 = end
-    );
+    unsafe {
+        device.cmd_write_timestamp(
+            command_buffer,
+            vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+            query_pool,
+            1, // query index 1 = end
+        );
+    }
 }
 
 /// Queries and possibly returns the difference between reset_start_timestamp and end_timestamp calls
@@ -1632,12 +1636,14 @@ pub(crate) unsafe fn query_timestamp_diff(
     timestamp_period: f32,
 ) -> Option<u64> {
     let mut encode_time_ns: Option<u64> = None;
-    let result = device.get_query_pool_results(
-        query_pool,
-        0,               // first_query
-        &mut timestamps, // data slice (length 2)
-        vk::QueryResultFlags::WAIT | vk::QueryResultFlags::TYPE_64,
-    );
+    let result = unsafe {
+        device.get_query_pool_results(
+            query_pool,
+            0,               // first_query
+            &mut timestamps, // data slice (length 2)
+            vk::QueryResultFlags::WAIT | vk::QueryResultFlags::TYPE_64,
+        )
+    };
     if result.is_ok() {
         encode_time_ns = Some(((timestamps[1] - timestamps[0]) as f32 * timestamp_period) as u64);
     }
