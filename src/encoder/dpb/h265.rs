@@ -184,10 +184,10 @@ impl DpbH265 {
                     if let Some(idx) = oldest_st_idx {
                         self.entries[idx].mark_unused();
                     }
-                } else if num_long_term > 0 {
-                    if let Some(idx) = oldest_lt_idx {
-                        self.entries[idx].mark_unused();
-                    }
+                } else if num_long_term > 0
+                    && let Some(idx) = oldest_lt_idx
+                {
+                    self.entries[idx].mark_unused();
                 }
             }
         } else {
@@ -203,10 +203,10 @@ impl DpbH265 {
                     if let Some(idx) = oldest_lt_idx {
                         self.entries[idx].mark_unused();
                     }
-                } else if num_short_term > 0 {
-                    if let Some(idx) = oldest_st_idx {
-                        self.entries[idx].mark_unused();
-                    }
+                } else if num_short_term > 0
+                    && let Some(idx) = oldest_st_idx
+                {
+                    self.entries[idx].mark_unused();
                 }
             }
         }

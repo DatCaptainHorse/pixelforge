@@ -473,18 +473,24 @@ impl EncodePipeline {
 
         for slot in &mut self.slots {
             if !slot.bitstream_buffer_ptr.is_null() {
-                device.unmap_memory(slot.bitstream_buffer_memory);
+                unsafe {
+                    device.unmap_memory(slot.bitstream_buffer_memory);
+                }
                 slot.bitstream_buffer_ptr = std::ptr::null_mut();
             }
-            device.destroy_query_pool(slot.query_pool, None);
-            device.destroy_fence(slot.encode_fence, None);
-            device.destroy_buffer(slot.bitstream_buffer, None);
-            device.free_memory(slot.bitstream_buffer_memory, None);
-            device.destroy_image_view(slot.input_image_view, None);
-            device.destroy_image(slot.input_image, None);
-            device.free_memory(slot.input_image_memory, None);
+            unsafe {
+                device.destroy_query_pool(slot.query_pool, None);
+                device.destroy_fence(slot.encode_fence, None);
+                device.destroy_buffer(slot.bitstream_buffer, None);
+                device.free_memory(slot.bitstream_buffer_memory, None);
+                device.destroy_image_view(slot.input_image_view, None);
+                device.destroy_image(slot.input_image, None);
+                device.free_memory(slot.input_image_memory, None);
+            }
         }
-        device.destroy_semaphore(self.timeline, None);
+        unsafe {
+            device.destroy_semaphore(self.timeline, None);
+        }
     }
 }
 

@@ -1245,15 +1245,17 @@ pub(crate) unsafe fn record_dpb_barriers(
         );
     }
 
-    device.cmd_pipeline_barrier(
-        command_buffer,
-        vk::PipelineStageFlags::ALL_COMMANDS,
-        vk::PipelineStageFlags::ALL_COMMANDS,
-        vk::DependencyFlags::empty(),
-        &[],
-        &[],
-        &all_barriers,
-    );
+    unsafe {
+        device.cmd_pipeline_barrier(
+            command_buffer,
+            vk::PipelineStageFlags::ALL_COMMANDS,
+            vk::PipelineStageFlags::ALL_COMMANDS,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &all_barriers,
+        );
+    }
 }
 
 /// Prepare an encode command buffer for recording.
@@ -1269,17 +1271,23 @@ pub(crate) unsafe fn prepare_encode_command_buffer(
     command_buffer: vk::CommandBuffer,
     query_pool: vk::QueryPool,
 ) -> Result<()> {
-    device
-        .reset_command_buffer(command_buffer, vk::CommandBufferResetFlags::empty())
-        .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
+    unsafe {
+        device
+            .reset_command_buffer(command_buffer, vk::CommandBufferResetFlags::empty())
+            .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
+    }
 
     let begin_info =
         vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
-    device
-        .begin_command_buffer(command_buffer, &begin_info)
-        .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
+    unsafe {
+        device
+            .begin_command_buffer(command_buffer, &begin_info)
+            .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
+    }
 
-    device.cmd_reset_query_pool(command_buffer, query_pool, 0, 1);
+    unsafe {
+        device.cmd_reset_query_pool(command_buffer, query_pool, 0, 1);
+    }
 
     Ok(())
 }
@@ -1321,15 +1329,17 @@ pub(crate) unsafe fn record_post_encode_dpb_barrier(
         .src_access_mask(vk::AccessFlags::MEMORY_WRITE)
         .dst_access_mask(vk::AccessFlags::MEMORY_READ);
 
-    device.cmd_pipeline_barrier(
-        command_buffer,
-        vk::PipelineStageFlags::ALL_COMMANDS,
-        vk::PipelineStageFlags::ALL_COMMANDS,
-        vk::DependencyFlags::empty(),
-        &[],
-        &[],
-        &[dpb_sync_barrier],
-    );
+    unsafe {
+        device.cmd_pipeline_barrier(
+            command_buffer,
+            vk::PipelineStageFlags::ALL_COMMANDS,
+            vk::PipelineStageFlags::ALL_COMMANDS,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &[dpb_sync_barrier],
+        );
+    }
 }
 
 /// Submit an encode command buffer without waiting for completion.
@@ -1378,13 +1388,17 @@ pub(crate) unsafe fn submit_encode_only(
         .command_buffer_infos(&command_buffer_infos)
         .signal_semaphore_infos(&signal_infos);
 
-    device
-        .reset_fences(&[fence])
-        .map_err(|e| PixelForgeError::Synchronization(e.to_string()))?;
+    unsafe {
+        device
+            .reset_fences(&[fence])
+            .map_err(|e| PixelForgeError::Synchronization(e.to_string()))?;
+    }
 
-    device
-        .queue_submit2(encode_queue, &[submit_info], fence)
-        .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
+    unsafe {
+        device
+            .queue_submit2(encode_queue, &[submit_info], fence)
+            .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
+    }
 
     Ok(())
 }
@@ -1405,9 +1419,11 @@ pub(crate) unsafe fn wait_and_read_bitstream(
     bitstream_buffer_ptr: *const u8,
     dst: &mut Vec<u8>,
 ) -> Result<()> {
-    device
-        .wait_for_fences(&[fence], true, u64::MAX)
-        .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
+    unsafe {
+        device
+            .wait_for_fences(&[fence], true, u64::MAX)
+            .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
+    }
 
     // Read query results (offset + bytes_written).
     #[repr(C)]
@@ -1421,14 +1437,16 @@ pub(crate) unsafe fn wait_and_read_bitstream(
         bytes_written: 0,
     }];
 
-    device
-        .get_query_pool_results(
-            query_pool,
-            0,
-            &mut query_results,
-            vk::QueryResultFlags::WAIT,
-        )
-        .map_err(|e| PixelForgeError::QueryPool(e.to_string()))?;
+    unsafe {
+        device
+            .get_query_pool_results(
+                query_pool,
+                0,
+                &mut query_results,
+                vk::QueryResultFlags::WAIT,
+            )
+            .map_err(|e| PixelForgeError::QueryPool(e.to_string()))?;
+    }
 
     let offset = query_results[0].offset as usize;
     let size = query_results[0].bytes_written as usize;
@@ -1441,7 +1459,7 @@ pub(crate) unsafe fn wait_and_read_bitstream(
 
     tracing::debug!("Encoded frame: offset={}, size={}", offset, size);
 
-    let src = std::slice::from_raw_parts(bitstream_buffer_ptr.add(offset), size);
+    let src = unsafe { std::slice::from_raw_parts(bitstream_buffer_ptr.add(offset), size) };
     dst.extend_from_slice(src);
 
     Ok(())
@@ -1473,32 +1491,38 @@ pub(crate) unsafe fn destroy_encoder_resources(
     video_queue_fn: &ash::khr::video_queue::Device,
     res: &EncoderTeardown,
 ) {
-    device.destroy_fence(res.upload_fence, None);
-    device.destroy_command_pool(res.command_pool, None);
-    if res.upload_command_pool != res.command_pool {
-        device.destroy_command_pool(res.upload_command_pool, None);
-    }
+    unsafe {
+        device.destroy_fence(res.upload_fence, None);
+        device.destroy_command_pool(res.command_pool, None);
+        if res.upload_command_pool != res.command_pool {
+            device.destroy_command_pool(res.upload_command_pool, None);
+        }
 
-    for &view in res.dpb_image_views {
-        device.destroy_image_view(view, None);
-    }
-    for &image in res.dpb_images {
-        device.destroy_image(image, None);
-    }
-    for &memory in res.dpb_image_memories {
-        device.free_memory(memory, None);
-    }
+        for &view in res.dpb_image_views {
+            device.destroy_image_view(view, None);
+        }
+        for &image in res.dpb_images {
+            device.destroy_image(image, None);
+        }
+        for &memory in res.dpb_image_memories {
+            device.free_memory(memory, None);
+        }
 
-    if res.session_params != vk::VideoSessionParametersKHR::null() {
-        (video_queue_fn.fp().destroy_video_session_parameters_khr)(
+        if res.session_params != vk::VideoSessionParametersKHR::null() {
+            (video_queue_fn.fp().destroy_video_session_parameters_khr)(
+                device.handle(),
+                res.session_params,
+                std::ptr::null(),
+            );
+        }
+        (video_queue_fn.fp().destroy_video_session_khr)(
             device.handle(),
-            res.session_params,
+            res.session,
             std::ptr::null(),
         );
-    }
-    (video_queue_fn.fp().destroy_video_session_khr)(device.handle(), res.session, std::ptr::null());
-    for &memory in res.session_memory {
-        device.free_memory(memory, None);
+        for &memory in res.session_memory {
+            device.free_memory(memory, None);
+        }
     }
 }
 

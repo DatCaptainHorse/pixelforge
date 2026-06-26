@@ -392,15 +392,13 @@ impl H265 {
                 }
             }
         }
-        if has_l1_ref {
-            if let Some(h265_slot_info) = slot_infos_iter.next() {
-                let ref_slot = vk::VideoReferenceSlotInfoKHR::default()
-                    .slot_index(self.backward_reference_dpb_slot as i32)
-                    .picture_resource(&ref_resources[stored_indices_count])
-                    .push(h265_slot_info);
-                reference_slots.push(ref_slot);
-                reference_slots_for_begin.push(ref_slot);
-            }
+        if has_l1_ref && let Some(h265_slot_info) = slot_infos_iter.next() {
+            let ref_slot = vk::VideoReferenceSlotInfoKHR::default()
+                .slot_index(self.backward_reference_dpb_slot as i32)
+                .picture_resource(&ref_resources[stored_indices_count])
+                .push(h265_slot_info);
+            reference_slots.push(ref_slot);
+            reference_slots_for_begin.push(ref_slot);
         }
 
         // Rate control.
