@@ -153,6 +153,10 @@ fn run_test(
 
         let mut output_file = File::create(&output_filename)?;
 
+        // Futures for in-flight encodes, drained in submission order.
+        let mut pending: std::collections::VecDeque<pixelforge::EncodeFuture> =
+            std::collections::VecDeque::new();
+
         for i in 0..FRAMES {
             let start = (i as usize) * frame_size;
             let end = start + frame_size;
@@ -171,9 +175,18 @@ fn run_test(
                 _ => return Err("Unsupported format".into()),
             }
 
-            for packet in encoder.encode(encoder_image)? {
+            pending.push_back(encoder.encode(encoder_image)?);
+            while pending.len() > 2 {
+                let packet = pollster::block_on(pending.pop_front().unwrap())?;
                 output_file.write_all(&packet.data)?;
             }
+        }
+
+        // Barrier, then drain the outstanding futures in submission order.
+        encoder.flush()?;
+        while let Some(future) = pending.pop_front() {
+            let packet = pollster::block_on(future)?;
+            output_file.write_all(&packet.data)?;
         }
     }
 

@@ -91,6 +91,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut output = File::create("output.h265")?;
     let mut total_bytes = 0;
 
+    // Each `encode()` returns a future that resolves with that frame's packet.
+    // Keep a few in flight (so capture/upload overlaps GPU encode) and drain the
+    // oldest once the pipeline is full, preserving submission order.
+    let mut pending: std::collections::VecDeque<pixelforge::EncodeFuture> =
+        std::collections::VecDeque::new();
+
+    let mut write_packet = |packet: pixelforge::EncodedPacket, total: &mut usize| {
+        *total += packet.data.len();
+        output.write_all(&packet.data)?;
+        println!(
+            "  pts={:<2} dts={:<2}: {:>5} bytes, {:?}{}",
+            packet.pts,
+            packet.dts,
+            packet.data.len(),
+            packet.frame_type,
+            if packet.is_key_frame { " [KEY]" } else { "" }
+        );
+        Ok::<(), Box<dyn std::error::Error>>(())
+    };
+
     // Encode frames.
     for i in 0..num_frames {
         let frame = &yuv_data[i * frame_size..(i + 1) * frame_size];
@@ -98,32 +118,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Upload YUV420 data to the input image.
         input_image.upload_yuv420(frame)?;
 
-        // Encode the image.
-        for packet in encoder.encode(input_image.image())? {
-            total_bytes += packet.data.len();
-            output.write_all(&packet.data)?;
-            println!(
-                "  pts={:<2} dts={:<2}: {:>5} bytes, {:?}{}",
-                packet.pts,
-                packet.dts,
-                packet.data.len(),
-                packet.frame_type,
-                if packet.is_key_frame { " [KEY]" } else { "" }
-            );
+        // Submit the frame (async) and keep the pipeline at most ~2 deep.
+        pending.push_back(encoder.encode(input_image.image())?);
+        while pending.len() > 2 {
+            let packet = pollster::block_on(pending.pop_front().unwrap())?;
+            write_packet(packet, &mut total_bytes)?;
         }
     }
 
-    // Flush remaining frames.
-    for packet in encoder.flush()? {
-        total_bytes += packet.data.len();
-        output.write_all(&packet.data)?;
-        println!(
-            "  pts={:<2} dts={:<2}: {:>5} bytes, {:?} (flushed)",
-            packet.pts,
-            packet.dts,
-            packet.data.len(),
-            packet.frame_type
-        );
+    // Flush remaining frames: barrier, then drain the outstanding futures in order.
+    encoder.flush()?;
+    while let Some(future) = pending.pop_front() {
+        let packet = pollster::block_on(future)?;
+        write_packet(packet, &mut total_bytes)?;
     }
 
     let ratio = (num_frames * frame_size) as f64 / total_bytes as f64;

@@ -454,6 +454,22 @@ impl VideoContext {
         let mut sync2_features =
             vk::PhysicalDeviceSynchronization2Features::default().synchronization2(true);
 
+        let mut supported_timeline_features =
+            vk::PhysicalDeviceTimelineSemaphoreFeatures::default();
+        let mut timeline_feature_query =
+            vk::PhysicalDeviceFeatures2::default().push(&mut supported_timeline_features);
+        unsafe {
+            instance.get_physical_device_features2(physical_device, &mut timeline_feature_query);
+        }
+        if supported_timeline_features.timeline_semaphore == 0 {
+            return Err(PixelForgeError::NoSuitableDevice(
+                "Timeline semaphores are required for pipelined video encode synchronization"
+                    .to_string(),
+            ));
+        }
+        let mut timeline_features =
+            vk::PhysicalDeviceTimelineSemaphoreFeatures::default().timeline_semaphore(true);
+
         // Enable sampler YCbCr conversion feature (required for YUV image views with SAMPLED flag).
         let mut ycbcr_features = vk::PhysicalDeviceSamplerYcbcrConversionFeatures::default()
             .sampler_ycbcr_conversion(true);
@@ -515,7 +531,8 @@ impl VideoContext {
         let mut device_create_info = vk::DeviceCreateInfo::default()
             .queue_create_infos(&queue_create_infos)
             .enabled_extension_names(&extension_names)
-            .push(&mut sync2_features);
+            .push(&mut sync2_features)
+            .push(&mut timeline_features);
 
         if supported_encode_codecs.contains(&Codec::AV1) {
             device_create_info = device_create_info.push(&mut av1_encode_features);

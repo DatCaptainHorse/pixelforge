@@ -7,10 +7,12 @@
 
 pub mod av1;
 pub mod bitwriter;
+pub(crate) mod codec;
 pub mod dpb;
 pub mod gop;
 pub mod h264;
 pub mod h265;
+pub(crate) mod pipeline;
 pub mod reorder;
 pub mod resources;
 
@@ -385,6 +387,8 @@ impl EncodeConfig {
     }
 }
 
+pub use pipeline::EncodeFuture;
+
 /// Encoded video packet.
 #[derive(Debug, Clone)]
 pub struct EncodedPacket {
@@ -400,51 +404,75 @@ pub struct EncodedPacket {
     pub dts: u64,
 }
 
-/// Video encoder supporting multiple codecs.
+/// The codec-erased operations every [`codec::CodecEncoder`] exposes.
 ///
-/// The encoder is implemented as an enum to dispatch to codec-specific implementations.
-// Allow large_enum_variant: H265Encoder is currently a stub. When fully implemented,
-// it will be similar in size to H264Encoder, making the size difference negligible.
-#[allow(clippy::large_enum_variant)]
-pub enum Encoder {
-    /// H.264/AVC encoder.
-    H264(self::h264::H264Encoder),
-    /// H.265/HEVC encoder.
-    H265(self::h265::H265Encoder),
-    /// AV1 encoder.
-    AV1(self::av1::AV1Encoder),
+/// One blanket impl covers all codecs, so [`Encoder`] can hold any of them
+/// behind a single boxed pointer instead of an enum that re-dispatches by hand.
+trait EncoderApi: Send {
+    fn input_image(&self) -> vk::Image;
+    fn encode(&mut self, src_image: vk::Image) -> Result<EncodeFuture>;
+    fn flush(&mut self) -> Result<()>;
+    fn request_idr(&mut self);
+    fn invalidate_reference_frames(&mut self, first_lost_display_order: u64);
+    fn set_color_description(&mut self, desc: ColorDescription) -> Result<()>;
 }
 
+impl<C: codec::VideoCodec> EncoderApi for codec::CodecEncoder<C> {
+    fn input_image(&self) -> vk::Image {
+        codec::CodecEncoder::input_image(self)
+    }
+    fn encode(&mut self, src_image: vk::Image) -> Result<EncodeFuture> {
+        codec::CodecEncoder::encode(self, src_image)
+    }
+    fn flush(&mut self) -> Result<()> {
+        codec::CodecEncoder::flush(self)
+    }
+    fn request_idr(&mut self) {
+        codec::CodecEncoder::request_idr(self)
+    }
+    fn invalidate_reference_frames(&mut self, first_lost_display_order: u64) {
+        codec::CodecEncoder::invalidate_reference_frames(self, first_lost_display_order)
+    }
+    fn set_color_description(&mut self, desc: ColorDescription) -> Result<()> {
+        codec::CodecEncoder::set_color_description(self, desc)
+    }
+}
+
+/// Video encoder supporting multiple codecs.
+///
+/// Constructed via [`Encoder::new`], which selects the codec from the config and
+/// boxes the corresponding `codec::CodecEncoder`. All codecs share one generic
+/// implementation; this type just erases which one is in use.
+pub struct Encoder(Box<dyn EncoderApi>);
+
 impl Encoder {
+    /// Create a new encoder for the codec named in `config`.
+    pub fn new(context: VideoContext, config: EncodeConfig) -> Result<Self> {
+        let inner: Box<dyn EncoderApi> = match config.codec {
+            Codec::H264 => Box::new(self::h264::H264::create(context, config)?),
+            Codec::H265 => Box::new(self::h265::H265::create(context, config)?),
+            Codec::AV1 => Box::new(self::av1::Av1::create(context, config)?),
+        };
+        Ok(Encoder(inner))
+    }
+
     /// Get the internal input image.
     ///
     /// This image can be used as a target for `ColorConverter::convert` to avoid
     /// an intermediate copy.
     pub fn input_image(&self) -> vk::Image {
-        match self {
-            Encoder::H264(encoder) => encoder.input_image(),
-            Encoder::H265(encoder) => encoder.input_image(),
-            Encoder::AV1(encoder) => encoder.input_image(),
-        }
-    }
-
-    /// Create a new encoder.
-    pub fn new(context: VideoContext, config: EncodeConfig) -> Result<Self> {
-        match config.codec {
-            Codec::H264 => Ok(Encoder::H264(self::h264::H264Encoder::new(
-                context, config,
-            )?)),
-            Codec::H265 => Ok(Encoder::H265(self::h265::H265Encoder::new(
-                context, config,
-            )?)),
-            Codec::AV1 => Ok(Encoder::AV1(self::av1::AV1Encoder::new(context, config)?)),
-        }
+        self.0.input_image()
     }
 
     /// Encode a frame from a GPU image.
     ///
     /// This accepts a source NV12 (YUV420) or planar YUV444 image on the GPU and encodes it directly.
     /// The source image must match the format and dimensions in the encoder configuration.
+    ///
+    /// Encoding is asynchronous: this submits the frame without blocking and
+    /// returns an [`EncodeFuture`] that resolves with the encoded packet once the
+    /// GPU finishes and a background readback thread reads it back. The call only
+    /// blocks if every pipeline slot is still in flight (backpressure).
     ///
     /// Use `InputImage` to create an image from YUV data:
     /// ```no_run
@@ -466,35 +494,52 @@ impl Encoder {
     /// # let yuv_data = vec![0u8; 1920 * 1080 * 3 / 2];
     /// input.upload_yuv420(&yuv_data)?;
     ///
-    /// // Encode the image
-    /// let packets = encoder.encode(input.image())?;
+    /// // Submit the frame and await its packet.
+    /// let future = encoder.encode(input.image())?;
+    /// let packet = pollster::block_on(future)?;
+    /// // ... use packet.data ...
     /// # Ok(())
     /// # }
     /// ```
-    pub fn encode(&mut self, src_image: vk::Image) -> Result<Vec<EncodedPacket>> {
-        match self {
-            Encoder::H264(encoder) => encoder.encode(src_image),
-            Encoder::H265(encoder) => encoder.encode(src_image),
-            Encoder::AV1(encoder) => encoder.encode(src_image),
-        }
+    pub fn encode(&mut self, src_image: vk::Image) -> Result<EncodeFuture> {
+        self.0.encode(src_image)
     }
 
-    /// Flush the encoder and get remaining packets.
-    pub fn flush(&mut self) -> Result<Vec<EncodedPacket>> {
-        match self {
-            Encoder::H264(encoder) => encoder.flush(),
-            Encoder::H265(encoder) => encoder.flush(),
-            Encoder::AV1(encoder) => encoder.flush(),
-        }
+    /// Wait for all in-flight frames to finish encoding (end-of-stream barrier).
+    ///
+    /// Packets are delivered through the [`EncodeFuture`]s returned by
+    /// [`Encoder::encode`]; await those to obtain them. Once this returns, every
+    /// outstanding future has been resolved.
+    pub fn flush(&mut self) -> Result<()> {
+        self.0.flush()
     }
 
     /// Request that the next frame be an IDR frame.
     pub fn request_idr(&mut self) {
-        match self {
-            Encoder::H264(encoder) => encoder.request_idr(),
-            Encoder::H265(encoder) => encoder.request_idr(),
-            Encoder::AV1(encoder) => encoder.request_idr(),
-        }
+        self.0.request_idr()
+    }
+
+    /// Recover from packet loss without a full IDR (reference frame invalidation).
+    ///
+    /// When a client reports that it could not decode a range of frames, every
+    /// reference picture the encoder still holds from the earliest lost frame
+    /// onward is transitively undecodable on the client. This drops those
+    /// references so the next P-frame is predicted from the most recent
+    /// *surviving* reference instead — a much cheaper recovery than re-sending a
+    /// full keyframe. If no reference survives (the loss covers the encoder's
+    /// whole reference window), it transparently falls back to forcing an IDR.
+    ///
+    /// `first_lost_display_order` is the display order — the `pts` reported on
+    /// [`EncodedPacket`]s — of the earliest frame the client lost.
+    ///
+    /// Effective recovery requires the encoder to keep more than one reference
+    /// (see [`EncodeConfig::with_max_reference_frames`]); with a single
+    /// reference this necessarily falls back to an IDR. This applies uniformly
+    /// across H.264, H.265, and AV1 — each keeps a multi-reference window and
+    /// re-anchors prediction to the most recent survivor, falling back to an
+    /// IDR (AV1: key frame) only when the loss covers the entire window.
+    pub fn invalidate_reference_frames(&mut self, first_lost_display_order: u64) {
+        self.0.invalidate_reference_frames(first_lost_display_order)
     }
 
     /// Update the color description (VUI parameters) for the encoder.
@@ -503,11 +548,7 @@ impl Encoder {
     /// header containing the new color description. The next frame will be encoded as
     /// an IDR/key frame with the new parameters.
     pub fn set_color_description(&mut self, desc: ColorDescription) -> Result<()> {
-        match self {
-            Encoder::H264(encoder) => encoder.set_color_description(desc),
-            Encoder::H265(encoder) => encoder.set_color_description(desc),
-            Encoder::AV1(encoder) => encoder.set_color_description(desc),
-        }
+        self.0.set_color_description(desc)
     }
 }
 

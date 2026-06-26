@@ -1,24 +1,22 @@
-//! H.264 encoder implementation using Vulkan Video.
+//! H.264/AVC codec: the differences from the generic encoder.
 //!
-//! This module implements H.264 video encoding using Vulkan Video extensions.
+//! The shared session/DPB/pipeline machinery lives in `crate::encoder::codec`;
+//! this folder holds only what is specific to H.264: its reference-picture
+//! tracking and syntax counters (`H264`), the per-frame StdVideo* graph
+//! (`record`), and the SPS/PPS generation (`session_params`).
 
-mod api;
-mod encode;
 mod init;
+mod record;
 mod session_params;
 
-use ash::vk;
-use tracing::debug;
-
-use crate::encoder::resources::{
-    destroy_encoder_resources, upload_image_to_input, EncoderResources, UploadParams,
+use crate::encoder::codec::{EncoderCommon, FramePlan, PictureSetup, VideoCodec};
+use crate::encoder::dpb::{
+    DecodedPictureBuffer, DecodedPictureBufferTrait, DpbConfig, PictureStartInfo, PictureType,
 };
+use crate::encoder::pipeline::EncodeFuture;
+use crate::encoder::ColorDescription;
 use crate::error::Result;
-
-use crate::encoder::dpb::DecodedPictureBuffer;
-use crate::encoder::gop::GopStructure;
-use crate::encoder::EncodeConfig;
-use crate::vulkan::VideoContext;
+use ash::vk;
 
 /// H.264 macroblock size in pixels.
 pub const MB_SIZE: u32 = 16;
@@ -28,159 +26,171 @@ pub(crate) struct ReferenceInfo {
     pub dpb_slot: u8,
     pub frame_num: u32,
     pub poc: i32,
+    /// Display order (`pts`) of this reference, for reference frame invalidation.
+    pub display_order: u64,
 }
 
-/// H.264 encoder.
-pub struct H264Encoder {
-    context: VideoContext,
-    config: EncodeConfig,
+/// H.264-specific encoder state (everything the generic encoder doesn't own).
+pub(crate) struct H264 {
+    /// Decoded-picture-buffer bookkeeping (reference marking).
     dpb: DecodedPictureBuffer,
-    gop: GopStructure,
-
-    /// Aligned width (macroblock + granularity aligned).
-    aligned_width: u32,
-    /// Aligned height (macroblock + granularity aligned).
-    aligned_height: u32,
-
-    // Video session.
-    video_queue_fn: ash::khr::video_queue::Device,
-    video_encode_fn: ash::khr::video_encode_queue::Device,
-    session: vk::VideoSessionKHR,
-    session_params: vk::VideoSessionParametersKHR,
-    session_memory: Vec<vk::DeviceMemory>,
-
-    // Frame counters.
-    input_frame_num: u64,
-    encode_frame_num: u64,
+    /// `frame_num` syntax element (mod `max_frame_num`).
     frame_num_syntax: u32,
+    /// IDR picture id, toggled each IDR.
     idr_pic_id: u32,
-
-    // Resources
-    input_image: vk::Image,
-    input_image_memory: vk::DeviceMemory,
-    input_image_view: vk::ImageView,
-    /// Current Vulkan image layout of `input_image` (tracked to avoid UB when transitioning).
-    input_image_layout: vk::ImageLayout,
-    /// DPB images (up to MAX_DPB_SLOTS for B-frame and long-term reference support).
-    dpb_images: Vec<vk::Image>,
-    dpb_image_memories: Vec<vk::DeviceMemory>,
-    dpb_image_views: Vec<vk::ImageView>,
-    /// Number of DPB slots allocated.
-    dpb_slot_count: usize,
-    /// Whether the DPB uses a single layered image (true) or separate images (false).
-    use_layered_dpb: bool,
-    /// Tracks which DPB slots have been activated (used at least once).
-    dpb_slot_active: Vec<bool>,
-    bitstream_buffer: vk::Buffer,
-    bitstream_buffer_memory: vk::DeviceMemory,
-    /// Persistently mapped pointer to the bitstream buffer (avoids per-frame map/unmap).
-    bitstream_buffer_ptr: *mut u8,
-
-    // Command resources.
-    command_pool: vk::CommandPool,
-    upload_command_pool: vk::CommandPool,
-    upload_command_buffer: vk::CommandBuffer,
-    upload_fence: vk::Fence,
-    encode_command_buffer: vk::CommandBuffer,
-    encode_fence: vk::Fence,
-    query_pool: vk::QueryPool,
-
-    // SPS/PPS written flag.
-    sps_written: bool,
-
-    // Reference picture tracking.
-    /// Whether we have a backward reference (for B-frames, L1).
+    /// Whether an L1 (backward) reference is available, for B-frames.
     has_backward_reference: bool,
-    /// Frame number of the L1 (backward) reference picture (for B-frames).
     backward_reference_frame_num: u32,
-    /// POC of the L1 (backward) reference picture.
     backward_reference_poc: i32,
-    /// DPB slot for L1 (backward) reference.
     backward_reference_dpb_slot: u8,
-    /// Current DPB slot to use for setup (the reconstructed picture).
-    current_dpb_slot: u8,
-    /// Active L0 reference pictures (for P-frames). Ordered from most recent to oldest.
+    /// Active L0 references, most-recent first.
     l0_references: Vec<ReferenceInfo>,
-    /// Number of active reference frames (as configured/negotiated).
+    /// Negotiated number of active references.
     active_reference_count: u32,
-    /// H.264 profile IDC (cached from initialization for session parameter recreation).
+    /// `frame_num`s of references dropped by reference frame invalidation that
+    /// still need to be marked unused-for-reference (via MMCO) in the next
+    /// P-frame's slice header, so the decoder's DPB matches the encoder's.
+    pending_unmark_frame_nums: Vec<u32>,
+    /// Profile IDC (cached for parameter-set recreation).
     profile_idc: u32,
-    /// Whether CABAC entropy coding is preferred (cached from quality level query).
+    /// Whether CABAC entropy coding is preferred (from quality-level query).
     preferred_entropy_cabac: bool,
 }
 
-impl H264Encoder {
-    /// Upload input frame from a GPU image.
-    ///
-    /// This copies from a source NV12 image directly to the encoder's input image,
-    /// avoiding any CPU-side data copies. The source image must be in NV12 format
-    /// with the same dimensions as the encoder configuration. The source image
-    /// should be in GENERAL layout.
-    fn upload_from_image(&mut self, src_image: vk::Image) -> Result<()> {
-        if src_image == self.input_image {
-            debug!("Source image is the encoder's input image, skipping upload copy");
-            return Ok(());
+impl VideoCodec for H264 {
+    fn begin_picture(
+        &mut self,
+        common: &mut EncoderCommon,
+        plan: &FramePlan,
+    ) -> Result<PictureSetup> {
+        if plan.is_idr() {
+            self.frame_num_syntax = 0;
+            self.idr_pic_id = (self.idr_pic_id + 1) & 1;
+            // Reset the DPB for the new coded video sequence.
+            let dpb_config = DpbConfig {
+                dpb_size: common.dpb_slot_count as u32,
+                max_num_ref_frames: common.config.max_reference_frames,
+                use_multiple_references: common.config.b_frame_count > 0,
+                log2_max_frame_num_minus4: 4,
+                log2_max_pic_order_cnt_lsb_minus4: 4,
+                ..Default::default()
+            };
+            self.dpb.h264.sequence_start(dpb_config);
+            self.l0_references.clear();
+            self.has_backward_reference = false;
+            // An IDR resets the decoder's whole DPB, so any deferred
+            // unused-reference markings are moot.
+            self.pending_unmark_frame_nums.clear();
         }
 
-        let params = UploadParams {
-            upload_command_buffer: self.upload_command_buffer,
-            upload_fence: self.upload_fence,
-            src_image,
-            dst_image: self.input_image,
-            width: self.config.dimensions.width,
-            height: self.config.dimensions.height,
-            pixel_format: self.config.pixel_format,
-            input_image_layout: self.input_image_layout,
-            upload_queue: self.context.transfer_queue(),
+        let header = if plan.is_idr() {
+            Some(self.build_header(common)?)
+        } else {
+            None
         };
 
-        upload_image_to_input(&self.context, &params)?;
-
-        // Update tracked layout.
-        self.input_image_layout = vk::ImageLayout::VIDEO_ENCODE_SRC_KHR;
-
-        Ok(())
+        Ok(PictureSetup {
+            frame_type: plan.frame_type(),
+            header,
+        })
     }
-}
 
-// SAFETY: The raw pointer bitstream_buffer_ptr is only used within the encoder's
-// thread and is properly synchronized via Vulkan fences before access
-unsafe impl Send for H264Encoder {}
+    fn record_picture(
+        &mut self,
+        common: &mut EncoderCommon,
+        plan: &FramePlan,
+    ) -> Result<EncodeFuture> {
+        self.record(common, plan)
+    }
 
-impl Drop for H264Encoder {
-    fn drop(&mut self) {
-        unsafe {
-            // Wait on the queues used by the encoder rather than stalling
-            // the entire device.
-            let _ = self
-                .context
-                .device()
-                .queue_wait_idle(self.context.transfer_queue());
-            if let Some(q) = self.context.video_encode_queue() {
-                let _ = self.context.device().queue_wait_idle(q);
-            }
-            destroy_encoder_resources(
-                self.context.device(),
-                &self.video_queue_fn,
-                &EncoderResources {
-                    query_pool: self.query_pool,
-                    upload_fence: self.upload_fence,
-                    encode_fence: self.encode_fence,
-                    command_pool: self.command_pool,
-                    upload_command_pool: self.upload_command_pool,
-                    bitstream_buffer: self.bitstream_buffer,
-                    bitstream_buffer_memory: self.bitstream_buffer_memory,
-                    input_image: self.input_image,
-                    input_image_memory: self.input_image_memory,
-                    input_image_view: self.input_image_view,
-                    dpb_images: &self.dpb_images,
-                    dpb_image_memories: &self.dpb_image_memories,
-                    dpb_image_views: &self.dpb_image_views,
-                    session: self.session,
-                    session_params: self.session_params,
-                    session_memory: &self.session_memory,
+    fn end_picture(&mut self, common: &mut EncoderCommon, plan: &FramePlan) {
+        // `frame_num` carried by this frame (pre-increment), reused below for the
+        // reference entry even after the syntax counter advances.
+        let frame_num = self.frame_num_syntax;
+        let pic_order_cnt = plan.pic_order_cnt();
+
+        if plan.is_reference() && !plan.is_b_frame() {
+            self.frame_num_syntax = (frame_num + 1) % 256;
+        }
+
+        if plan.is_reference() {
+            let pic_type = if plan.is_idr() {
+                PictureType::Idr
+            } else if plan.is_b_frame() {
+                PictureType::B
+            } else {
+                PictureType::P
+            };
+            let pic_info = PictureStartInfo {
+                frame_id: plan.display_order,
+                pic_order_cnt,
+                frame_num,
+                pic_type,
+                is_reference: true,
+                ..Default::default()
+            };
+            self.dpb.h264.picture_start(pic_info);
+            self.dpb.h264.picture_end(true);
+
+            // The current frame becomes a reference for subsequent frames.
+            self.l0_references.insert(
+                0,
+                ReferenceInfo {
+                    dpb_slot: common.current_dpb_slot,
+                    frame_num,
+                    poc: pic_order_cnt,
+                    display_order: plan.display_order,
                 },
             );
+            while self.l0_references.len() > self.active_reference_count as usize {
+                self.l0_references.pop();
+            }
+
+            // Pick the next free DPB slot for the reconstructed picture.
+            let used_slots: Vec<u8> = self.l0_references.iter().map(|r| r.dpb_slot).collect();
+            for i in 0..common.dpb_slot_count as u8 {
+                if !used_slots.contains(&i) {
+                    common.current_dpb_slot = i;
+                    break;
+                }
+            }
         }
+    }
+
+    fn invalidate_references(
+        &mut self,
+        _common: &mut EncoderCommon,
+        first_lost_display_order: u64,
+    ) -> bool {
+        // Keep references older than the loss; every newer one is transitively
+        // undecodable on the client. H.264 maintains the DPB with an implicit
+        // sliding window, which would keep those newer pictures and desync the
+        // decoder's reference list from ours — so each dropped reference is
+        // queued to be explicitly marked unused-for-reference (MMCO) in the next
+        // P-frame (see `record`).
+        let mut survivors = Vec::with_capacity(self.l0_references.len());
+        for r in self.l0_references.drain(..) {
+            if r.display_order < first_lost_display_order {
+                survivors.push(r);
+            } else {
+                self.pending_unmark_frame_nums.push(r.frame_num);
+            }
+        }
+        self.l0_references = survivors;
+        // A backward (L1) reference may also be tainted; only B-frames use it.
+        self.has_backward_reference = false;
+        !self.l0_references.is_empty()
+    }
+
+    fn create_session_params(
+        &self,
+        common: &EncoderCommon,
+        desc: &ColorDescription,
+    ) -> Result<vk::VideoSessionParametersKHR> {
+        self.build_session_params(common, desc)
+    }
+
+    fn invalidate_header_cache(&mut self) {
+        // H.264 regenerates SPS/PPS on every IDR, so there is nothing cached.
     }
 }

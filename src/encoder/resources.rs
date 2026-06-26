@@ -123,20 +123,6 @@ pub(crate) fn get_video_format(pixel_format: PixelFormat, bit_depth: BitDepth) -
     }
 }
 
-/// Create a codec name array for Vulkan from a string.
-///
-/// This creates a null-terminated c_char array of 256 bytes for use with Vulkan
-/// video extensions.
-pub(crate) fn make_codec_name(codec_name: &[u8]) -> [std::ffi::c_char; 256] {
-    let mut name = [0 as std::ffi::c_char; 256];
-    for (i, &byte) in codec_name.iter().enumerate() {
-        if i < 255 {
-            name[i] = byte as std::ffi::c_char;
-        }
-    }
-    name
-}
-
 /// Create a buffer that requires device addresses (SHADER_DEVICE_ADDRESS usage).
 ///
 /// This allocates memory with `VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT` so that
@@ -250,6 +236,43 @@ pub(crate) fn create_bitstream_buffer(
 
     Ok((buffer, memory))
 }
+
+pub(crate) fn create_timeline_semaphore(context: &VideoContext) -> Result<vk::Semaphore> {
+    let mut type_info = vk::SemaphoreTypeCreateInfo::default()
+        .semaphore_type(vk::SemaphoreType::TIMELINE)
+        .initial_value(0);
+    let create_info = vk::SemaphoreCreateInfo::default().push(&mut type_info);
+
+    unsafe { context.device().create_semaphore(&create_info, None) }
+        .map_err(|e| PixelForgeError::Synchronization(e.to_string()))
+}
+
+pub(crate) fn create_encode_feedback_query_pool(
+    context: &VideoContext,
+    profile_info: &mut vk::VideoProfileInfoKHR,
+) -> Result<vk::QueryPool> {
+    let mut encode_feedback_create = vk::QueryPoolVideoEncodeFeedbackCreateInfoKHR::default()
+        .encode_feedback_flags(
+            vk::VideoEncodeFeedbackFlagsKHR::BITSTREAM_BUFFER_OFFSET
+                | vk::VideoEncodeFeedbackFlagsKHR::BITSTREAM_BYTES_WRITTEN,
+        );
+
+    let query_pool_create_info = unsafe {
+        vk::QueryPoolCreateInfo::default()
+            .query_type(vk::QueryType::VIDEO_ENCODE_FEEDBACK_KHR)
+            .query_count(1)
+            .extend(profile_info)
+            .push(&mut encode_feedback_create)
+    };
+
+    unsafe {
+        context
+            .device()
+            .create_query_pool(&query_pool_create_info, None)
+    }
+    .map_err(|e| PixelForgeError::QueryPool(e.to_string()))
+}
+
 /// Create an image for video encoding (input or DPB).
 ///
 /// This creates a VkImage suitable for use with a video encoder.
@@ -483,10 +506,6 @@ pub(crate) struct CommandResources {
     pub upload_command_buffer: vk::CommandBuffer,
     /// Fence for upload synchronization.
     pub upload_fence: vk::Fence,
-    /// Command buffer for encode operations.
-    pub encode_command_buffer: vk::CommandBuffer,
-    /// Fence for encode synchronization.
-    pub encode_fence: vk::Fence,
 }
 
 /// Create command resources for encoding.
@@ -510,16 +529,6 @@ pub(crate) fn create_command_resources(
             .create_command_pool(&pool_create_info, None)
     }
     .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
-
-    // Allocate encode command buffer.
-    let alloc_info = vk::CommandBufferAllocateInfo::default()
-        .command_pool(command_pool)
-        .level(vk::CommandBufferLevel::PRIMARY)
-        .command_buffer_count(1);
-
-    let encode_command_buffers = unsafe { context.device().allocate_command_buffers(&alloc_info) }
-        .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
-    let encode_command_buffer = encode_command_buffers[0];
 
     // Create command pool for upload commands (may be the same family).
     let upload_command_pool = if upload_queue_family == encode_queue_family {
@@ -550,13 +559,10 @@ pub(crate) fn create_command_resources(
     .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
     let upload_command_buffer = upload_command_buffers[0];
 
-    // Create fences. The encode fence is created signaled so that
-    // set_color_description() can safely wait on it before the first encode.
+    // Upload fence is created unsignaled. Per-slot encode fences are created by
+    // the encode pipeline (see `encoder::pipeline`).
     let fence_create_info = vk::FenceCreateInfo::default();
     let upload_fence = unsafe { context.device().create_fence(&fence_create_info, None) }
-        .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
-    let signaled_fence_info = vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED);
-    let encode_fence = unsafe { context.device().create_fence(&signaled_fence_info, None) }
         .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
 
     Ok(CommandResources {
@@ -564,8 +570,6 @@ pub(crate) fn create_command_resources(
         upload_command_pool,
         upload_command_buffer,
         upload_fence,
-        encode_command_buffer,
-        encode_fence,
     })
 }
 
@@ -1161,77 +1165,6 @@ pub(crate) fn upload_image_to_input(
     Ok(())
 }
 
-/// Parameters for cleaning up shared encoder resources.
-pub(crate) struct EncoderResources<'a> {
-    pub query_pool: vk::QueryPool,
-    pub upload_fence: vk::Fence,
-    pub encode_fence: vk::Fence,
-    pub command_pool: vk::CommandPool,
-    pub upload_command_pool: vk::CommandPool,
-    pub bitstream_buffer: vk::Buffer,
-    pub bitstream_buffer_memory: vk::DeviceMemory,
-    pub input_image: vk::Image,
-    pub input_image_memory: vk::DeviceMemory,
-    pub input_image_view: vk::ImageView,
-    pub dpb_images: &'a [vk::Image],
-    pub dpb_image_memories: &'a [vk::DeviceMemory],
-    pub dpb_image_views: &'a [vk::ImageView],
-    pub session: vk::VideoSessionKHR,
-    pub session_params: vk::VideoSessionParametersKHR,
-    pub session_memory: &'a [vk::DeviceMemory],
-}
-
-/// Destroy all shared encoder resources.
-///
-/// # Safety
-///
-/// All queues that may reference these resources (transfer and video encode)
-/// must be idle before calling this function.
-pub(crate) unsafe fn destroy_encoder_resources(
-    device: &ash::Device,
-    video_queue_fn: &ash::khr::video_queue::Device,
-    res: &EncoderResources,
-) {
-    device.destroy_query_pool(res.query_pool, None);
-    device.destroy_fence(res.upload_fence, None);
-    device.destroy_fence(res.encode_fence, None);
-    device.destroy_command_pool(res.command_pool, None);
-    if res.upload_command_pool != res.command_pool {
-        device.destroy_command_pool(res.upload_command_pool, None);
-    }
-
-    device.unmap_memory(res.bitstream_buffer_memory);
-    device.destroy_buffer(res.bitstream_buffer, None);
-    device.free_memory(res.bitstream_buffer_memory, None);
-
-    device.destroy_image_view(res.input_image_view, None);
-    device.destroy_image(res.input_image, None);
-    device.free_memory(res.input_image_memory, None);
-
-    for view in res.dpb_image_views {
-        device.destroy_image_view(*view, None);
-    }
-    for image in res.dpb_images {
-        device.destroy_image(*image, None);
-    }
-    for memory in res.dpb_image_memories {
-        device.free_memory(*memory, None);
-    }
-
-    if res.session_params != vk::VideoSessionParametersKHR::null() {
-        (video_queue_fn.fp().destroy_video_session_parameters_khr)(
-            device.handle(),
-            res.session_params,
-            std::ptr::null(),
-        );
-    }
-    (video_queue_fn.fp().destroy_video_session_khr)(device.handle(), res.session, std::ptr::null());
-
-    for memory in res.session_memory {
-        device.free_memory(*memory, None);
-    }
-}
-
 /// Record DPB image barriers for encode.
 ///
 /// Transitions the setup DPB slot from UNDEFINED to VIDEO_ENCODE_DPB and
@@ -1399,39 +1332,79 @@ pub(crate) unsafe fn record_post_encode_dpb_barrier(
     );
 }
 
-/// Submit an encode command buffer and wait for completion.
+/// Submit an encode command buffer without waiting for completion.
 ///
-/// Submits the command buffer to the encode queue, waits for the fence,
-/// then reads query results and copies the encoded bitstream data.
-/// The fence is reset before submission so it may be in any state on entry.
+/// Timeline semaphore waits/signals are used to keep shared DPB access ordered
+/// across pipelined slots while leaving bitstream readback delayed. Uses
+/// Synchronization2 (`queue_submit2`) so the timeline wait/signal are scoped to
+/// the `VIDEO_ENCODE` stage rather than `ALL_COMMANDS`, avoiding unnecessary
+/// over-synchronization.
 ///
 /// # Safety
 ///
 /// The command buffer must have been ended.
-/// The bitstream buffer pointer must be valid and the buffer must be persistently mapped.
-pub(crate) unsafe fn submit_encode_and_read_bitstream(
+pub(crate) unsafe fn submit_encode_only(
     device: &ash::Device,
     command_buffer: vk::CommandBuffer,
     fence: vk::Fence,
     encode_queue: vk::Queue,
-    query_pool: vk::QueryPool,
-    bitstream_buffer_ptr: *const u8,
-) -> Result<Vec<u8>> {
-    let submit_info =
-        vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&command_buffer));
+    wait_timeline: Option<(vk::Semaphore, u64)>,
+    signal_timeline: Option<(vk::Semaphore, u64)>,
+) -> Result<()> {
+    let command_buffer_info = vk::CommandBufferSubmitInfo::default().command_buffer(command_buffer);
+    let command_buffer_infos = [command_buffer_info];
 
-    // Reset the fence before submit (it may be signaled from a previous encode
-    // or from initial creation with SIGNALED_BIT). This ensures the fence is
-    // unsignaled for queue_submit, and after wait_for_fences it stays signaled —
-    // which lets set_color_description() safely wait on it between encodes.
+    let wait_infos: Vec<vk::SemaphoreSubmitInfo> = wait_timeline
+        .into_iter()
+        .map(|(semaphore, value)| {
+            vk::SemaphoreSubmitInfo::default()
+                .semaphore(semaphore)
+                .value(value)
+                .stage_mask(vk::PipelineStageFlags2::VIDEO_ENCODE_KHR)
+        })
+        .collect();
+    let signal_infos: Vec<vk::SemaphoreSubmitInfo> = signal_timeline
+        .into_iter()
+        .map(|(semaphore, value)| {
+            vk::SemaphoreSubmitInfo::default()
+                .semaphore(semaphore)
+                .value(value)
+                .stage_mask(vk::PipelineStageFlags2::VIDEO_ENCODE_KHR)
+        })
+        .collect();
+
+    let submit_info = vk::SubmitInfo2::default()
+        .wait_semaphore_infos(&wait_infos)
+        .command_buffer_infos(&command_buffer_infos)
+        .signal_semaphore_infos(&signal_infos);
+
     device
         .reset_fences(&[fence])
         .map_err(|e| PixelForgeError::Synchronization(e.to_string()))?;
 
     device
-        .queue_submit(encode_queue, &[submit_info], fence)
+        .queue_submit2(encode_queue, &[submit_info], fence)
         .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
 
+    Ok(())
+}
+
+/// Wait for a submitted encode and copy its bitstream data.
+///
+/// # Safety
+///
+/// The bitstream buffer pointer must be valid and persistently mapped.
+/// Wait for the encode to finish, then append its bitstream directly onto `dst`
+/// (which already holds any codec header). Appending in place means the encoded
+/// bytes are copied out of the mapped buffer exactly once — there is no
+/// intermediate owned `Vec`.
+pub(crate) unsafe fn wait_and_read_bitstream(
+    device: &ash::Device,
+    fence: vk::Fence,
+    query_pool: vk::QueryPool,
+    bitstream_buffer_ptr: *const u8,
+    dst: &mut Vec<u8>,
+) -> Result<()> {
     device
         .wait_for_fences(&[fence], true, u64::MAX)
         .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
@@ -1468,11 +1441,122 @@ pub(crate) unsafe fn submit_encode_and_read_bitstream(
 
     tracing::debug!("Encoded frame: offset={}, size={}", offset, size);
 
-    let mut encoded_data = vec![0u8; size];
     let src = std::slice::from_raw_parts(bitstream_buffer_ptr.add(offset), size);
-    encoded_data.copy_from_slice(src);
+    dst.extend_from_slice(src);
 
-    Ok(encoded_data)
+    Ok(())
+}
+
+/// The per-codec Vulkan resources torn down on `Drop`, other than the encode
+/// pipeline (which the engine owns and destroys). Bundled so the identical
+/// teardown lives in one place; see [`destroy_encoder_resources`].
+pub(crate) struct EncoderTeardown<'a> {
+    pub command_pool: vk::CommandPool,
+    pub upload_command_pool: vk::CommandPool,
+    pub upload_fence: vk::Fence,
+    pub dpb_images: &'a [vk::Image],
+    pub dpb_image_views: &'a [vk::ImageView],
+    pub dpb_image_memories: &'a [vk::DeviceMemory],
+    pub session: vk::VideoSessionKHR,
+    pub session_params: vk::VideoSessionParametersKHR,
+    pub session_memory: &'a [vk::DeviceMemory],
+}
+
+/// Destroy the common encoder resources (command pools, upload fence, DPB
+/// images, and the video session). Identical across codecs.
+///
+/// # Safety
+///
+/// All queues that may reference these resources must be idle.
+pub(crate) unsafe fn destroy_encoder_resources(
+    device: &ash::Device,
+    video_queue_fn: &ash::khr::video_queue::Device,
+    res: &EncoderTeardown,
+) {
+    device.destroy_fence(res.upload_fence, None);
+    device.destroy_command_pool(res.command_pool, None);
+    if res.upload_command_pool != res.command_pool {
+        device.destroy_command_pool(res.upload_command_pool, None);
+    }
+
+    for &view in res.dpb_image_views {
+        device.destroy_image_view(view, None);
+    }
+    for &image in res.dpb_images {
+        device.destroy_image(image, None);
+    }
+    for &memory in res.dpb_image_memories {
+        device.free_memory(memory, None);
+    }
+
+    if res.session_params != vk::VideoSessionParametersKHR::null() {
+        (video_queue_fn.fp().destroy_video_session_parameters_khr)(
+            device.handle(),
+            res.session_params,
+            std::ptr::null(),
+        );
+    }
+    (video_queue_fn.fp().destroy_video_session_khr)(device.handle(), res.session, std::ptr::null());
+    for &memory in res.session_memory {
+        device.free_memory(memory, None);
+    }
+}
+
+/// Retrieve driver-encoded video session parameters (H.264 SPS/PPS, H.265
+/// VPS/SPS/PPS, or AV1 sequence header) into a byte buffer, retrying on
+/// `INCOMPLETE`.
+///
+/// The codec-specific `*GetInfoKHR` and feedback structs are built by the caller
+/// and chained into `get_info`/`feedback`; this owns only the identical query
+/// loop. A preallocated buffer is always provided because some drivers misbehave
+/// on a size-only query (`pData == NULL`), notably for 4:4:4 profiles.
+pub(crate) fn get_encoded_session_params(
+    context: &VideoContext,
+    video_encode_fn: &ash::khr::video_encode_queue::Device,
+    get_info: &vk::VideoEncodeSessionParametersGetInfoKHR,
+    feedback: &mut vk::VideoEncodeSessionParametersFeedbackInfoKHR,
+) -> Result<Vec<u8>> {
+    let mut data = vec![0u8; 4096];
+    let mut data_size: usize = data.len();
+    let mut attempts = 0;
+    loop {
+        attempts += 1;
+        let result = unsafe {
+            (video_encode_fn
+                .fp()
+                .get_encoded_video_session_parameters_khr)(
+                context.device().handle(),
+                get_info,
+                feedback,
+                &mut data_size,
+                data.as_mut_ptr() as *mut std::ffi::c_void,
+            )
+        };
+
+        match result {
+            vk::Result::SUCCESS => {
+                if data_size == 0 {
+                    return Err(PixelForgeError::SessionParametersCreation(
+                        "Encoded session parameters size is 0".to_string(),
+                    ));
+                }
+                data.truncate(data_size);
+                return Ok(data);
+            }
+            // Driver indicates the buffer was too small; resize to the reported
+            // required size (or grow conservatively if it is not provided).
+            vk::Result::INCOMPLETE if attempts < 3 => {
+                let new_size = data_size.max(data.len() * 2).max(1);
+                data.resize(new_size, 0);
+                data_size = data.len();
+            }
+            err => {
+                return Err(PixelForgeError::SessionParametersCreation(format!(
+                    "Failed to get encoded session parameters: {err:?}"
+                )));
+            }
+        }
+    }
 }
 
 #[cfg(test)]

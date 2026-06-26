@@ -1,23 +1,21 @@
-//! H.265/HEVC encoder implementation using Vulkan Video.
+//! H.265/HEVC codec: the differences from the generic encoder.
 //!
-//! This module implements H.265/HEVC video encoding using Vulkan Video extensions.
+//! Shared machinery lives in `crate::encoder::codec`; this folder holds only
+//! H.265's reference tracking (`H265`), its per-frame StdVideo* graph
+//! (`record`), and its VPS/SPS/PPS generation (`session_params`).
 
-mod api;
-mod encode;
 mod init;
+mod record;
 mod session_params;
 
-use ash::vk;
-use tracing::debug;
-
-use crate::encoder::dpb::DecodedPictureBuffer;
-use crate::encoder::gop::GopStructure;
-use crate::encoder::resources::{
-    destroy_encoder_resources, upload_image_to_input, EncoderResources, UploadParams,
+use crate::encoder::codec::{EncoderCommon, FramePlan, PictureSetup, VideoCodec};
+use crate::encoder::dpb::{
+    DecodedPictureBuffer, DecodedPictureBufferTrait, DpbConfig, PictureStartInfo, PictureType,
 };
-use crate::encoder::EncodeConfig;
+use crate::encoder::pipeline::EncodeFuture;
+use crate::encoder::ColorDescription;
 use crate::error::Result;
-use crate::vulkan::VideoContext;
+use ash::vk;
 
 /// H.265 Coding Tree Block (CTB) size in pixels.
 pub const CTB_SIZE: u32 = 32;
@@ -26,155 +24,143 @@ pub const CTB_SIZE: u32 = 32;
 pub(crate) struct ReferenceInfo {
     pub dpb_slot: u8,
     pub poc: i32,
+    /// Display order (`pts`) of this reference, for reference frame invalidation.
+    pub display_order: u64,
 }
 
-/// H.265 encoder.
-pub struct H265Encoder {
-    context: VideoContext,
-    config: EncodeConfig,
+/// H.265-specific encoder state.
+pub(crate) struct H265 {
     dpb: DecodedPictureBuffer,
-    gop: GopStructure,
-
-    /// Aligned width (to CTB size).
-    aligned_width: u32,
-    /// Aligned height (to CTB size).
-    aligned_height: u32,
-
-    // Video session.
-    video_queue_fn: ash::khr::video_queue::Device,
-    video_encode_fn: ash::khr::video_encode_queue::Device,
-    session: vk::VideoSessionKHR,
-    session_params: vk::VideoSessionParametersKHR,
-    session_memory: Vec<vk::DeviceMemory>,
-
-    // Frame counters.
-    input_frame_num: u64,
-    encode_frame_num: u64,
-
-    // Resources
-    input_image: vk::Image,
-    input_image_memory: vk::DeviceMemory,
-    input_image_view: vk::ImageView,
-    /// Current Vulkan image layout of `input_image` (tracked to avoid UB when transitioning).
-    input_image_layout: vk::ImageLayout,
-    /// DPB images.
-    dpb_images: Vec<vk::Image>,
-    dpb_image_memories: Vec<vk::DeviceMemory>,
-    dpb_image_views: Vec<vk::ImageView>,
-    /// Number of DPB slots allocated.
-    dpb_slot_count: usize,
-    /// Whether the DPB uses a single layered image (true) or separate images (false).
-    use_layered_dpb: bool,
-    bitstream_buffer: vk::Buffer,
-    bitstream_buffer_memory: vk::DeviceMemory,
-    /// Persistently mapped pointer to the bitstream buffer (avoids per-frame map/unmap).
-    bitstream_buffer_ptr: *mut u8,
-
-    // Command resources.
-    command_pool: vk::CommandPool,
-    upload_command_pool: vk::CommandPool,
-    upload_command_buffer: vk::CommandBuffer,
-    upload_fence: vk::Fence,
-    encode_command_buffer: vk::CommandBuffer,
-    encode_fence: vk::Fence,
-    query_pool: vk::QueryPool,
-
-    // Parameter sets - cached header data (VPS/SPS/PPS)
+    /// Cached VPS/SPS/PPS header (invalidated when session params change).
     header_data: Option<Vec<u8>>,
-
-    // Reference picture tracking.
-    /// Whether we have a backward reference (for B-frames, L1).
     has_backward_reference: bool,
-    /// POC of the L1 (backward) reference picture.
     backward_reference_poc: i32,
-    /// DPB slot for L1 (backward) reference.
     backward_reference_dpb_slot: u8,
-    /// Current DPB slot to use for setup (the reconstructed picture).
-    current_dpb_slot: u8,
-    /// Active L0 reference pictures (for P-frames).
     l0_references: Vec<ReferenceInfo>,
-    /// Number of active reference frames.
     active_reference_count: u32,
-    /// H.265 profile IDC (cached from initialization for session parameter recreation).
     profile_idc: u32,
-
-    // DPB slot activation tracking.
-    /// Tracks which DPB slots have been activated (used at least once).
-    dpb_slot_active: Vec<bool>,
 }
 
-impl H265Encoder {
-    /// Upload input frame from a GPU image.
-    ///
-    /// This copies from a source NV12 image directly to the encoder's input image,
-    /// avoiding any CPU-side data copies. The source image must be in NV12 format
-    /// with the same dimensions as the encoder configuration. The source image
-    /// should be in GENERAL layout.
-    fn upload_from_image(&mut self, src_image: vk::Image) -> Result<()> {
-        if src_image == self.input_image {
-            debug!("Source image is the encoder's input image, skipping upload copy");
-            return Ok(());
+impl VideoCodec for H265 {
+    fn begin_picture(
+        &mut self,
+        common: &mut EncoderCommon,
+        plan: &FramePlan,
+    ) -> Result<PictureSetup> {
+        if plan.is_idr() {
+            let dpb_config = DpbConfig {
+                dpb_size: common.dpb_slot_count as u32,
+                max_num_ref_frames: common.config.max_reference_frames,
+                use_multiple_references: common.config.b_frame_count > 0,
+                log2_max_frame_num_minus4: 0,
+                log2_max_pic_order_cnt_lsb_minus4: 4,
+                ..Default::default()
+            };
+            self.dpb.h265.sequence_start(dpb_config);
+            self.l0_references.clear();
+            self.has_backward_reference = false;
+            // All DPB slots become inactive at the start of a coded video sequence.
+            for active in &mut common.dpb_slot_active {
+                *active = false;
+            }
         }
 
-        let params = UploadParams {
-            upload_command_buffer: self.upload_command_buffer,
-            upload_fence: self.upload_fence,
-            src_image,
-            dst_image: self.input_image,
-            width: self.config.dimensions.width,
-            height: self.config.dimensions.height,
-            pixel_format: self.config.pixel_format,
-            input_image_layout: self.input_image_layout,
-            upload_queue: self.context.transfer_queue(),
+        let header = if plan.is_idr() {
+            if self.header_data.is_none() {
+                self.header_data = Some(self.build_header(common)?);
+            }
+            self.header_data.clone()
+        } else {
+            None
         };
 
-        upload_image_to_input(&self.context, &params)?;
-
-        // Update tracked layout.
-        self.input_image_layout = vk::ImageLayout::VIDEO_ENCODE_SRC_KHR;
-
-        Ok(())
+        Ok(PictureSetup {
+            frame_type: plan.frame_type(),
+            header,
+        })
     }
-}
 
-// SAFETY: The raw pointer bitstream_buffer_ptr is only used within the encoder's
-// thread and is properly synchronized via Vulkan fences before access
-unsafe impl Send for H265Encoder {}
+    fn record_picture(
+        &mut self,
+        common: &mut EncoderCommon,
+        plan: &FramePlan,
+    ) -> Result<EncodeFuture> {
+        self.record(common, plan)
+    }
 
-impl Drop for H265Encoder {
-    fn drop(&mut self) {
-        unsafe {
-            // Wait on the queues used by the encoder rather than stalling
-            // the entire device.
-            let _ = self
-                .context
-                .device()
-                .queue_wait_idle(self.context.transfer_queue());
-            if let Some(q) = self.context.video_encode_queue() {
-                let _ = self.context.device().queue_wait_idle(q);
-            }
-            destroy_encoder_resources(
-                self.context.device(),
-                &self.video_queue_fn,
-                &EncoderResources {
-                    query_pool: self.query_pool,
-                    upload_fence: self.upload_fence,
-                    encode_fence: self.encode_fence,
-                    command_pool: self.command_pool,
-                    upload_command_pool: self.upload_command_pool,
-                    bitstream_buffer: self.bitstream_buffer,
-                    bitstream_buffer_memory: self.bitstream_buffer_memory,
-                    input_image: self.input_image,
-                    input_image_memory: self.input_image_memory,
-                    input_image_view: self.input_image_view,
-                    dpb_images: &self.dpb_images,
-                    dpb_image_memories: &self.dpb_image_memories,
-                    dpb_image_views: &self.dpb_image_views,
-                    session: self.session,
-                    session_params: self.session_params,
-                    session_memory: &self.session_memory,
-                },
-            );
+    fn end_picture(&mut self, common: &mut EncoderCommon, plan: &FramePlan) {
+        if !plan.is_reference() {
+            return;
         }
+        let pic_order_cnt = plan.pic_order_cnt();
+        let pic_type = if plan.is_idr() {
+            PictureType::Idr
+        } else if plan.is_b_frame() {
+            PictureType::B
+        } else {
+            PictureType::P
+        };
+        let pic_info = PictureStartInfo {
+            frame_id: plan.display_order,
+            pic_order_cnt,
+            frame_num: 0,
+            pic_type,
+            is_reference: true,
+            ..Default::default()
+        };
+        self.dpb.h265.picture_start(pic_info);
+        self.dpb.h265.picture_end(true);
+
+        self.l0_references.insert(
+            0,
+            ReferenceInfo {
+                dpb_slot: common.current_dpb_slot,
+                poc: pic_order_cnt,
+                display_order: plan.display_order,
+            },
+        );
+        while self.l0_references.len() > self.active_reference_count as usize {
+            self.l0_references.pop();
+        }
+
+        if !plan.is_b_frame() {
+            let used_slots: Vec<u8> = self.l0_references.iter().map(|r| r.dpb_slot).collect();
+            for i in 0..common.dpb_slot_count as u8 {
+                if !used_slots.contains(&i) {
+                    common.current_dpb_slot = i;
+                    break;
+                }
+            }
+        }
+    }
+
+    fn invalidate_references(
+        &mut self,
+        _common: &mut EncoderCommon,
+        first_lost_display_order: u64,
+    ) -> bool {
+        // Every reference at or after the first lost frame is transitively
+        // undecodable on the client; keep only older survivors. H.265 declares
+        // its short-term reference picture set explicitly every frame from
+        // `l0_references` (see `record`), so dropping entries here is enough for
+        // the decoder to follow — no extra bitstream marking is required.
+        self.l0_references
+            .retain(|r| r.display_order < first_lost_display_order);
+        // A backward (L1) reference may also be tainted; B-frames are the only
+        // consumer of it, so simply forget it on invalidation.
+        self.has_backward_reference = false;
+        !self.l0_references.is_empty()
+    }
+
+    fn create_session_params(
+        &self,
+        common: &EncoderCommon,
+        desc: &ColorDescription,
+    ) -> Result<vk::VideoSessionParametersKHR> {
+        self.build_session_params(common, desc)
+    }
+
+    fn invalidate_header_cache(&mut self) {
+        self.header_data = None;
     }
 }
