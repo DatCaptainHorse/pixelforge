@@ -3,7 +3,7 @@
 use std::cmp::Reverse;
 
 use super::entry::{DpbEntry, DpbState, MarkingState};
-use super::{PictureType, MAX_DPB_SIZE, MAX_REF_LIST_SIZE};
+use super::{MAX_DPB_SIZE, MAX_REF_LIST_SIZE, PictureType};
 
 /// A reference picture for building reference lists.
 #[derive(Debug, Clone, Copy)]

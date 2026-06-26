@@ -1,7 +1,7 @@
 use super::{CTB_SIZE, H265};
 
 use crate::encoder::codec::{
-    build_encoder_common, query_video_caps, CodecEncoder, CommonInitRequest,
+    CodecEncoder, CommonInitRequest, build_encoder_common, query_video_caps,
 };
 use crate::encoder::dpb::{DecodedPictureBuffer, DecodedPictureBufferTrait, DpbConfig};
 use crate::encoder::resources::MIN_BITSTREAM_BUFFER_SIZE;

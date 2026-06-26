@@ -1,6 +1,6 @@
 //! DPB entry structures for individual pictures in the buffer.
 
-use super::{PictureType, MAX_DPB_SIZE};
+use super::{MAX_DPB_SIZE, PictureType};
 
 /// Reference marking state for a picture.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

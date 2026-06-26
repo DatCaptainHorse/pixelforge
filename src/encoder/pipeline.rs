@@ -39,9 +39,9 @@ use ash::vk;
 use futures_channel::oneshot;
 
 use crate::encoder::resources::{
-    clear_input_image, create_bitstream_buffer, create_encode_feedback_query_pool, create_image,
-    create_timeline_semaphore, map_bitstream_buffer, submit_encode_only, wait_and_read_bitstream,
-    ClearImageParams,
+    ClearImageParams, clear_input_image, create_bitstream_buffer,
+    create_encode_feedback_query_pool, create_image, create_timeline_semaphore,
+    map_bitstream_buffer, submit_encode_only, wait_and_read_bitstream,
 };
 use crate::encoder::{BitDepth, EncodedPacket, FrameType, PixelFormat};
 use crate::error::{PixelForgeError, Result};

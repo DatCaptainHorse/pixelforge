@@ -6,7 +6,7 @@
 use ash::vk;
 use ash::vk::TaggedStructure;
 use pixelforge::{Codec, VideoContextBuilder};
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, Layer};
+use tracing_subscriber::{Layer, layer::SubscriberExt, util::SubscriberInitExt};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize tracing.

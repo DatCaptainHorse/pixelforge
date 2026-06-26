@@ -157,7 +157,7 @@ fn run_codec(
             return Err(format!(
                 "recovery frame {INVALIDATE_AT} fell back to a keyframe (RFI did not engage)"
             )
-            .into())
+            .into());
         }
         None => return Err(format!("recovery frame {INVALIDATE_AT} was never produced").into()),
         Some(false) => {}

@@ -10,7 +10,7 @@ use pixelforge::{
 use std::fs::File;
 use std::io::{Read, Write};
 use std::path::Path;
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, Layer};
+use tracing_subscriber::{Layer, layer::SubscriberExt, util::SubscriberInitExt};
 
 const TEST_FRAMES_PATH: &str = "testdata/test_frames.yuv";
 const WIDTH: u32 = 320;
@@ -33,7 +33,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let test_path = Path::new(TEST_FRAMES_PATH);
     if !test_path.exists() {
         eprintln!("Test frames not found at '{TEST_FRAMES_PATH}'");
-        eprintln!("Generate with: ffmpeg -f lavfi -i testsrc=duration=0.5:size=320x240:rate=30 -pix_fmt yuv420p -f rawvideo testdata/test_frames.yuv");
+        eprintln!(
+            "Generate with: ffmpeg -f lavfi -i testsrc=duration=0.5:size=320x240:rate=30 -pix_fmt yuv420p -f rawvideo testdata/test_frames.yuv"
+        );
         return Ok(());
     }
 

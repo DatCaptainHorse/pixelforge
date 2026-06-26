@@ -18,9 +18,9 @@ use crate::encoder::dpb::MAX_DPB_SLOTS;
 use crate::encoder::gop::{GopFrameType, GopPosition, GopStructure};
 use crate::encoder::pipeline::{EncodeFuture, EncodePipeline, PipelineConfig, SlotPacketMetadata};
 use crate::encoder::resources::{
-    align_up, allocate_session_memory, create_command_resources, create_dpb_images,
-    destroy_encoder_resources, get_video_format, lcm, query_supported_video_formats,
-    upload_image_to_input, EncoderTeardown, UploadParams,
+    EncoderTeardown, UploadParams, align_up, allocate_session_memory, create_command_resources,
+    create_dpb_images, destroy_encoder_resources, get_video_format, lcm,
+    query_supported_video_formats, upload_image_to_input,
 };
 use crate::encoder::{ColorDescription, EncodeConfig, FrameType, RateControlMode};
 use crate::error::{PixelForgeError, Result};
@@ -524,8 +524,14 @@ pub(crate) fn build_encoder_common(req: &CommonInitRequest) -> Result<CommonInit
     {
         return Err(PixelForgeError::InvalidInput(format!(
             "Requested coded extent {}x{} (aligned to {}x{} with granularity {}x{}) exceeds device max {}x{} for this profile",
-            width, height, aligned_width, aligned_height, gran_w, gran_h,
-            capabilities.max_coded_extent.width, capabilities.max_coded_extent.height
+            width,
+            height,
+            aligned_width,
+            aligned_height,
+            gran_w,
+            gran_h,
+            capabilities.max_coded_extent.width,
+            capabilities.max_coded_extent.height
         )));
     }
     tracing::info!(

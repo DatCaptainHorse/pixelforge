@@ -11,7 +11,7 @@
 use super::entry::{DpbEntry, DpbState, MarkingState};
 use super::reference_lists::{H264ReferenceListBuilder, ReferenceList};
 use super::types::{DpbConfig, MmcoOperation, PictureStartInfo, PocType};
-use super::{DecodedPictureBufferTrait, PictureType, MAX_DPB_SIZE};
+use super::{DecodedPictureBufferTrait, MAX_DPB_SIZE, PictureType};
 
 /// H.264-specific DPB implementation.
 #[derive(Debug)]

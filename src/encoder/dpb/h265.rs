@@ -12,7 +12,7 @@ use std::cmp::Reverse;
 use super::entry::{DpbEntry, DpbState, MarkingState};
 use super::reference_lists::{H265ReferenceListBuilder, ReferenceList};
 use super::types::{DpbConfig, PictureStartInfo, RefPicSet, ShortTermRefPicSet};
-use super::{DecodedPictureBufferTrait, PictureType, MAX_DPB_SIZE, MAX_REF_LIST_SIZE};
+use super::{DecodedPictureBufferTrait, MAX_DPB_SIZE, MAX_REF_LIST_SIZE, PictureType};
 
 /// H.265-specific DPB implementation.
 #[derive(Debug)]

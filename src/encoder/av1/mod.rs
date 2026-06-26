@@ -14,9 +14,9 @@ mod init;
 mod record;
 mod session_params;
 
+use crate::encoder::ColorDescription;
 use crate::encoder::codec::{EncoderCommon, FramePlan, PictureSetup, VideoCodec};
 use crate::encoder::pipeline::EncodeFuture;
-use crate::encoder::ColorDescription;
 use crate::error::Result;
 use ash::vk;
 

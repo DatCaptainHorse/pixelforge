@@ -140,11 +140,7 @@ impl OutputFormat {
 
     /// Bytes per sample for this format.
     pub fn bytes_per_sample(&self) -> usize {
-        if self.is_10bit() {
-            2
-        } else {
-            1
-        }
+        if self.is_10bit() { 2 } else { 1 }
     }
 }
 

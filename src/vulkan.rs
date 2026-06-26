@@ -512,7 +512,9 @@ impl VideoContext {
                 desc_buf_features.descriptor_buffer = 1;
                 desc_buf_features.descriptor_buffer_capture_replay = 1;
             } else if desc_buf_supported {
-                warn!("VK_EXT_descriptor_buffer extension present but bufferDeviceAddress not supported; descriptor buffer will not be enabled");
+                warn!(
+                    "VK_EXT_descriptor_buffer extension present but bufferDeviceAddress not supported; descriptor buffer will not be enabled"
+                );
             }
         }
 

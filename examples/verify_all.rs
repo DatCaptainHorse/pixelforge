@@ -11,7 +11,7 @@ use std::fs::File;
 use std::io::{Read, Write};
 use std::path::Path;
 use std::process::Command;
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, Layer};
+use tracing_subscriber::{Layer, layer::SubscriberExt, util::SubscriberInitExt};
 
 const WIDTH: u32 = 320;
 const HEIGHT: u32 = 240;

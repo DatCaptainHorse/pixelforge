@@ -1,7 +1,7 @@
 use super::{Av1, MIN_BITSTREAM_BUFFER_SIZE, SUPERBLOCK_SIZE};
 
 use crate::encoder::codec::{
-    build_encoder_common, query_video_caps, CodecEncoder, CommonInitRequest,
+    CodecEncoder, CommonInitRequest, build_encoder_common, query_video_caps,
 };
 use crate::encoder::{ColorDescription, EncodeConfig, PixelFormat};
 use crate::error::Result;
