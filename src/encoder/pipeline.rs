@@ -441,10 +441,10 @@ impl EncodePipeline {
                 Some((self.timeline, signal_value)),
             )?;
         }
+        let submit_time = std::time::Instant::now();
 
         self.last_value = signal_value;
         self.next_value = signal_value + 1;
-        let submit_time = std::time::Instant::now();
 
         // Mark busy *before* handing the work off, so the completion thread can
         // never clear the flag before it is set.

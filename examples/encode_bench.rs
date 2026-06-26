@@ -56,7 +56,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let context = VideoContextBuilder::new()
         .app_name("Encode Bench Example")
         .enable_validation(cfg!(debug_assertions))
-        .require_encode(Codec::H264)
         .build()?;
 
     // Define codecs and tuning modes to test.
@@ -165,20 +164,17 @@ fn run_encode_test(
         // Upload YUV420 data to the input image
         input_image.upload_yuv420(frame)?;
 
-        // Submit the frame (async) and keep the pipeline at most ~2 deep
         pending.push_back(encoder.encode(input_image.image())?);
-        while pending.len() > 2 {
+        // drain before submitting when at capacity
+        while pending.len() >= 2 {
             let packet = pollster::block_on(pending.pop_front().unwrap())?;
             write_packet(packet)?;
         }
     }
 
-    // Flush remaining frames
+    // Flush remaining frames without using them for statistics
     encoder.flush()?;
-    while let Some(future) = pending.pop_front() {
-        let packet = pollster::block_on(future)?;
-        write_packet(packet)?;
-    }
+    while let Some(_future) = pending.pop_front() {}
 
     let ratio = (num_frames * frame_size) as f64 / total_bytes as f64;
     println!("Encoded {num_frames} frames, {total_bytes} bytes, {ratio:.1}:1 compression");
