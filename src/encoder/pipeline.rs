@@ -123,6 +123,7 @@ struct WorkItem {
     /// Timestamping resources
     timestamp_period: f32,
     timestamp_query_pool: vk::QueryPool,
+    submit_time: std::time::Instant,
     /// Resolves this frame's [`EncodeFuture`] once the bitstream is read back.
     result_tx: oneshot::Sender<Result<EncodedPacket>>,
 }
@@ -443,6 +444,7 @@ impl EncodePipeline {
 
         self.last_value = signal_value;
         self.next_value = signal_value + 1;
+        let submit_time = std::time::Instant::now();
 
         // Mark busy *before* handing the work off, so the completion thread can
         // never clear the flag before it is set.
@@ -456,6 +458,7 @@ impl EncodePipeline {
             bitstream_ptr: SendPtr(bitstream_ptr),
             timestamp_period,
             timestamp_query_pool,
+            submit_time,
             metadata,
             result_tx,
         };
@@ -547,6 +550,7 @@ fn run_completion_thread(
                 &mut data,
             )
         };
+        let bitstream_ready_time = std::time::Instant::now();
 
         let mut stats: Option<super::EncodedPacketStats> = None;
         if let Some(gpu_encode_ns) = unsafe {
@@ -559,7 +563,10 @@ fn run_completion_thread(
         } {
             stats = Some(super::EncodedPacketStats {
                 gpu_time_ns: gpu_encode_ns,
-                cpu_wall_time_ns: work.metadata.now.elapsed().as_nanos() as u64,
+                cpu_time_ns: work.metadata.now.elapsed().as_nanos() as u64,
+                wall_latency_ns: bitstream_ready_time
+                    .duration_since(work.submit_time)
+                    .as_nanos() as u64,
             });
         }
 

@@ -143,6 +143,7 @@ fn run_encode_test(
 
     let mut gpu_durations: Vec<Duration> = Vec::new();
     let mut cpu_durations: Vec<Duration> = Vec::new();
+    let mut wall_latency_durations: Vec<Duration> = Vec::new();
 
     let mut pending: std::collections::VecDeque<pixelforge::EncodeFuture> =
         std::collections::VecDeque::new();
@@ -151,7 +152,8 @@ fn run_encode_test(
         total_bytes += packet.data.len();
         if let Some(stats) = packet.stats {
             gpu_durations.push(Duration::from_nanos(stats.gpu_time_ns));
-            cpu_durations.push(Duration::from_nanos(stats.cpu_wall_time_ns));
+            cpu_durations.push(Duration::from_nanos(stats.cpu_time_ns));
+            wall_latency_durations.push(Duration::from_nanos(stats.wall_latency_ns));
         }
         Ok::<(), Box<dyn std::error::Error>>(())
     };
@@ -191,6 +193,12 @@ fn run_encode_test(
     if !cpu_durations.is_empty() {
         cpu_durations.sort_unstable();
         print_timing_stats("CPU", &cpu_durations);
+    }
+
+    // Print wall latency timings.
+    if !wall_latency_durations.is_empty() {
+        wall_latency_durations.sort_unstable();
+        print_timing_stats("Wall Latency", &wall_latency_durations);
     }
 
     Ok(())
