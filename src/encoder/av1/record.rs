@@ -47,10 +47,6 @@ impl Av1 {
         unsafe {
             prepare_encode_command_buffer(common.device(), command_buffer, query_pool)?;
         }
-        // Reset and write start timestamp
-        unsafe {
-            reset_start_timestamp(common.device(), command_buffer, timestamp_query_pool);
-        }
         let ref_dpb_slots: Vec<u8> = self.references.iter().map(|r| r.dpb_slot).collect();
         unsafe {
             record_dpb_barriers(
@@ -333,6 +329,11 @@ impl Av1 {
             .key_frame_period(common.config.gop_size)
             .consecutive_bipredictive_frame_count(0)
             .temporal_layer_count(1);
+
+        // Reset and write start timestamp
+        unsafe {
+            reset_start_timestamp(common.device(), command_buffer, timestamp_query_pool);
+        }
 
         let begin_coding_info = if is_first_frame {
             vk::VideoBeginCodingInfoKHR::default()

@@ -36,10 +36,6 @@ impl H265 {
         unsafe {
             prepare_encode_command_buffer(common.device(), command_buffer, query_pool)?;
         }
-        // Reset and write start timestamp
-        unsafe {
-            reset_start_timestamp(common.device(), command_buffer, timestamp_query_pool);
-        }
         let ref_dpb_slots: Vec<u8> = self.l0_references.iter().map(|r| r.dpb_slot).collect();
         unsafe {
             record_dpb_barriers(
@@ -441,6 +437,11 @@ impl H265 {
                 .layers(&rc_layers)
                 .virtual_buffer_size_in_ms(common.config.virtual_buffer_size_ms)
                 .initial_virtual_buffer_size_in_ms(common.config.initial_virtual_buffer_size_ms);
+        }
+
+        // Reset and write start timestamp
+        unsafe {
+            reset_start_timestamp(common.device(), command_buffer, timestamp_query_pool);
         }
 
         let is_first_frame = plan.is_first_frame();

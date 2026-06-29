@@ -563,7 +563,7 @@ fn run_completion_thread(
         } {
             stats = Some(super::EncodedPacketStats {
                 gpu_time_ns: gpu_encode_ns,
-                cpu_time_ns: work.metadata.now.elapsed().as_nanos() as u64,
+                frame_latency_ns: work.metadata.now.elapsed().as_nanos() as u64,
                 wall_latency_ns: bitstream_ready_time
                     .duration_since(work.submit_time)
                     .as_nanos() as u64,

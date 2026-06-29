@@ -6,7 +6,7 @@
 
 A Vulkan-based video encoding library for Rust, supporting H.264, H.265, and AV1 codecs.
 
-## Features
+# Features
 
 - **Hardware-accelerated** video encoding using Vulkan Video extensions.
 - **Multiple codec support**: H.264/AVC, H.265/HEVC, AV1.
@@ -20,7 +20,7 @@ A Vulkan-based video encoding library for Rust, supporting H.264, H.265, and AV1
 
 > **Note**: B-frame support is not yet implemented. Setting `b_frame_count > 0` will panic.
 
-## Supported Codecs
+# Supported Codecs
 
 | Codec | Encode |
 |-------|--------|
@@ -28,11 +28,11 @@ A Vulkan-based video encoding library for Rust, supporting H.264, H.265, and AV1
 | H.265/HEVC | ✓ |
 | AV1 | ✓ |
 
-## Requirements
+# Requirements
 
 - A GPU with Vulkan video encoding support (e.g., NVIDIA RTX series, AMD RDNA2+, Intel Arc)
 
-## Installation
+# Installation
 
 Add this to your `Cargo.toml`:
 
@@ -41,7 +41,7 @@ Add this to your `Cargo.toml`:
 pixelforge = "0.1"
 ```
 
-### Optional Features
+## Optional Features
 
 | Feature | Description |
 |---------|-------------|
@@ -54,9 +54,9 @@ To enable DMA-BUF support:
 pixelforge = { version = "0.1", features = ["dmabuf"] }
 ```
 
-## Quick Start
+# Quick Start
 
-### Query Capabilities
+## Query Capabilities
 
 ```rust
 use pixelforge::{Codec, VideoContextBuilder};
@@ -76,7 +76,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-### Encoding Video
+## Encoding Video
 
 ```rust
 use pixelforge::{
@@ -116,7 +116,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-### Color Conversion (RGB → YUV)
+## Color Conversion (RGB → YUV)
 
 PixelForge includes a GPU compute shader for converting RGB input to YUV output, supporting multiple color spaces:
 
@@ -144,7 +144,15 @@ let mut converter = ColorConverter::new(context.clone(), config)?;
 // converter.convert(input_image, output_buffer)?;
 ```
 
-## Examples
+# Benchmarking
+
+Run the encode latency benchmark with:
+
+```
+cargo run --example encode_bench
+```
+
+# Examples
 
 Run the examples with:
 
@@ -165,21 +173,21 @@ cargo run --example encode_av1
 cargo run --example verify_all
 ```
 
-## Shader Development
+# Shader Development
 
 The color conversion shader is precompiled to SPIR-V and embedded at build time.
 See [shader/README.md](shader/README.md) for details on editing and recompiling shaders.
 
-## TODO's
+# TODO's
 
 1. [] Decoding.
 1. [] B-frames support.
 
-## Contributing
+# Contributing
 
 Contributions are welcome! Please feel free to submit a Pull Request.
 
-## Acknowledgement
+# Acknowledgement
 
 This project was heavily inspired by the [vk_video_samples](https://github.com/nvpro-samples/vk_video_samples)
 repository by NVIDIA, which provided invaluable reference for Vulkan Video encoding.

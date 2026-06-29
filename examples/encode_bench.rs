@@ -141,7 +141,7 @@ fn run_encode_test(
     let mut total_bytes = 0;
 
     let mut gpu_durations: Vec<Duration> = Vec::new();
-    let mut cpu_durations: Vec<Duration> = Vec::new();
+    let mut frame_latency_durations: Vec<Duration> = Vec::new();
     let mut wall_latency_durations: Vec<Duration> = Vec::new();
 
     let mut pending: std::collections::VecDeque<pixelforge::EncodeFuture> =
@@ -151,7 +151,7 @@ fn run_encode_test(
         total_bytes += packet.data.len();
         if let Some(stats) = packet.stats {
             gpu_durations.push(Duration::from_nanos(stats.gpu_time_ns));
-            cpu_durations.push(Duration::from_nanos(stats.cpu_time_ns));
+            frame_latency_durations.push(Duration::from_nanos(stats.frame_latency_ns));
             wall_latency_durations.push(Duration::from_nanos(stats.wall_latency_ns));
         }
         Ok::<(), Box<dyn std::error::Error>>(())
@@ -185,10 +185,10 @@ fn run_encode_test(
         print_timing_stats("GPU", &gpu_durations);
     }
 
-    // Print CPU timings.
-    if !cpu_durations.is_empty() {
-        cpu_durations.sort_unstable();
-        print_timing_stats("CPU", &cpu_durations);
+    // Print frame latency timings.
+    if !frame_latency_durations.is_empty() {
+        frame_latency_durations.sort_unstable();
+        print_timing_stats("Frame Latency", &frame_latency_durations);
     }
 
     // Print wall latency timings.
@@ -207,9 +207,10 @@ fn print_timing_stats(label: &str, durations: &[Duration]) {
     let avg = sum / durations.len() as u32;
     let p99_index = (durations.len() as f64 * 0.99) as usize;
     let p99 = durations[p99_index.min(durations.len() - 1)];
+    let total = sum.as_millis();
 
     println!(
-        "{} Encode timings: Min: {:?}, Max: {:?}, Avg: {:?}, P99: {:?}",
-        label, min, max, avg, p99
+        "{} Encode timings: Min: {:?}, Max: {:?}, Avg: {:?}, P99: {:?}, Total: {}ms",
+        label, min, max, avg, p99, total
     );
 }

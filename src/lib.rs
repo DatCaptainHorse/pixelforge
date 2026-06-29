@@ -141,6 +141,14 @@
 //! # }
 //! ```
 //!
+//! # Benchmarking
+//!
+//! Run the encode latency benchmark with:
+//!
+//! ```text
+//! cargo run --example encode_bench
+//! ```
+//!
 //! # Examples
 //!
 //! Run the examples with:
