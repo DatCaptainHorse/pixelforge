@@ -190,9 +190,11 @@
 //! repository by NVIDIA, which provided invaluable reference for Vulkan Video encoding.
 
 pub mod converter;
+pub mod decoder;
 pub mod encoder;
 pub mod error;
 pub mod image;
+pub(crate) mod video;
 pub mod vulkan;
 
 /// Align a byte size up to a multiple of 4.

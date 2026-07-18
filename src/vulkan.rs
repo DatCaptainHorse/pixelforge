@@ -14,6 +14,7 @@ pub struct VideoContextBuilder {
     app_version: (u32, u32, u32),
     enable_validation: bool,
     required_encode_codecs: Vec<Codec>,
+    required_decode_codecs: Vec<Codec>,
 }
 
 impl Default for VideoContextBuilder {
@@ -30,6 +31,7 @@ impl VideoContextBuilder {
             app_version: (1, 0, 0),
             enable_validation: false,
             required_encode_codecs: Vec::new(),
+            required_decode_codecs: Vec::new(),
         }
     }
 
@@ -57,10 +59,213 @@ impl VideoContextBuilder {
         self
     }
 
+    /// Require video decode support for a codec.
+    pub fn require_decode(mut self, codec: Codec) -> Self {
+        self.required_decode_codecs.push(codec);
+        self
+    }
+
     /// Build the VideoContext.
     pub fn build(self) -> Result<VideoContext> {
         VideoContext::new(self)
     }
+
+    /// What a caller-created device must provide for pixelforge to decode on it.
+    ///
+    /// Use this when you already have your own Vulkan device (e.g. a renderer's)
+    /// and want to decode into images that device can use directly, without the
+    /// cross-device copy a separate context would require. The flow is:
+    ///
+    /// 1. Pick a physical device that supports both your needs and decode (this
+    ///    call fails if `physical_device` cannot decode the required codecs).
+    /// 2. Merge the returned queue families and extensions with your own, create
+    ///    one logical device, and enable the `synchronization2` feature.
+    /// 3. Adopt it with [`VideoContext::from_existing_decode`].
+    ///
+    /// Only the decode path is covered; encoding still needs [`Self::build`].
+    pub fn decode_device_requirements(
+        &self,
+        entry: &ash::Entry,
+        instance: &ash::Instance,
+        physical_device: vk::PhysicalDevice,
+    ) -> Result<DeviceRequirements> {
+        let families = find_decode_queue_families(
+            entry,
+            instance,
+            physical_device,
+            &self.required_decode_codecs,
+        )?;
+        Ok(DeviceRequirements {
+            queue_families: families.unique(),
+            extensions: decode_extension_names(&self.required_decode_codecs),
+        })
+    }
+
+    /// Adopt a caller-created device for decoding, rather than creating one.
+    ///
+    /// The device must have been created with the queue families and extensions
+    /// reported by [`Self::decode_device_requirements`] for the same
+    /// `physical_device`, and with the `synchronization2` feature enabled. The
+    /// resulting context **borrows** `instance` and `device`: dropping it frees
+    /// neither, so the caller must keep both alive for at least as long as the
+    /// context and anything decoded with it.
+    pub fn build_from_existing_decode(
+        self,
+        entry: ash::Entry,
+        instance: ash::Instance,
+        physical_device: vk::PhysicalDevice,
+        device: ash::Device,
+    ) -> Result<VideoContext> {
+        VideoContext::from_existing_decode(
+            self.required_decode_codecs,
+            entry,
+            instance,
+            physical_device,
+            device,
+        )
+    }
+}
+
+/// Queue families and extensions a caller's device must provide to decode.
+///
+/// Returned by [`VideoContextBuilder::decode_device_requirements`].
+#[derive(Debug, Clone)]
+pub struct DeviceRequirements {
+    /// Queue families pixelforge needs a queue created for. Merge these with
+    /// your own (deduplicated) when building the device.
+    pub queue_families: Vec<u32>,
+    /// Device extensions pixelforge needs enabled. Merge with your own.
+    pub extensions: Vec<&'static std::ffi::CStr>,
+}
+
+/// The queue families pixelforge selects for decoding on a given device.
+struct DecodeQueueFamilies {
+    decode: u32,
+    transfer: u32,
+    compute: u32,
+}
+
+impl DecodeQueueFamilies {
+    /// The distinct families, in a stable order.
+    fn unique(&self) -> Vec<u32> {
+        let mut out = vec![self.decode];
+        for f in [self.transfer, self.compute] {
+            if !out.contains(&f) {
+                out.push(f);
+            }
+        }
+        out
+    }
+}
+
+/// Select the decode / transfer / compute queue families on `physical_device`,
+/// failing if it cannot decode the required codecs.
+///
+/// Mirrors the selection [`VideoContext::new`] does inline, but scoped to the
+/// decode path: a video-decode family, a transfer family (preferring a
+/// dedicated engine over one that also does video — see the scoring), and any
+/// compute family.
+fn find_decode_queue_families(
+    entry: &ash::Entry,
+    instance: &ash::Instance,
+    physical_device: vk::PhysicalDevice,
+    decode_codecs: &[Codec],
+) -> Result<DecodeQueueFamilies> {
+    let queue_families =
+        unsafe { instance.get_physical_device_queue_family_properties(physical_device) };
+
+    let mut decode = None;
+    let mut transfer = u32::MAX;
+    let mut transfer_score = -1i32;
+    let mut compute = u32::MAX;
+
+    for (idx, props) in queue_families.iter().enumerate() {
+        let idx = idx as u32;
+        let flags = props.queue_flags;
+
+        if flags.contains(vk::QueueFlags::VIDEO_DECODE_KHR) {
+            decode = Some(idx);
+        }
+        if flags.contains(vk::QueueFlags::TRANSFER) {
+            let is_video = flags
+                .intersects(vk::QueueFlags::VIDEO_ENCODE_KHR | vk::QueueFlags::VIDEO_DECODE_KHR);
+            let score = if is_video {
+                0
+            } else if flags.contains(vk::QueueFlags::GRAPHICS) {
+                1
+            } else if flags.contains(vk::QueueFlags::COMPUTE) {
+                2
+            } else {
+                3
+            };
+            if score > transfer_score {
+                transfer_score = score;
+                transfer = idx;
+            }
+        }
+        if flags.contains(vk::QueueFlags::COMPUTE) && compute == u32::MAX {
+            compute = idx;
+        }
+    }
+
+    let decode = decode.ok_or_else(|| {
+        PixelForgeError::NoSuitableDevice(
+            "Physical device has no video decode queue family".to_string(),
+        )
+    })?;
+    if transfer == u32::MAX {
+        return Err(PixelForgeError::NoSuitableDevice(
+            "Physical device has no transfer queue family".to_string(),
+        ));
+    }
+    if compute == u32::MAX {
+        return Err(PixelForgeError::NoSuitableDevice(
+            "Physical device has no compute queue family".to_string(),
+        ));
+    }
+
+    // Confirm the device actually decodes the codecs asked for.
+    let available = query_decode_codecs(entry, instance, physical_device);
+    for codec in decode_codecs {
+        if !available.contains(codec) {
+            return Err(PixelForgeError::CodecNotSupported(format!(
+                "Physical device does not support decoding {:?}",
+                codec
+            )));
+        }
+    }
+
+    Ok(DecodeQueueFamilies {
+        decode,
+        transfer,
+        compute,
+    })
+}
+
+/// Device extensions required to decode the given codecs.
+fn decode_extension_names(decode_codecs: &[Codec]) -> Vec<&'static std::ffi::CStr> {
+    let mut names = vec![
+        ash::khr::video_queue::NAME,
+        ash::khr::video_decode_queue::NAME,
+        ash::khr::synchronization2::NAME,
+    ];
+    if decode_codecs.contains(&Codec::H264) {
+        names.push(ash::khr::video_decode_h264::NAME);
+    }
+    names
+}
+
+/// The decode codecs `physical_device` supports.
+fn query_decode_codecs(
+    entry: &ash::Entry,
+    instance: &ash::Instance,
+    physical_device: vk::PhysicalDevice,
+) -> Vec<Codec> {
+    let mut codecs = Vec::new();
+    if VideoContext::check_h264_decode_support(entry, instance, physical_device) {
+        codecs.push(Codec::H264);
+    }
+    codecs
 }
 
 /// Inner struct holding the actual Vulkan resources.
@@ -72,6 +277,8 @@ struct VideoContextInner {
     video_encode_queue_family: Option<u32>,
     video_encode_timestamp_valid_bits: u32,
     video_encode_queue: Option<vk::Queue>,
+    video_decode_queue_family: Option<u32>,
+    video_decode_queue: Option<vk::Queue>,
     transfer_queue_family: u32,
     transfer_queue: vk::Queue,
     compute_queue_family: u32,
@@ -79,14 +286,23 @@ struct VideoContextInner {
     memory_properties: vk::PhysicalDeviceMemoryProperties,
     device_properties: vk::PhysicalDeviceProperties,
     supported_encode_codecs: Vec<Codec>,
+    supported_decode_codecs: Vec<Codec>,
     has_descriptor_buffer: bool,
+    /// Whether this context created (and therefore must destroy) the device and
+    /// instance. A context adopted from a caller's device via
+    /// [`VideoContext::from_existing_decode`] borrows them and destroys neither.
+    owns_device: bool,
 }
 
 impl Drop for VideoContextInner {
     fn drop(&mut self) {
-        unsafe {
-            self.device.destroy_device(None);
-            self.instance.destroy_instance(None);
+        // Only tear down the device/instance we created ourselves. An adopted
+        // device is owned by the caller and outlives this context.
+        if self.owns_device {
+            unsafe {
+                self.device.destroy_device(None);
+                self.instance.destroy_instance(None);
+            }
         }
     }
 }
@@ -125,6 +341,14 @@ impl VideoContext {
     /// (VUID-vkCmdWriteTimestamp-timestampValidBits-00829).
     pub(crate) fn encode_timestamps_supported(&self) -> bool {
         self.inner.video_encode_timestamp_valid_bits > 0
+    }
+
+    pub(crate) fn video_decode_queue_family(&self) -> Option<u32> {
+        self.inner.video_decode_queue_family
+    }
+
+    pub(crate) fn video_decode_queue(&self) -> Option<vk::Queue> {
+        self.inner.video_decode_queue
     }
 
     /// Get the transfer queue family index.
@@ -252,9 +476,11 @@ impl VideoContext {
         let mut selected_device_exts = None;
         let mut video_encode_queue_family = None;
         let mut video_encode_timestamp_valid_bits = 0u32;
+        let mut video_decode_queue_family = None;
         let mut transfer_queue_family = u32::MAX;
         let mut compute_queue_family = u32::MAX;
         let mut supported_encode_codecs = Vec::new();
+        let mut supported_decode_codecs = Vec::new();
         let mut has_descriptor_buffer_ext = false;
 
         let has_extension =
@@ -278,7 +504,9 @@ impl VideoContext {
             // Find queue families.
             let mut encode_queue = None;
             let mut encode_ts_bits = 0u32;
+            let mut decode_queue = None;
             let mut transfer_q = u32::MAX;
+            let mut transfer_score = -1i32;
             let mut compute_q = u32::MAX;
 
             for (idx, props) in queue_families.iter().enumerate() {
@@ -286,21 +514,51 @@ impl VideoContext {
                     "Queue family {}: flags={:?}, count={}",
                     idx, props.queue_flags, props.queue_count
                 );
+                let flags = props.queue_flags;
 
                 // Check for video encode queue.
-                if props.queue_flags.contains(vk::QueueFlags::VIDEO_ENCODE_KHR) {
+                if flags.contains(vk::QueueFlags::VIDEO_ENCODE_KHR) {
                     encode_queue = Some(idx as u32);
                     encode_ts_bits = props.timestamp_valid_bits;
                     debug!("Found video encode queue at family {}", idx);
                 }
 
-                // Check for transfer queue.
-                if props.queue_flags.contains(vk::QueueFlags::TRANSFER) {
-                    transfer_q = idx as u32;
+                // Check for video decode queue.
+                if flags.contains(vk::QueueFlags::VIDEO_DECODE_KHR) {
+                    decode_queue = Some(idx as u32);
+                    debug!("Found video decode queue at family {}", idx);
+                }
+
+                // Pick the transfer queue by preference, not by last-wins. The
+                // readback copy runs here, so a family that also does video
+                // (encode or decode) is the worst choice: it contends with our
+                // own encode/decode work and, on some drivers, shares a single
+                // VkQueue that would then need external synchronization. Among
+                // the rest, prefer the least capable family: a dedicated DMA
+                // engine first, then compute+transfer, and only then the
+                // graphics queue (which a downstream app typically drives for
+                // rendering and present).
+                if flags.contains(vk::QueueFlags::TRANSFER) {
+                    let is_video = flags.intersects(
+                        vk::QueueFlags::VIDEO_ENCODE_KHR | vk::QueueFlags::VIDEO_DECODE_KHR,
+                    );
+                    let score = if is_video {
+                        0 // shares a video engine; last resort
+                    } else if flags.contains(vk::QueueFlags::GRAPHICS) {
+                        1 // the universal graphics queue
+                    } else if flags.contains(vk::QueueFlags::COMPUTE) {
+                        2 // compute + transfer
+                    } else {
+                        3 // dedicated transfer engine
+                    };
+                    if score > transfer_score {
+                        transfer_score = score;
+                        transfer_q = idx as u32;
+                    }
                 }
 
                 // Check for compute queue (prefer dedicated compute, otherwise graphics+compute).
-                if props.queue_flags.contains(vk::QueueFlags::COMPUTE) && compute_q == u32::MAX {
+                if flags.contains(vk::QueueFlags::COMPUTE) && compute_q == u32::MAX {
                     compute_q = idx as u32;
                     debug!("Found compute queue at family {}", idx);
                 }
@@ -348,21 +606,48 @@ impl VideoContext {
                 }
             }
 
-            // Check if all required encode codecs are supported.
+            // Check codec support for decoding.
+            let mut decode_codecs = Vec::new();
+            if decode_queue.is_some() {
+                let available_extensions =
+                    unsafe { instance.enumerate_device_extension_properties(physical_device) }
+                        .unwrap_or_default();
+                let has_extension = |name: &std::ffi::CStr| -> bool {
+                    available_extensions.iter().any(|ext| {
+                        let ext_name =
+                            unsafe { std::ffi::CStr::from_ptr(ext.extension_name.as_ptr()) };
+                        ext_name == name
+                    })
+                };
+
+                if has_extension(ash::khr::video_decode_h264::NAME)
+                    && Self::check_h264_decode_support(&entry, &instance, physical_device)
+                {
+                    decode_codecs.push(Codec::H264);
+                    debug!("Device {} supports H.264 decode", device_name);
+                }
+            }
+
+            // Check if all required encode/decode codecs are supported.
             let encode_supported = builder
                 .required_encode_codecs
                 .iter()
                 .all(|codec| encode_codecs.contains(codec));
+            let decode_supported = builder
+                .required_decode_codecs
+                .iter()
+                .all(|codec| decode_codecs.contains(codec));
 
-            // We need encode support and compute support.
-            let has_video_support = encode_queue.is_some();
+            // We need at least one video queue, and compute support.
+            let has_video_support = encode_queue.is_some() || decode_queue.is_some();
             let has_compute_support = compute_q != u32::MAX;
 
-            if has_video_support && encode_supported && has_compute_support {
+            if has_video_support && encode_supported && decode_supported && has_compute_support {
                 selected_device = Some(physical_device);
                 selected_device_exts = Some(available_extensions);
                 video_encode_queue_family = encode_queue;
                 video_encode_timestamp_valid_bits = encode_ts_bits;
+                video_decode_queue_family = decode_queue;
                 transfer_queue_family = if transfer_q != u32::MAX {
                     transfer_q
                 } else {
@@ -370,22 +655,34 @@ impl VideoContext {
                 };
                 compute_queue_family = compute_q;
                 supported_encode_codecs = encode_codecs;
+                supported_decode_codecs = decode_codecs;
                 info!("Selected device: {}", device_name);
                 break;
             } else {
                 warn!(
-                    "Device {} skipped: video_support={}, encode_supported={}, compute_support={}",
-                    device_name, has_video_support, encode_supported, has_compute_support
+                    "Device {} skipped: video_support={}, encode_supported={}, decode_supported={}, compute_support={}",
+                    device_name,
+                    has_video_support,
+                    encode_supported,
+                    decode_supported,
+                    has_compute_support
                 );
                 if !has_video_support {
                     warn!("  - No queue with VIDEO_ENCODE_KHR flag found");
                 }
                 if !encode_supported {
                     warn!(
-                        "  - Required codecs not supported: {:?}",
+                        "  - Required encode codecs not supported: {:?}",
                         builder.required_encode_codecs
                     );
-                    warn!("  - Available codecs: {:?}", encode_codecs);
+                    warn!("  - Available encode codecs: {:?}", encode_codecs);
+                }
+                if !decode_supported {
+                    warn!(
+                        "  - Required decode codecs not supported: {:?}",
+                        builder.required_decode_codecs
+                    );
+                    warn!("  - Available decode codecs: {:?}", decode_codecs);
                 }
             }
         }
@@ -408,6 +705,11 @@ impl VideoContext {
         let mut unique_families = Vec::new();
         if let Some(encode_family) = video_encode_queue_family {
             unique_families.push(encode_family);
+        }
+        if let Some(decode_family) = video_decode_queue_family
+            && !unique_families.contains(&decode_family)
+        {
+            unique_families.push(decode_family);
         }
         if !unique_families.contains(&transfer_queue_family) {
             unique_families.push(transfer_queue_family);
@@ -456,6 +758,13 @@ impl VideoContext {
             }
             if supported_encode_codecs.contains(&Codec::AV1) {
                 push_ext(ash::khr::video_encode_av1::NAME.as_ptr());
+            }
+        }
+        if video_decode_queue_family.is_some() && !supported_decode_codecs.is_empty() {
+            push_ext(ash::khr::video_decode_queue::NAME.as_ptr());
+
+            if supported_decode_codecs.contains(&Codec::H264) {
+                push_ext(ash::khr::video_decode_h264::NAME.as_ptr());
             }
         }
 
@@ -585,11 +894,16 @@ impl VideoContext {
         // Get queues.
         let video_encode_queue =
             video_encode_queue_family.map(|family| unsafe { device.get_device_queue(family, 0) });
+        let video_decode_queue =
+            video_decode_queue_family.map(|family| unsafe { device.get_device_queue(family, 0) });
         let transfer_queue = unsafe { device.get_device_queue(transfer_queue_family, 0) };
         let compute_queue = unsafe { device.get_device_queue(compute_queue_family, 0) };
 
         if let Some(family) = video_encode_queue_family {
             info!("Video encode queue family: {}", family);
+        }
+        if let Some(family) = video_decode_queue_family {
+            info!("Video decode queue family: {}", family);
         }
         info!("Transfer queue family: {}", transfer_queue_family);
         info!("Compute queue family: {}", compute_queue_family);
@@ -604,6 +918,8 @@ impl VideoContext {
                 video_encode_queue_family,
                 video_encode_timestamp_valid_bits,
                 video_encode_queue,
+                video_decode_queue_family,
+                video_decode_queue,
                 transfer_queue_family,
                 transfer_queue,
                 compute_queue_family,
@@ -611,7 +927,68 @@ impl VideoContext {
                 memory_properties,
                 device_properties,
                 supported_encode_codecs,
+                supported_decode_codecs,
                 has_descriptor_buffer,
+                owns_device: true,
+            }),
+        })
+    }
+
+    /// Adopt a caller-created device for decoding.
+    ///
+    /// See [`VideoContextBuilder::build_from_existing_decode`], the public entry
+    /// point. The returned context borrows `instance` and `device` and destroys
+    /// neither on drop.
+    fn from_existing_decode(
+        required_decode_codecs: Vec<Codec>,
+        entry: ash::Entry,
+        instance: ash::Instance,
+        physical_device: vk::PhysicalDevice,
+        device: ash::Device,
+    ) -> Result<VideoContext> {
+        let families = find_decode_queue_families(
+            &entry,
+            &instance,
+            physical_device,
+            &required_decode_codecs,
+        )?;
+
+        let device_properties = unsafe { instance.get_physical_device_properties(physical_device) };
+        let memory_properties =
+            unsafe { instance.get_physical_device_memory_properties(physical_device) };
+
+        // The caller created a queue for each family (from device_requirements).
+        let video_decode_queue = unsafe { device.get_device_queue(families.decode, 0) };
+        let transfer_queue = unsafe { device.get_device_queue(families.transfer, 0) };
+        let compute_queue = unsafe { device.get_device_queue(families.compute, 0) };
+
+        let supported_decode_codecs = query_decode_codecs(&entry, &instance, physical_device);
+
+        info!(
+            "Adopted caller device for decode: decode family {}, transfer family {}, compute family {}",
+            families.decode, families.transfer, families.compute
+        );
+
+        Ok(VideoContext {
+            inner: std::sync::Arc::new(VideoContextInner {
+                entry,
+                instance,
+                physical_device,
+                device,
+                video_encode_queue_family: None,
+                video_encode_queue: None,
+                video_decode_queue_family: Some(families.decode),
+                video_decode_queue: Some(video_decode_queue),
+                transfer_queue_family: families.transfer,
+                transfer_queue,
+                compute_queue_family: families.compute,
+                compute_queue,
+                memory_properties,
+                device_properties,
+                supported_encode_codecs: Vec::new(),
+                supported_decode_codecs,
+                has_descriptor_buffer: false,
+                owns_device: false,
             }),
         })
     }
@@ -793,8 +1170,69 @@ impl VideoContext {
     }
 
     /// Check if a codec is supported for encoding.
+    fn check_h264_decode_support(
+        entry: &ash::Entry,
+        instance: &ash::Instance,
+        physical_device: vk::PhysicalDevice,
+    ) -> bool {
+        let video_queue = ash::khr::video_queue::Instance::load(entry, instance);
+
+        // H.264 decode profile: High profile, progressive, 8-bit 4:2:0.
+        let mut h264_profile = vk::VideoDecodeH264ProfileInfoKHR::default()
+            .std_profile_idc(
+                ash::vk::native::StdVideoH264ProfileIdc_STD_VIDEO_H264_PROFILE_IDC_HIGH,
+            )
+            .picture_layout(vk::VideoDecodeH264PictureLayoutFlagsKHR::PROGRESSIVE);
+
+        let profile_info = vk::VideoProfileInfoKHR::default()
+            .video_codec_operation(vk::VideoCodecOperationFlagsKHR::DECODE_H264)
+            .chroma_subsampling(vk::VideoChromaSubsamplingFlagsKHR::TYPE_420)
+            .luma_bit_depth(vk::VideoComponentBitDepthFlagsKHR::TYPE_8)
+            .chroma_bit_depth(vk::VideoComponentBitDepthFlagsKHR::TYPE_8)
+            .push(&mut h264_profile);
+
+        let mut h264_capabilities = vk::VideoDecodeH264CapabilitiesKHR::default();
+        let mut decode_capabilities = vk::VideoDecodeCapabilitiesKHR::default();
+        let mut capabilities = vk::VideoCapabilitiesKHR::default()
+            .push(&mut h264_capabilities)
+            .push(&mut decode_capabilities);
+
+        let result = unsafe {
+            (video_queue.fp().get_physical_device_video_capabilities_khr)(
+                physical_device,
+                &profile_info,
+                &mut capabilities,
+            )
+        };
+
+        match result {
+            vk::Result::SUCCESS => {
+                debug!(
+                    "H.264 decode supported: max {}x{}, {} DPB slots",
+                    capabilities.max_coded_extent.width,
+                    capabilities.max_coded_extent.height,
+                    capabilities.max_dpb_slots
+                );
+                true
+            }
+            vk::Result::ERROR_VIDEO_PROFILE_CODEC_NOT_SUPPORTED_KHR => {
+                debug!("H.264 decode not supported on this device");
+                false
+            }
+            _ => {
+                warn!("Failed to query H.264 decode capabilities: {:?}", result);
+                false
+            }
+        }
+    }
+
     pub fn supports_encode(&self, codec: Codec) -> bool {
         self.inner.supported_encode_codecs.contains(&codec)
+    }
+
+    /// Check if the selected device supports decoding the given codec.
+    pub fn supports_decode(&self, codec: Codec) -> bool {
+        self.inner.supported_decode_codecs.contains(&codec)
     }
 
     /// Get the Vulkan entry point.

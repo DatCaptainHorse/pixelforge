@@ -284,6 +284,7 @@ impl EncodePipeline {
             let (bitstream_buffer, bitstream_buffer_memory) = create_bitstream_buffer(
                 context,
                 config.bitstream_buffer_size,
+                vk::BufferUsageFlags::VIDEO_ENCODE_DST_KHR,
                 config.profile_info,
             )?;
             let bitstream_buffer_ptr = map_bitstream_buffer(
