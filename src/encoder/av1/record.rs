@@ -6,7 +6,8 @@ use super::Av1;
 use crate::encoder::codec::{EncoderCommon, FramePlan, RateControlPlan};
 use crate::encoder::pipeline::EncodeFuture;
 use crate::encoder::resources::{
-    prepare_encode_command_buffer, record_dpb_barriers, record_post_encode_dpb_barrier,
+    end_timestamp, prepare_encode_command_buffer, record_dpb_barriers,
+    record_post_encode_dpb_barrier, reset_start_timestamp,
 };
 use crate::error::{PixelForgeError, Result};
 use ash::vk;
@@ -28,6 +29,7 @@ impl Av1 {
         let slot = common.pipeline.current();
         let command_buffer = slot.encode_command_buffer;
         let query_pool = slot.query_pool;
+        let timestamp_query_pool = slot.timestamp_query_pool;
         let bitstream_buffer = slot.bitstream_buffer;
         let bitstream_buffer_size = slot.bitstream_buffer_size;
         let input_image_view = slot.input_image_view;
@@ -328,6 +330,9 @@ impl Av1 {
             .consecutive_bipredictive_frame_count(0)
             .temporal_layer_count(1);
 
+        // Reset and write start timestamp
+        reset_start_timestamp(common.device(), command_buffer, timestamp_query_pool);
+
         let begin_coding_info = if is_first_frame {
             vk::VideoBeginCodingInfoKHR::default()
                 .video_session(common.session)
@@ -399,6 +404,9 @@ impl Av1 {
                 .video_encode_fn
                 .cmd_encode_video(command_buffer, &encode_info);
             device.cmd_end_query(command_buffer, query_pool, 0);
+
+            // Write end timestamp
+            end_timestamp(common.device(), command_buffer, timestamp_query_pool);
 
             record_post_encode_dpb_barrier(
                 device,

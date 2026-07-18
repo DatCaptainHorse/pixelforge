@@ -144,6 +144,14 @@ let mut converter = ColorConverter::new(context.clone(), config)?;
 // converter.convert(input_image, output_buffer)?;
 ```
 
+## Benchmarking
+
+Run the encode latency benchmark with:
+
+```
+cargo run --example encode_bench
+```
+
 ## Examples
 
 Run the examples with:

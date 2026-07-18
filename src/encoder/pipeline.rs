@@ -40,8 +40,9 @@ use futures_channel::oneshot;
 
 use crate::encoder::resources::{
     ClearImageParams, clear_input_image, create_bitstream_buffer,
-    create_encode_feedback_query_pool, create_image, create_timeline_semaphore,
-    map_bitstream_buffer, submit_encode_only, wait_and_read_bitstream,
+    create_encode_feedback_query_pool, create_encode_timestamp_query_pool, create_image,
+    create_timeline_semaphore, map_bitstream_buffer, query_timestamp_diff, submit_encode_only,
+    wait_and_read_bitstream,
 };
 use crate::encoder::{BitDepth, EncodedPacket, FrameType, PixelFormat};
 use crate::error::{PixelForgeError, Result};
@@ -98,6 +99,8 @@ pub(crate) struct SlotPacketMetadata {
     /// Codec header (SPS/PPS, VPS/SPS/PPS, or AV1 sequence header) to prepend.
     /// `Some` only for frames that carry one (e.g. the IDR/key frame).
     pub header: Option<Vec<u8>>,
+    pub timestamps: [u64; 2],
+    pub now: std::time::Instant,
 }
 
 /// A raw pointer wrapper asserting `Send` so the persistently-mapped bitstream
@@ -117,6 +120,10 @@ struct WorkItem {
     query_pool: vk::QueryPool,
     bitstream_ptr: SendPtr,
     metadata: SlotPacketMetadata,
+    /// Timestamping resources
+    timestamp_period: f32,
+    timestamp_query_pool: vk::QueryPool,
+    submit_time: std::time::Instant,
     /// Resolves this frame's [`EncodeFuture`] once the bitstream is read back.
     result_tx: oneshot::Sender<Result<EncodedPacket>>,
 }
@@ -181,6 +188,9 @@ pub(crate) struct EncodeSlot {
     pub encode_command_buffer: vk::CommandBuffer,
     pub encode_fence: vk::Fence,
     pub query_pool: vk::QueryPool,
+
+    pub timestamp_period: f32,
+    pub timestamp_query_pool: vk::QueryPool,
 
     /// Packet metadata recorded before submit, moved to the completion thread
     /// with the work item.
@@ -290,6 +300,15 @@ impl EncodePipeline {
             let mut profile = *config.profile_info;
             let query_pool = create_encode_feedback_query_pool(context, &mut profile)?;
 
+            let timestamp_query_pool = create_encode_timestamp_query_pool(context)?;
+            let timestamp_period = unsafe {
+                context
+                    .instance()
+                    .get_physical_device_properties(context.physical_device())
+                    .limits
+                    .timestamp_period
+            };
+
             slots.push(EncodeSlot {
                 input_image,
                 input_image_memory,
@@ -302,6 +321,8 @@ impl EncodePipeline {
                 encode_command_buffer,
                 encode_fence,
                 query_pool,
+                timestamp_period,
+                timestamp_query_pool,
                 pending_metadata: None,
             });
         }
@@ -384,7 +405,15 @@ impl EncodePipeline {
 
         // Capture the Copy handles + metadata, releasing the slot borrow before
         // touching the cross-thread channels.
-        let (command_buffer, fence, query_pool, bitstream_ptr, metadata) = {
+        let (
+            command_buffer,
+            fence,
+            query_pool,
+            bitstream_ptr,
+            timestamp_period,
+            timestamp_query_pool,
+            metadata,
+        ) = {
             let slot = &mut self.slots[slot_index];
             let metadata = slot.pending_metadata.take().ok_or_else(|| {
                 PixelForgeError::CommandBuffer(
@@ -396,6 +425,8 @@ impl EncodePipeline {
                 slot.encode_fence,
                 slot.query_pool,
                 slot.bitstream_buffer_ptr as *const u8,
+                slot.timestamp_period,
+                slot.timestamp_query_pool,
                 metadata,
             )
         };
@@ -410,6 +441,7 @@ impl EncodePipeline {
                 Some((self.timeline, signal_value)),
             )?;
         }
+        let submit_time = std::time::Instant::now();
 
         self.last_value = signal_value;
         self.next_value = signal_value + 1;
@@ -424,6 +456,9 @@ impl EncodePipeline {
             fence,
             query_pool,
             bitstream_ptr: SendPtr(bitstream_ptr),
+            timestamp_period,
+            timestamp_query_pool,
+            submit_time,
             metadata,
             result_tx,
         };
@@ -479,6 +514,7 @@ impl EncodePipeline {
                 slot.bitstream_buffer_ptr = std::ptr::null_mut();
             }
             unsafe {
+                device.destroy_query_pool(slot.timestamp_query_pool, None);
                 device.destroy_query_pool(slot.query_pool, None);
                 device.destroy_fence(slot.encode_fence, None);
                 device.destroy_buffer(slot.bitstream_buffer, None);
@@ -514,6 +550,25 @@ fn run_completion_thread(
                 &mut data,
             )
         };
+        let bitstream_ready_time = std::time::Instant::now();
+
+        let mut stats: Option<super::EncodedPacketStats> = None;
+        if let Some(gpu_encode_ns) = unsafe {
+            query_timestamp_diff(
+                &device,
+                work.timestamp_query_pool,
+                work.metadata.timestamps,
+                work.timestamp_period,
+            )
+        } {
+            stats = Some(super::EncodedPacketStats {
+                gpu_time_ns: gpu_encode_ns,
+                frame_latency_ns: work.metadata.now.elapsed().as_nanos() as u64,
+                wall_latency_ns: bitstream_ready_time
+                    .duration_since(work.submit_time)
+                    .as_nanos() as u64,
+            });
+        }
 
         let packet = result.map(|()| EncodedPacket {
             data,
@@ -521,6 +576,7 @@ fn run_completion_thread(
             is_key_frame: work.metadata.is_key_frame,
             pts: work.metadata.pts,
             dts: work.metadata.dts,
+            stats,
         });
 
         // Resolve the future *before* freeing the slot. This ordering means that

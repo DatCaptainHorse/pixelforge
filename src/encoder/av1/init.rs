@@ -33,13 +33,24 @@ impl Av1 {
         let chroma_subsampling: vk::VideoChromaSubsamplingFlagsKHR = config.pixel_format.into();
         let bit_depth: vk::VideoComponentBitDepthFlagsKHR = config.bit_depth.into();
 
+        // Get encoder tuning mode, usage and content hints.
+        let encode_usage_hint: vk::VideoEncodeUsageFlagsKHR = config.encode_usage_hint.into();
+        let encode_content_hint: vk::VideoEncodeContentFlagsKHR = config.encode_content_hint.into();
+        let encoder_tuning_mode: vk::VideoEncodeTuningModeKHR = config.encoder_tuning_mode.into();
+
+        let mut video_encode_usage_info = vk::VideoEncodeUsageInfoKHR::default()
+            .video_usage_hints(encode_usage_hint)
+            .video_content_hints(encode_content_hint)
+            .tuning_mode(encoder_tuning_mode);
+
         let mut av1_profile_info = vk::VideoEncodeAV1ProfileInfoKHR::default().std_profile(profile);
         let profile_info = vk::VideoProfileInfoKHR::default()
             .video_codec_operation(vk::VideoCodecOperationFlagsKHR::ENCODE_AV1)
             .chroma_subsampling(chroma_subsampling)
             .luma_bit_depth(bit_depth)
             .chroma_bit_depth(bit_depth)
-            .push(&mut av1_profile_info);
+            .push(&mut av1_profile_info)
+            .push(&mut video_encode_usage_info);
 
         let bitstream_buffer_size = MIN_BITSTREAM_BUFFER_SIZE
             .max(config.dimensions.width as usize * config.dimensions.height as usize);

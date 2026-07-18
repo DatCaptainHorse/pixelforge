@@ -5,7 +5,9 @@ use super::H264;
 
 use crate::encoder::codec::{EncoderCommon, FramePlan, RateControlPlan};
 use crate::encoder::pipeline::EncodeFuture;
-use crate::encoder::resources::{prepare_encode_command_buffer, record_dpb_barriers};
+use crate::encoder::resources::{
+    end_timestamp, prepare_encode_command_buffer, record_dpb_barriers, reset_start_timestamp,
+};
 use crate::error::{PixelForgeError, Result};
 use ash::vk;
 use ash::vk::TaggedStructure;
@@ -26,6 +28,7 @@ impl H264 {
         let slot = common.pipeline.current();
         let command_buffer = slot.encode_command_buffer;
         let query_pool = slot.query_pool;
+        let timestamp_query_pool = slot.timestamp_query_pool;
         let bitstream_buffer = slot.bitstream_buffer;
         let bitstream_buffer_size = slot.bitstream_buffer_size;
         let input_image_view = slot.input_image_view;
@@ -465,6 +468,9 @@ impl H264 {
                 .initial_virtual_buffer_size_in_ms(common.config.initial_virtual_buffer_size_ms);
         }
 
+        // Reset and write start timestamp
+        reset_start_timestamp(common.device(), command_buffer, timestamp_query_pool);
+
         // For the first frame, configure rate control via the control command
         // after RESET rather than in begin_coding.
         let is_first_frame = plan.is_first_frame();
@@ -519,6 +525,9 @@ impl H264 {
             );
             (common.video_encode_fn.fp().cmd_encode_video_khr)(command_buffer, &encode_info);
             device.cmd_end_query(command_buffer, query_pool, 0);
+
+            // Write end timestamp
+            end_timestamp(common.device(), command_buffer, timestamp_query_pool);
 
             let end_info = vk::VideoEndCodingInfoKHR::default();
             (common.video_queue_fn.fp().cmd_end_video_coding_khr)(command_buffer, &end_info);
