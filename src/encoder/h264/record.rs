@@ -469,9 +469,7 @@ impl H264 {
         }
 
         // Reset and write start timestamp
-        unsafe {
-            reset_start_timestamp(common.device(), command_buffer, timestamp_query_pool);
-        }
+        reset_start_timestamp(common.device(), command_buffer, timestamp_query_pool);
 
         // For the first frame, configure rate control via the control command
         // after RESET rather than in begin_coding.

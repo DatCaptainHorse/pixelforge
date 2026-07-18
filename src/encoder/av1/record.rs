@@ -331,9 +331,7 @@ impl Av1 {
             .temporal_layer_count(1);
 
         // Reset and write start timestamp
-        unsafe {
-            reset_start_timestamp(common.device(), command_buffer, timestamp_query_pool);
-        }
+        reset_start_timestamp(common.device(), command_buffer, timestamp_query_pool);
 
         let begin_coding_info = if is_first_frame {
             vk::VideoBeginCodingInfoKHR::default()

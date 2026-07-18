@@ -1596,8 +1596,8 @@ pub(crate) fn get_encoded_session_params(
     }
 }
 
-/// Resets and writes first timestamp command
-pub(crate) unsafe fn reset_start_timestamp(
+/// Resets the given query pool and writes starting timestamp command.
+pub(crate) fn reset_start_timestamp(
     device: &ash::Device,
     command_buffer: vk::CommandBuffer,
     query_pool: vk::QueryPool,
@@ -1613,7 +1613,8 @@ pub(crate) unsafe fn reset_start_timestamp(
     }
 }
 
-pub(crate) unsafe fn end_timestamp(
+/// Writes ending timestamp command to the given query pool.
+pub(crate) fn end_timestamp(
     device: &ash::Device,
     command_buffer: vk::CommandBuffer,
     query_pool: vk::QueryPool,
@@ -1628,7 +1629,11 @@ pub(crate) unsafe fn end_timestamp(
     }
 }
 
-/// Queries and possibly returns the difference between reset_start_timestamp and end_timestamp calls
+/// Queries the given query pool for recorded timestamps, returning their difference.
+///
+/// # Safety
+/// This must only be called if both `reset_start_timestamp` and `end_timestamp`
+///  were previously written and executed for the given query pool.
 pub(crate) unsafe fn query_timestamp_diff(
     device: &ash::Device,
     query_pool: vk::QueryPool,

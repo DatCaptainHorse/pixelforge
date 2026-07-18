@@ -440,9 +440,7 @@ impl H265 {
         }
 
         // Reset and write start timestamp
-        unsafe {
-            reset_start_timestamp(common.device(), command_buffer, timestamp_query_pool);
-        }
+        reset_start_timestamp(common.device(), command_buffer, timestamp_query_pool);
 
         let is_first_frame = plan.is_first_frame();
         let begin_coding_info = if is_first_frame {
