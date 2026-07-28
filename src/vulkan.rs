@@ -240,11 +240,20 @@ impl VideoContext {
             .map_err(|e| PixelForgeError::NoSuitableDevice(e.to_string()))?;
 
         let mut selected_device = None;
+        let mut selected_device_exts = None;
         let mut video_encode_queue_family = None;
         let mut transfer_queue_family = u32::MAX;
         let mut compute_queue_family = u32::MAX;
         let mut supported_encode_codecs = Vec::new();
         let mut has_descriptor_buffer_ext = false;
+
+        let has_extension =
+            |extensions: &Vec<vk::ExtensionProperties>, name: &std::ffi::CStr| -> bool {
+                extensions.iter().any(|ext| {
+                    let ext_name = unsafe { std::ffi::CStr::from_ptr(ext.extension_name.as_ptr()) };
+                    ext_name == name
+                })
+            };
 
         for physical_device in physical_devices {
             let props = unsafe { instance.get_physical_device_properties(physical_device) };
@@ -285,48 +294,41 @@ impl VideoContext {
                 }
             }
 
+            // Get list of available device extensions
+            let available_extensions = match unsafe {
+                instance.enumerate_device_extension_properties(physical_device)
+            } {
+                Ok(exts) => exts,
+                Err(e) => {
+                    warn!(
+                        "Failed to enumerate device extension properties for {}: {}. Skipping device.",
+                        device_name, e
+                    );
+                    continue;
+                }
+            };
+
             // Check codec support for encoding.
             let mut encode_codecs = Vec::new();
             if let Some(eq) = encode_queue {
-                // Get list of available device extensions
-                let available_extensions = match unsafe {
-                    instance.enumerate_device_extension_properties(physical_device)
-                } {
-                    Ok(exts) => exts,
-                    Err(e) => {
-                        warn!(
-                            "Failed to enumerate device extension properties for {}: {}. Skipping device.",
-                            device_name, e
-                        );
-                        continue;
-                    }
-                };
-
-                let has_extension = |name: &std::ffi::CStr| -> bool {
-                    available_extensions.iter().any(|ext| {
-                        let ext_name =
-                            unsafe { std::ffi::CStr::from_ptr(ext.extension_name.as_ptr()) };
-                        ext_name == name
-                    })
-                };
-
                 // Check if descriptor buffer extension is available.
-                has_descriptor_buffer_ext = has_extension(ash::ext::descriptor_buffer::NAME);
+                has_descriptor_buffer_ext =
+                    has_extension(&available_extensions, ash::ext::descriptor_buffer::NAME);
 
                 // Only check codec support if the extension exists
-                if has_extension(ash::khr::video_encode_h264::NAME)
+                if has_extension(&available_extensions, ash::khr::video_encode_h264::NAME)
                     && Self::check_h264_encode_support(&entry, &instance, physical_device, eq)
                 {
                     encode_codecs.push(Codec::H264);
                     debug!("Device {} supports H.264 encode", device_name);
                 }
-                if has_extension(ash::khr::video_encode_h265::NAME)
+                if has_extension(&available_extensions, ash::khr::video_encode_h265::NAME)
                     && Self::check_h265_encode_support(&entry, &instance, physical_device, eq)
                 {
                     encode_codecs.push(Codec::H265);
                     debug!("Device {} supports H.265 encode", device_name);
                 }
-                if has_extension(ash::khr::video_encode_av1::NAME)
+                if has_extension(&available_extensions, ash::khr::video_encode_av1::NAME)
                     && Self::check_av1_encode_support(&entry, &instance, physical_device, eq)
                 {
                     encode_codecs.push(Codec::AV1);
@@ -346,6 +348,7 @@ impl VideoContext {
 
             if has_video_support && encode_supported && has_compute_support {
                 selected_device = Some(physical_device);
+                selected_device_exts = Some(available_extensions);
                 video_encode_queue_family = encode_queue;
                 transfer_queue_family = if transfer_q != u32::MAX {
                     transfer_q
@@ -474,13 +477,20 @@ impl VideoContext {
         let mut ycbcr_features = vk::PhysicalDeviceSamplerYcbcrConversionFeatures::default()
             .sampler_ycbcr_conversion(true);
 
-        // Enable YCbCr 2-plane 444 formats feature (required for YUV444 encoding with NVIDIA).
+        let has_ycbcr_2plane_444_ext = if let Some(device_exts) = selected_device_exts {
+            has_extension(&device_exts, ash::ext::ycbcr_2plane_444_formats::NAME)
+        } else {
+            false
+        };
+
         let mut ycbcr_2plane_444_features =
             vk::PhysicalDeviceYcbcr2Plane444FormatsFeaturesEXT::default()
                 .ycbcr2plane444_formats(true);
 
-        // Add the 2-plane 444 formats extension.
-        push_ext(ash::ext::ycbcr_2plane_444_formats::NAME.as_ptr());
+        if has_ycbcr_2plane_444_ext {
+            // Add the 2-plane 444 formats extension.
+            push_ext(ash::ext::ycbcr_2plane_444_formats::NAME.as_ptr());
+        }
 
         // Enable AV1 video encode feature only if AV1 is supported.
         // Only include AV1 features in the pNext chain when AV1 is actually supported,
@@ -548,8 +558,12 @@ impl VideoContext {
             device_create_info = device_create_info
                 .push(&mut desc_buf_features)
                 .push(&mut buffer_device_address_features)
-                .push(&mut ycbcr_features)
-                .push(&mut ycbcr_2plane_444_features);
+                .push(&mut ycbcr_features);
+
+            // Enable YCbCr 2-plane 444 formats feature (required for YUV444 encoding with NVIDIA).
+            if has_ycbcr_2plane_444_ext {
+                device_create_info = device_create_info.push(&mut ycbcr_2plane_444_features);
+            }
         }
 
         let device = unsafe { instance.create_device(physical_device, &device_create_info, None) }
