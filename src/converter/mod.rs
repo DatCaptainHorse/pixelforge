@@ -770,10 +770,13 @@ impl ColorConverter {
             );
 
             // Transition target image (encoder's input) to TRANSFER_DST layout.
+            // The encoder's init clears the input image and leaves it in
+            // VIDEO_ENCODE_SRC_KHR, so we must use that (not UNDEFINED) as the
+            // old layout on every frame, including the first.
             let target_barrier_to_transfer = vk::ImageMemoryBarrier::default()
-                .src_access_mask(vk::AccessFlags::empty())
+                .src_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE)
                 .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-                .old_layout(vk::ImageLayout::UNDEFINED)
+                .old_layout(vk::ImageLayout::VIDEO_ENCODE_SRC_KHR)
                 .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
                 .image(target_image)
                 .subresource_range(vk::ImageSubresourceRange {
@@ -786,7 +789,7 @@ impl ColorConverter {
 
             device.cmd_pipeline_barrier(
                 self.command_buffer,
-                vk::PipelineStageFlags::TOP_OF_PIPE,
+                vk::PipelineStageFlags::ALL_COMMANDS,
                 vk::PipelineStageFlags::TRANSFER,
                 vk::DependencyFlags::empty(),
                 &[],

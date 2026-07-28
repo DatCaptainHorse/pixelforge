@@ -77,8 +77,10 @@ impl Av1 {
             // array and `1 << slot` refresh mask can represent).
             max_active_refs_cap: 7,
             bitstream_buffer_size,
-            // AV1 reference handling here does not use a layered DPB.
-            allow_layered_dpb: false,
+            // Allow the shared infrastructure to fall back to a layered DPB
+            // when the driver does not support separate reference images
+            // (required for AMD RADV).
+            allow_layered_dpb: true,
         })?;
         let active_reference_count = init.active_reference_count;
         let common = init.common;

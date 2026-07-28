@@ -324,9 +324,12 @@ impl Av1 {
         all_reference_slots.extend_from_slice(&reference_slots);
 
         let is_first_frame = plan.is_first_frame();
+        // Clamp GOP values to at least 1; a value of 0 is undefined in
+        // Vulkan and causes undefined behavior on some drivers (RADV).
+        let gop_frames = common.config.gop_size.max(1);
         let mut av1_rc_info = vk::VideoEncodeAV1RateControlInfoKHR::default()
-            .gop_frame_count(common.config.gop_size)
-            .key_frame_period(common.config.gop_size)
+            .gop_frame_count(gop_frames)
+            .key_frame_period(gop_frames)
             .consecutive_bipredictive_frame_count(0)
             .temporal_layer_count(1);
 
