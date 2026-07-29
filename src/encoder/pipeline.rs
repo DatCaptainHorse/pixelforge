@@ -526,8 +526,12 @@ impl EncodePipeline {
                 }
                 slot.bitstream_buffer_ptr = std::ptr::null_mut();
             }
+            if slot.timestamp_query_pool != vk::QueryPool::null() {
+                unsafe {
+                    device.destroy_query_pool(slot.timestamp_query_pool, None);
+                }
+            }
             unsafe {
-                device.destroy_query_pool(slot.timestamp_query_pool, None);
                 device.destroy_query_pool(slot.query_pool, None);
                 device.destroy_fence(slot.encode_fence, None);
                 device.destroy_buffer(slot.bitstream_buffer, None);
