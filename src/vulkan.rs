@@ -70,6 +70,7 @@ struct VideoContextInner {
     physical_device: vk::PhysicalDevice,
     device: ash::Device,
     video_encode_queue_family: Option<u32>,
+    video_encode_timestamp_valid_bits: u32,
     video_encode_queue: Option<vk::Queue>,
     transfer_queue_family: u32,
     transfer_queue: vk::Queue,
@@ -116,6 +117,14 @@ impl VideoContext {
 
     pub(crate) fn video_encode_queue(&self) -> Option<vk::Queue> {
         self.inner.video_encode_queue
+    }
+
+    /// Whether the selected video encode queue family supports timestamp
+    /// queries, i.e. reports a non-zero `timestampValidBits`. RADV's dedicated
+    /// video encode queue reports 0, so `vkCmdWriteTimestamp` is illegal there
+    /// (VUID-vkCmdWriteTimestamp-timestampValidBits-00829).
+    pub(crate) fn encode_timestamps_supported(&self) -> bool {
+        self.inner.video_encode_timestamp_valid_bits > 0
     }
 
     /// Get the transfer queue family index.
@@ -241,6 +250,7 @@ impl VideoContext {
 
         let mut selected_device = None;
         let mut video_encode_queue_family = None;
+        let mut video_encode_timestamp_valid_bits = 0u32;
         let mut transfer_queue_family = u32::MAX;
         let mut compute_queue_family = u32::MAX;
         let mut supported_encode_codecs = Vec::new();
@@ -258,6 +268,7 @@ impl VideoContext {
 
             // Find queue families.
             let mut encode_queue = None;
+            let mut encode_ts_bits = 0u32;
             let mut transfer_q = u32::MAX;
             let mut compute_q = u32::MAX;
 
@@ -270,6 +281,7 @@ impl VideoContext {
                 // Check for video encode queue.
                 if props.queue_flags.contains(vk::QueueFlags::VIDEO_ENCODE_KHR) {
                     encode_queue = Some(idx as u32);
+                    encode_ts_bits = props.timestamp_valid_bits;
                     debug!("Found video encode queue at family {}", idx);
                 }
 
@@ -347,6 +359,7 @@ impl VideoContext {
             if has_video_support && encode_supported && has_compute_support {
                 selected_device = Some(physical_device);
                 video_encode_queue_family = encode_queue;
+                video_encode_timestamp_valid_bits = encode_ts_bits;
                 transfer_queue_family = if transfer_q != u32::MAX {
                     transfer_q
                 } else {
@@ -575,6 +588,7 @@ impl VideoContext {
                 physical_device,
                 device,
                 video_encode_queue_family,
+                video_encode_timestamp_valid_bits,
                 video_encode_queue,
                 transfer_queue_family,
                 transfer_queue,

@@ -1,8 +1,8 @@
 use crate::encoder::{BitDepth, PixelFormat};
 use crate::error::{PixelForgeError, Result};
 use crate::vulkan::VideoContext;
-use ash::vk;
 use ash::vk::TaggedStructure;
+use ash::vk::{self, Handle};
 use std::ptr;
 
 /// Minimum bitstream buffer size.
@@ -1597,11 +1597,17 @@ pub(crate) fn get_encoded_session_params(
 }
 
 /// Resets the given query pool and writes starting timestamp command.
+///
+/// No-op when `query_pool` is null (i.e. the encode queue family does not
+/// support timestamp queries).
 pub(crate) fn reset_start_timestamp(
     device: &ash::Device,
     command_buffer: vk::CommandBuffer,
     query_pool: vk::QueryPool,
 ) {
+    if query_pool.is_null() {
+        return;
+    }
     unsafe {
         device.cmd_reset_query_pool(command_buffer, query_pool, 0, 2);
         device.cmd_write_timestamp(
@@ -1614,11 +1620,17 @@ pub(crate) fn reset_start_timestamp(
 }
 
 /// Writes ending timestamp command to the given query pool.
+///
+/// No-op when `query_pool` is null (i.e. the encode queue family does not
+/// support timestamp queries).
 pub(crate) fn end_timestamp(
     device: &ash::Device,
     command_buffer: vk::CommandBuffer,
     query_pool: vk::QueryPool,
 ) {
+    if query_pool.is_null() {
+        return;
+    }
     unsafe {
         device.cmd_write_timestamp(
             command_buffer,
@@ -1631,6 +1643,9 @@ pub(crate) fn end_timestamp(
 
 /// Queries the given query pool for recorded timestamps, returning their difference.
 ///
+/// Returns `None` when `query_pool` is null (i.e. the encode queue family does
+/// not support timestamp queries).
+///
 /// # Safety
 /// This must only be called if both `reset_start_timestamp` and `end_timestamp`
 ///  were previously written and executed for the given query pool.
@@ -1640,6 +1655,9 @@ pub(crate) unsafe fn query_timestamp_diff(
     mut timestamps: [u64; 2],
     timestamp_period: f32,
 ) -> Option<u64> {
+    if query_pool.is_null() {
+        return None;
+    }
     let mut encode_time_ns: Option<u64> = None;
     let result = unsafe {
         device.get_query_pool_results(

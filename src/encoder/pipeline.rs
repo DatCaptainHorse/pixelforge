@@ -35,7 +35,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::task::{Context, Poll};
 use std::thread::JoinHandle;
 
-use ash::vk;
+use ash::vk::{self, Handle};
 use futures_channel::oneshot;
 
 use crate::encoder::resources::{
@@ -252,6 +252,22 @@ impl EncodePipeline {
         let command_buffers = unsafe { device.allocate_command_buffers(&alloc_info) }
             .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
 
+        // Timestamp queries are only legal on a queue family with non-zero
+        // `timestampValidBits` (VUID-vkCmdWriteTimestamp-timestampValidBits-00829).
+        // RADV's dedicated video encode queue reports 0, so recording
+        // vkCmdWriteTimestamp there causes device loss. When unsupported we
+        // leave the per-slot pools null and the recording/readback helpers treat
+        // a null pool as "timestamps disabled".
+        let timestamps_supported = context.encode_timestamps_supported();
+        let timestamp_period = context.device_properties().limits.timestamp_period;
+        if !timestamps_supported {
+            tracing::info!(
+                "Video encode queue family {:?} reports timestampValidBits=0; \
+                 GPU encode timing stats disabled",
+                context.video_encode_queue_family()
+            );
+        }
+
         let mut slots = Vec::with_capacity(ENCODE_PIPELINE_DEPTH);
         for &encode_command_buffer in &command_buffers {
             let (input_image, input_image_memory, input_image_view) = create_image(
@@ -300,13 +316,10 @@ impl EncodePipeline {
             let mut profile = *config.profile_info;
             let query_pool = create_encode_feedback_query_pool(context, &mut profile)?;
 
-            let timestamp_query_pool = create_encode_timestamp_query_pool(context)?;
-            let timestamp_period = unsafe {
-                context
-                    .instance()
-                    .get_physical_device_properties(context.physical_device())
-                    .limits
-                    .timestamp_period
+            let timestamp_query_pool = if timestamps_supported {
+                create_encode_timestamp_query_pool(context)?
+            } else {
+                vk::QueryPool::null()
             };
 
             slots.push(EncodeSlot {
@@ -513,8 +526,12 @@ impl EncodePipeline {
                 }
                 slot.bitstream_buffer_ptr = std::ptr::null_mut();
             }
+            if !slot.timestamp_query_pool.is_null() {
+                unsafe {
+                    device.destroy_query_pool(slot.timestamp_query_pool, None);
+                }
+            }
             unsafe {
-                device.destroy_query_pool(slot.timestamp_query_pool, None);
                 device.destroy_query_pool(slot.query_pool, None);
                 device.destroy_fence(slot.encode_fence, None);
                 device.destroy_buffer(slot.bitstream_buffer, None);
