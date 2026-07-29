@@ -35,7 +35,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::task::{Context, Poll};
 use std::thread::JoinHandle;
 
-use ash::vk;
+use ash::vk::{self, Handle};
 use futures_channel::oneshot;
 
 use crate::encoder::resources::{
@@ -526,7 +526,7 @@ impl EncodePipeline {
                 }
                 slot.bitstream_buffer_ptr = std::ptr::null_mut();
             }
-            if slot.timestamp_query_pool != vk::QueryPool::null() {
+            if !slot.timestamp_query_pool.is_null() {
                 unsafe {
                     device.destroy_query_pool(slot.timestamp_query_pool, None);
                 }
