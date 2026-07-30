@@ -248,7 +248,7 @@ impl VideoContext {
         let mut has_descriptor_buffer_ext = false;
 
         let has_extension =
-            |extensions: &Vec<vk::ExtensionProperties>, name: &std::ffi::CStr| -> bool {
+            |extensions: &[vk::ExtensionProperties], name: &std::ffi::CStr| -> bool {
                 extensions.iter().any(|ext| {
                     let ext_name = unsafe { std::ffi::CStr::from_ptr(ext.extension_name.as_ptr()) };
                     ext_name == name
