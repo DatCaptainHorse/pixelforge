@@ -232,6 +232,7 @@ pub struct Dimensions {
 /// Describes how color is encoded in the video stream, allowing decoders
 /// to correctly interpret the color space.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use]
 pub struct ColorDescription {
     /// Color primaries (1=BT.709, 9=BT.2020).
     pub color_primaries: u8,
@@ -244,12 +245,20 @@ pub struct ColorDescription {
 }
 
 impl ColorDescription {
+    // H.273 code points for the fields above.
+    const PRIMARIES_BT709: u8 = 1;
+    const PRIMARIES_BT2020: u8 = 9;
+    const TRANSFER_BT709: u8 = 1;
+    const TRANSFER_ST2084_PQ: u8 = 16;
+    const MATRIX_BT709: u8 = 1;
+    const MATRIX_BT2020_NCL: u8 = 9;
+
     /// BT.709 color description (standard SDR, limited range).
     pub fn bt709() -> Self {
         Self {
-            color_primaries: 1,
-            transfer_characteristics: 1,
-            matrix_coefficients: 1,
+            color_primaries: Self::PRIMARIES_BT709,
+            transfer_characteristics: Self::TRANSFER_BT709,
+            matrix_coefficients: Self::MATRIX_BT709,
             full_range: false,
         }
     }
@@ -257,11 +266,25 @@ impl ColorDescription {
     /// BT.2020 with PQ transfer function (HDR10).
     pub fn bt2020_pq() -> Self {
         Self {
-            color_primaries: 9,
-            transfer_characteristics: 16,
-            matrix_coefficients: 9,
+            color_primaries: Self::PRIMARIES_BT2020,
+            transfer_characteristics: Self::TRANSFER_ST2084_PQ,
+            matrix_coefficients: Self::MATRIX_BT2020_NCL,
             full_range: false,
         }
+    }
+
+    /// Set full range (0-255) rather than limited/TV range (16-235).
+    pub fn with_full_range(mut self, full_range: bool) -> Self {
+        self.full_range = full_range;
+        self
+    }
+
+    /// Whether this description makes the stream HDR.
+    ///
+    /// The PQ (ST 2084) transfer function is what decides it; primaries and
+    /// luma range do not.
+    pub fn is_hdr(&self) -> bool {
+        self.transfer_characteristics == Self::TRANSFER_ST2084_PQ
     }
 }
 
@@ -1003,6 +1026,40 @@ mod tests {
             assert_eq!(cd.transfer_characteristics, 16);
             assert_eq!(cd.matrix_coefficients, 9);
             assert!(!cd.full_range);
+        }
+
+        #[test]
+        fn test_with_full_range() {
+            let cd = ColorDescription::bt709().with_full_range(true);
+            assert!(cd.full_range);
+            // Only the range changes; the preset stays intact.
+            assert_eq!(cd.with_full_range(false), ColorDescription::bt709());
+        }
+
+        #[test]
+        fn test_is_hdr() {
+            // The luma range doesn't decide it.
+            for full_range in [false, true] {
+                assert!(
+                    ColorDescription::bt2020_pq()
+                        .with_full_range(full_range)
+                        .is_hdr()
+                );
+                assert!(
+                    !ColorDescription::bt709()
+                        .with_full_range(full_range)
+                        .is_hdr()
+                );
+            }
+
+            // Neither do the primaries: PQ on BT.709 primaries is still HDR.
+            // 16 is the H.273 code point for ST 2084, written literally so the
+            // test pins the constant rather than echoing it.
+            let pq_709 = ColorDescription {
+                transfer_characteristics: 16,
+                ..ColorDescription::bt709()
+            };
+            assert!(pq_709.is_hdr());
         }
     }
 }
