@@ -16,10 +16,10 @@ dmabuf = []
 [dependencies]
 ash = { git = "https://github.com/ash-rs/ash", rev = "55dd56906bbb5760e9e9e6c56f45be67f67e0649", features = ["loaded"] }
 futures-channel = { version = "0.3", default-features = false, features = ["std"] }
-thiserror = "1.0"
+thiserror = "2.0"
 tracing = "0.1"
 
 [dev-dependencies]
 env_logger = "0.11"
-pollster = "0.4"
+pollster = "1.0"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
