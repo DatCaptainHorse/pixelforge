@@ -119,6 +119,8 @@ struct WorkItem {
     fence: vk::Fence,
     query_pool: vk::QueryPool,
     bitstream_ptr: SendPtr,
+    /// Capacity of the mapped bitstream buffer, for overflow detection.
+    bitstream_buffer_size: usize,
     metadata: SlotPacketMetadata,
     /// Timestamping resources
     timestamp_period: f32,
@@ -423,6 +425,7 @@ impl EncodePipeline {
             fence,
             query_pool,
             bitstream_ptr,
+            bitstream_buffer_size,
             timestamp_period,
             timestamp_query_pool,
             metadata,
@@ -438,6 +441,7 @@ impl EncodePipeline {
                 slot.encode_fence,
                 slot.query_pool,
                 slot.bitstream_buffer_ptr as *const u8,
+                slot.bitstream_buffer_size,
                 slot.timestamp_period,
                 slot.timestamp_query_pool,
                 metadata,
@@ -469,6 +473,7 @@ impl EncodePipeline {
             fence,
             query_pool,
             bitstream_ptr: SendPtr(bitstream_ptr),
+            bitstream_buffer_size,
             timestamp_period,
             timestamp_query_pool,
             submit_time,
@@ -564,6 +569,7 @@ fn run_completion_thread(
                 work.fence,
                 work.query_pool,
                 work.bitstream_ptr.0,
+                work.bitstream_buffer_size,
                 &mut data,
             )
         };

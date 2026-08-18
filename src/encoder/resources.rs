@@ -1425,11 +1425,16 @@ pub(crate) unsafe fn submit_encode_only(
 /// (which already holds any codec header). Appending in place means the encoded
 /// bytes are copied out of the mapped buffer exactly once — there is no
 /// intermediate owned `Vec`.
+///
+/// `bitstream_buffer_size` is the mapped buffer's capacity; if the reported
+/// `bytes_written` (+ `offset`) exceeds it, return [`PixelForgeError::BufferOverflow`]
+/// instead of reading out of bounds.
 pub(crate) unsafe fn wait_and_read_bitstream(
     device: &ash::Device,
     fence: vk::Fence,
     query_pool: vk::QueryPool,
     bitstream_buffer_ptr: *const u8,
+    bitstream_buffer_size: usize,
     dst: &mut Vec<u8>,
 ) -> Result<()> {
     unsafe {
@@ -1471,6 +1476,14 @@ pub(crate) unsafe fn wait_and_read_bitstream(
     }
 
     tracing::debug!("Encoded frame: offset={}, size={}", offset, size);
+
+    // Guard against writing past the destination range: `bytes_written > capacity` is the only overflow signal.
+    if offset.saturating_add(size) > bitstream_buffer_size {
+        return Err(PixelForgeError::BufferOverflow {
+            written: offset + size,
+            capacity: bitstream_buffer_size,
+        });
+    }
 
     let src = unsafe { std::slice::from_raw_parts(bitstream_buffer_ptr.add(offset), size) };
     dst.extend_from_slice(src);

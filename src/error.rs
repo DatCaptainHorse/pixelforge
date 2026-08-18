@@ -53,6 +53,15 @@ pub enum PixelForgeError {
     #[error("Query pool error: {0}")]
     QueryPool(String),
 
+    /// The encoded bitstream overflowed the destination buffer.
+    #[error("Encoder bitstream buffer overflow (wrote {written} bytes into {capacity} bytes)")]
+    BufferOverflow {
+        /// Number of bytes the encoder reported writing.
+        written: usize,
+        /// Capacity of the bitstream buffer in bytes.
+        capacity: usize,
+    },
+
     /// Generic Vulkan error.
     #[error("Vulkan error: {0}")]
     Vulkan(ash::vk::Result),

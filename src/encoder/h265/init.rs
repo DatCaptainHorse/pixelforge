@@ -76,6 +76,10 @@ impl H265 {
             .push(&mut h265_caps);
         let caps = query_video_caps(&context, &profile_info, &mut capabilities)?;
 
+        // Scale the bitstream buffer by resolution so a single frame can't overflow (matches AV1).
+        let bitstream_buffer_size = MIN_BITSTREAM_BUFFER_SIZE
+            .max(config.dimensions.width as usize * config.dimensions.height as usize);
+
         let init = build_encoder_common(&CommonInitRequest {
             context: &context,
             config: &config,
@@ -83,7 +87,7 @@ impl H265 {
             caps: &caps,
             align_unit: CTB_SIZE,
             max_active_refs_cap: 15,
-            bitstream_buffer_size: MIN_BITSTREAM_BUFFER_SIZE,
+            bitstream_buffer_size,
             allow_layered_dpb: true,
         })?;
         let active_reference_count = init.active_reference_count;
