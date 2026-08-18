@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.0] - 18-08-2026
+
+### Fixed
+
+- Detect when an encoded frame overflows its bitstream buffer and report it instead of reading out of bounds, preventing a segfault on large scene-cut frames.
+- Scale the H.264/H.265 bitstream buffer by resolution so a single frame can't overflow the fixed minimum.
+
 ## [0.8.1] - 02-08-2026
 
 ### Fixed
