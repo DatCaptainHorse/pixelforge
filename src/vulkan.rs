@@ -976,6 +976,7 @@ impl VideoContext {
                 physical_device,
                 device,
                 video_encode_queue_family: None,
+                video_encode_timestamp_valid_bits: 0u32,
                 video_encode_queue: None,
                 video_decode_queue_family: Some(families.decode),
                 video_decode_queue: Some(video_decode_queue),
