@@ -41,6 +41,127 @@ pub(crate) fn align_up(value: u32, alignment: u32) -> u32 {
     }
 }
 
+/// Parameters describing a video image's dimensions, format, usage and queue sharing.
+pub(crate) struct VideoImageParams<'a> {
+    pub width: u32,
+    pub height: u32,
+    pub format: vk::Format,
+    pub usage: vk::ImageUsageFlags,
+    pub sharing_families: &'a [u32],
+}
+
+/// Deduplicate `families` and decide CONCURRENT vs EXCLUSIVE sharing mode.
+/// Returns an empty family list for EXCLUSIVE, in which case Vulkan ignores it.
+fn resolve_sharing_mode(families: &[u32]) -> (Vec<u32>, vk::SharingMode) {
+    let mut deduped: Vec<u32> = Vec::new();
+    for &family in families {
+        if !deduped.contains(&family) {
+            deduped.push(family);
+        }
+    }
+    if deduped.len() > 1 {
+        (deduped, vk::SharingMode::CONCURRENT)
+    } else {
+        (Vec::new(), vk::SharingMode::EXCLUSIVE)
+    }
+}
+
+fn allocate_and_bind_image_memory(
+    context: &VideoContext,
+    image: vk::Image,
+) -> Result<vk::DeviceMemory> {
+    let mem_requirements = unsafe { context.device().get_image_memory_requirements(image) };
+
+    let memory_type_index = find_memory_type(
+        context.memory_properties(),
+        mem_requirements.memory_type_bits,
+        vk::MemoryPropertyFlags::DEVICE_LOCAL,
+    )
+    .ok_or_else(|| {
+        PixelForgeError::MemoryAllocation("No suitable memory type for image".to_string())
+    })?;
+
+    let alloc_info = vk::MemoryAllocateInfo::default()
+        .allocation_size(mem_requirements.size)
+        .memory_type_index(memory_type_index);
+
+    let memory = unsafe { context.device().allocate_memory(&alloc_info, None) }
+        .map_err(|e| PixelForgeError::MemoryAllocation(e.to_string()))?;
+
+    match unsafe { context.device().bind_image_memory(image, memory, 0) } {
+        Ok(()) => Ok(memory),
+        Err(e) => {
+            unsafe { context.device().free_memory(memory, None) };
+            Err(PixelForgeError::MemoryAllocation(e.to_string()))
+        }
+    }
+}
+
+/// Create a video-profile-tagged image with `array_layers`.
+fn create_video_image_raw(
+    context: &VideoContext,
+    params: &VideoImageParams,
+    array_layers: u32,
+    profile_info: &vk::VideoProfileInfoKHR,
+) -> Result<(vk::Image, vk::DeviceMemory)> {
+    let (queue_families, sharing_mode) = resolve_sharing_mode(params.sharing_families);
+
+    let profiles = [*profile_info];
+    let mut profile_list = vk::VideoProfileListInfoKHR::default().profiles(&profiles);
+
+    let create_info = vk::ImageCreateInfo::default()
+        .image_type(vk::ImageType::TYPE_2D)
+        .format(params.format)
+        .extent(vk::Extent3D {
+            width: params.width,
+            height: params.height,
+            depth: 1,
+        })
+        .mip_levels(1)
+        .array_layers(array_layers)
+        .samples(vk::SampleCountFlags::TYPE_1)
+        .tiling(vk::ImageTiling::OPTIMAL)
+        .usage(params.usage)
+        .sharing_mode(sharing_mode)
+        .queue_family_indices(&queue_families)
+        .initial_layout(vk::ImageLayout::UNDEFINED)
+        .push(&mut profile_list);
+
+    let image = unsafe { context.device().create_image(&create_info, None) }
+        .map_err(|e| PixelForgeError::ResourceCreation(format!("image creation: {}", e)))?;
+
+    match allocate_and_bind_image_memory(context, image) {
+        Ok(memory) => Ok((image, memory)),
+        Err(e) => {
+            unsafe { context.device().destroy_image(image, None) };
+            Err(e)
+        }
+    }
+}
+
+fn create_video_image_view(
+    context: &VideoContext,
+    image: vk::Image,
+    format: vk::Format,
+    layer: u32,
+) -> Result<vk::ImageView> {
+    let view_create_info = vk::ImageViewCreateInfo::default()
+        .image(image)
+        .view_type(vk::ImageViewType::TYPE_2D)
+        .format(format)
+        .components(vk::ComponentMapping::default())
+        .subresource_range(vk::ImageSubresourceRange {
+            aspect_mask: vk::ImageAspectFlags::COLOR,
+            base_mip_level: 0,
+            level_count: 1,
+            base_array_layer: layer,
+            layer_count: 1,
+        });
+
+    unsafe { context.device().create_image_view(&view_create_info, None) }
+        .map_err(|e| PixelForgeError::ResourceCreation(format!("image view creation: {}", e)))
+}
+
 pub(crate) fn query_supported_video_formats(
     context: &VideoContext,
     profile_info: &vk::VideoProfileInfoKHR,
@@ -261,103 +382,24 @@ pub(crate) fn create_timeline_semaphore(context: &VideoContext) -> Result<vk::Se
 ///
 /// # Arguments
 /// * `context` - The Vulkan video context
-/// * `width` - Image width in pixels
-/// * `height` - Image height in pixels
-/// * `format` - The Vulkan format to use for the image
-/// * `is_dpb` - If true, create a DPB image; if false, create an input image
+/// * `params` - Parameters to use for the video image
 /// * `profile_info` - Video profile info for the encoder session
 pub(crate) fn create_video_image(
     context: &VideoContext,
-    width: u32,
-    height: u32,
-    format: vk::Format,
-    usage: vk::ImageUsageFlags,
-    sharing_families: &[u32],
+    params: &VideoImageParams,
     profile_info: &vk::VideoProfileInfoKHR,
 ) -> Result<(vk::Image, vk::DeviceMemory, vk::ImageView)> {
-    // Use CONCURRENT sharing mode when multiple queue families need access
-    // (e.g. video queue + transfer queue for upload/readback, compute for
-    // color conversion). Callers pass the deduplicated family list.
-    let mut queue_families: Vec<u32> = Vec::new();
-    for &family in sharing_families {
-        if !queue_families.contains(&family) {
-            queue_families.push(family);
+    let (image, memory) = create_video_image_raw(context, params, 1, profile_info)?;
+    match create_video_image_view(context, image, params.format, 0) {
+        Ok(view) => Ok((image, memory, view)),
+        Err(e) => {
+            unsafe {
+                context.device().destroy_image(image, None);
+                context.device().free_memory(memory, None);
+            }
+            Err(e)
         }
     }
-    let sharing_mode = if queue_families.len() > 1 {
-        vk::SharingMode::CONCURRENT
-    } else {
-        queue_families.clear();
-        vk::SharingMode::EXCLUSIVE
-    };
-
-    let profiles = [*profile_info];
-    let mut profile_list = vk::VideoProfileListInfoKHR::default().profiles(&profiles);
-
-    let create_info = vk::ImageCreateInfo::default()
-        .image_type(vk::ImageType::TYPE_2D)
-        .format(format)
-        .extent(vk::Extent3D {
-            width,
-            height,
-            depth: 1,
-        })
-        .mip_levels(1)
-        .array_layers(1)
-        .samples(vk::SampleCountFlags::TYPE_1)
-        .tiling(vk::ImageTiling::OPTIMAL)
-        .usage(usage)
-        .sharing_mode(sharing_mode)
-        .queue_family_indices(&queue_families)
-        .initial_layout(vk::ImageLayout::UNDEFINED)
-        .push(&mut profile_list);
-
-    let image = unsafe { context.device().create_image(&create_info, None) }
-        .map_err(|e| PixelForgeError::ResourceCreation(format!("image creation: {}", e)))?;
-
-    let mem_requirements = unsafe { context.device().get_image_memory_requirements(image) };
-
-    let memory_type_index = find_memory_type(
-        context.memory_properties(),
-        mem_requirements.memory_type_bits,
-        vk::MemoryPropertyFlags::DEVICE_LOCAL,
-    )
-    .ok_or_else(|| {
-        PixelForgeError::MemoryAllocation("No suitable memory type for image".to_string())
-    })?;
-
-    let alloc_info = vk::MemoryAllocateInfo::default()
-        .allocation_size(mem_requirements.size)
-        .memory_type_index(memory_type_index);
-
-    let memory = unsafe { context.device().allocate_memory(&alloc_info, None) }
-        .map_err(|e| PixelForgeError::MemoryAllocation(e.to_string()))?;
-
-    unsafe { context.device().bind_image_memory(image, memory, 0) }
-        .map_err(|e| PixelForgeError::MemoryAllocation(e.to_string()))?;
-
-    let view_create_info = vk::ImageViewCreateInfo::default()
-        .image(image)
-        .view_type(vk::ImageViewType::TYPE_2D)
-        .format(format)
-        .components(vk::ComponentMapping {
-            r: vk::ComponentSwizzle::IDENTITY,
-            g: vk::ComponentSwizzle::IDENTITY,
-            b: vk::ComponentSwizzle::IDENTITY,
-            a: vk::ComponentSwizzle::IDENTITY,
-        })
-        .subresource_range(vk::ImageSubresourceRange {
-            aspect_mask: vk::ImageAspectFlags::COLOR,
-            base_mip_level: 0,
-            level_count: 1,
-            base_array_layer: 0,
-            layer_count: 1,
-        });
-
-    let view = unsafe { context.device().create_image_view(&view_create_info, None) }
-        .map_err(|e| PixelForgeError::ResourceCreation(format!("image view creation: {}", e)))?;
-
-    Ok((image, memory, view))
 }
 
 /// Allocate and bind memory for a video session.
@@ -493,13 +535,9 @@ pub(crate) fn map_bitstream_buffer(
 /// output and be copied from), so they are supplied by the caller.
 pub(crate) fn create_dpb_images(
     context: &VideoContext,
-    width: u32,
-    height: u32,
-    format: vk::Format,
-    count: usize,
-    usage: vk::ImageUsageFlags,
-    sharing_families: &[u32],
+    params: &VideoImageParams,
     profile_info: &vk::VideoProfileInfoKHR,
+    count: usize,
     use_layered: bool,
 ) -> Result<(Vec<vk::Image>, Vec<vk::DeviceMemory>, Vec<vk::ImageView>)> {
     if !use_layered {
@@ -507,103 +545,48 @@ pub(crate) fn create_dpb_images(
         let mut memories = Vec::with_capacity(count);
         let mut views = Vec::with_capacity(count);
         for _ in 0..count {
-            let (image, memory, view) = create_video_image(
-                context,
-                width,
-                height,
-                format,
-                usage,
-                sharing_families,
-                profile_info,
-            )?;
-            images.push(image);
-            memories.push(memory);
-            views.push(view);
+            match create_video_image(context, params, profile_info) {
+                Ok((image, memory, view)) => {
+                    images.push(image);
+                    memories.push(memory);
+                    views.push(view);
+                }
+                Err(e) => {
+                    unsafe {
+                        for &v in &views {
+                            context.device().destroy_image_view(v, None);
+                        }
+                        for &img in &images {
+                            context.device().destroy_image(img, None);
+                        }
+                        for &m in &memories {
+                            context.device().free_memory(m, None);
+                        }
+                    }
+                    return Err(e);
+                }
+            }
         }
         return Ok((images, memories, views));
     }
 
-    // Layered: one image, `count` array layers, one view per layer.
-    let profiles = [*profile_info];
-    let mut profile_list = vk::VideoProfileListInfoKHR::default().profiles(&profiles);
-
-    let mut queue_families: Vec<u32> = Vec::new();
-    for &family in sharing_families {
-        if !queue_families.contains(&family) {
-            queue_families.push(family);
-        }
-    }
-    let sharing_mode = if queue_families.len() > 1 {
-        vk::SharingMode::CONCURRENT
-    } else {
-        queue_families.clear();
-        vk::SharingMode::EXCLUSIVE
-    };
-
-    let create_info = vk::ImageCreateInfo::default()
-        .image_type(vk::ImageType::TYPE_2D)
-        .format(format)
-        .extent(vk::Extent3D {
-            width,
-            height,
-            depth: 1,
-        })
-        .mip_levels(1)
-        .array_layers(count as u32)
-        .samples(vk::SampleCountFlags::TYPE_1)
-        .tiling(vk::ImageTiling::OPTIMAL)
-        .usage(usage)
-        .sharing_mode(sharing_mode)
-        .queue_family_indices(&queue_families)
-        .initial_layout(vk::ImageLayout::UNDEFINED)
-        .push(&mut profile_list);
-
-    let image = unsafe { context.device().create_image(&create_info, None) }
-        .map_err(|e| PixelForgeError::ResourceCreation(format!("layered DPB image: {}", e)))?;
-
-    let mem_requirements = unsafe { context.device().get_image_memory_requirements(image) };
-    let memory_type_index = find_memory_type(
-        context.memory_properties(),
-        mem_requirements.memory_type_bits,
-        vk::MemoryPropertyFlags::DEVICE_LOCAL,
-    )
-    .ok_or_else(|| {
-        PixelForgeError::MemoryAllocation(
-            "No suitable memory type for layered DPB image".to_string(),
-        )
-    })?;
-
-    let alloc_info = vk::MemoryAllocateInfo::default()
-        .allocation_size(mem_requirements.size)
-        .memory_type_index(memory_type_index);
-    let memory = unsafe { context.device().allocate_memory(&alloc_info, None) }
-        .map_err(|e| PixelForgeError::MemoryAllocation(e.to_string()))?;
-    unsafe { context.device().bind_image_memory(image, memory, 0) }
-        .map_err(|e| PixelForgeError::MemoryAllocation(e.to_string()))?;
+    let (image, memory) = create_video_image_raw(context, params, count as u32, profile_info)?;
 
     let mut views = Vec::with_capacity(count);
     for layer in 0..count as u32 {
-        let view_create_info = vk::ImageViewCreateInfo::default()
-            .image(image)
-            .view_type(vk::ImageViewType::TYPE_2D)
-            .format(format)
-            .components(vk::ComponentMapping::default())
-            .subresource_range(vk::ImageSubresourceRange {
-                aspect_mask: vk::ImageAspectFlags::COLOR,
-                base_mip_level: 0,
-                level_count: 1,
-                base_array_layer: layer,
-                layer_count: 1,
-            });
-        let view = unsafe { context.device().create_image_view(&view_create_info, None) }.map_err(
-            |e| {
-                PixelForgeError::ResourceCreation(format!(
-                    "layered DPB view layer {}: {}",
-                    layer, e
-                ))
-            },
-        )?;
-        views.push(view);
+        match create_video_image_view(context, image, params.format, layer) {
+            Ok(view) => views.push(view),
+            Err(e) => {
+                unsafe {
+                    for &v in &views {
+                        context.device().destroy_image_view(v, None);
+                    }
+                    context.device().destroy_image(image, None);
+                    context.device().free_memory(memory, None);
+                }
+                return Err(e);
+            }
+        }
     }
 
     Ok((vec![image], vec![memory], views))

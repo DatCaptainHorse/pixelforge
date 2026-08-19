@@ -10,9 +10,10 @@ use std::ptr;
 #[cfg(test)]
 pub(crate) use crate::video::gcd;
 pub(crate) use crate::video::{
-    align_up, allocate_session_memory, create_bitstream_buffer, create_buffer_with_device_address,
-    create_dpb_images as create_dpb_images_shared, create_timeline_semaphore, create_video_image,
-    find_memory_type, get_video_format, lcm, map_bitstream_buffer, query_supported_video_formats,
+    VideoImageParams, align_up, allocate_session_memory, create_bitstream_buffer,
+    create_buffer_with_device_address, create_dpb_images as create_dpb_images_shared,
+    create_timeline_semaphore, create_video_image, find_memory_type, get_video_format, lcm,
+    map_bitstream_buffer, query_supported_video_formats,
 };
 
 /// Create the encoder's DPB images.
@@ -30,17 +31,14 @@ pub(crate) fn create_dpb_images(
     profile_info: &vk::VideoProfileInfoKHR,
     use_layered: bool,
 ) -> Result<(Vec<vk::Image>, Vec<vk::DeviceMemory>, Vec<vk::ImageView>)> {
-    create_dpb_images_shared(
-        context,
+    let dpb_params = VideoImageParams {
         width,
         height,
         format,
-        count,
-        vk::ImageUsageFlags::VIDEO_ENCODE_DPB_KHR,
-        &[],
-        profile_info,
-        use_layered,
-    )
+        usage: vk::ImageUsageFlags::VIDEO_ENCODE_DPB_KHR,
+        sharing_families: &[],
+    };
+    create_dpb_images_shared(context, &dpb_params, profile_info, count, use_layered)
 }
 
 /// Create an image for video encoding (input or DPB).
@@ -70,15 +68,14 @@ pub(crate) fn create_image(
             families,
         )
     };
-    create_video_image(
-        context,
+    let dpb_params = VideoImageParams {
         width,
         height,
         format,
         usage,
-        &families,
-        profile_info,
-    )
+        sharing_families: &families,
+    };
+    create_video_image(context, &dpb_params, profile_info)
 }
 
 /// Minimum bitstream buffer size.

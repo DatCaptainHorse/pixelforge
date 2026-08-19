@@ -23,8 +23,8 @@ use crate::decoder::{DecodedFrame, DecodedFrameData};
 use crate::encoder::{BitDepth, PixelFormat};
 use crate::error::{PixelForgeError, Result};
 use crate::video::{
-    allocate_session_memory, create_bitstream_buffer, create_dpb_images, create_video_image,
-    find_memory_type, map_bitstream_buffer,
+    VideoImageParams, allocate_session_memory, create_bitstream_buffer, create_dpb_images,
+    create_video_image, find_memory_type, map_bitstream_buffer,
 };
 use crate::vulkan::VideoContext;
 
@@ -114,6 +114,18 @@ pub(crate) struct DecodeSession {
     pub coincide: bool,
     /// Distinct decode output image, only when `!coincide`.
     pub output_image: Option<(vk::Image, vk::DeviceMemory, vk::ImageView)>,
+}
+impl DecodeSession {
+    /// The image and array layer holding DPB slot `slot`.
+    /// For layered DPBs all slots share `dpb_images[0]` and are distinguished
+    /// by layer; for separate images each slot has its own image at layer 0.
+    pub fn dpb_image_for_slot(&self, slot: u8) -> (vk::Image, u32) {
+        if self.use_layered_dpb {
+            (self.dpb_images[0], slot as u32)
+        } else {
+            (self.dpb_images[slot as usize], 0)
+        }
+    }
 }
 
 /// Per-decoder state shared by every codec.
@@ -253,31 +265,33 @@ impl DecoderCommon {
             self.decode_queue_family,
             self.context.transfer_queue_family(),
         ];
+
+        let dpb_params = VideoImageParams {
+            width: plan.coded_width,
+            height: plan.coded_height,
+            format: plan.picture_format,
+            usage: plan.dpb_usage,
+            sharing_families: &families,
+        };
         let (dpb_images, dpb_memories, dpb_views) = create_dpb_images(
             &self.context,
-            plan.coded_width,
-            plan.coded_height,
-            plan.picture_format,
-            plan.slot_count,
-            plan.dpb_usage,
-            &families,
+            &dpb_params,
             profile_info,
+            plan.slot_count,
             plan.use_layered_dpb,
         )?;
 
-        // Distinct output image when the driver can't decode straight into the DPB.
         let output_image = if plan.coincide {
             None
         } else {
-            let usage =
-                vk::ImageUsageFlags::VIDEO_DECODE_DST_KHR | vk::ImageUsageFlags::TRANSFER_SRC;
+            let output_params = VideoImageParams {
+                usage: vk::ImageUsageFlags::VIDEO_DECODE_DST_KHR
+                    | vk::ImageUsageFlags::TRANSFER_SRC,
+                ..dpb_params
+            };
             Some(create_video_image(
                 &self.context,
-                plan.coded_width,
-                plan.coded_height,
-                plan.picture_format,
-                usage,
-                &families,
+                &output_params,
                 profile_info,
             )?)
         };
@@ -427,11 +441,7 @@ impl DecoderCommon {
         };
 
         // The slot being written: UNDEFINED on first use, DPB afterwards.
-        let (dst_image, dst_layer) = if session.use_layered_dpb {
-            (session.dpb_images[0], slot as u32)
-        } else {
-            (session.dpb_images[slot as usize], 0)
-        };
+        let (dst_image, dst_layer) = session.dpb_image_for_slot(slot);
         let old_layout = if session.dpb_slot_active[slot as usize] {
             vk::ImageLayout::VIDEO_DECODE_DPB_KHR
         } else {
@@ -486,20 +496,6 @@ impl DecoderCommon {
                 .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
         }
         Ok(())
-    }
-
-    /// The array layer `frame.image` holds the picture in.
-    fn frame_array_layer(&self, frame: &DecodedFrame) -> u32 {
-        let session = self.session.as_ref().expect("active session");
-        if !session.use_layered_dpb || !session.coincide {
-            return 0;
-        }
-        // Layered + coincide: find the slot whose view matches.
-        session
-            .dpb_views
-            .iter()
-            .position(|&v| v == frame.image_view)
-            .unwrap_or(0) as u32
     }
 
     /// Ensure the readback buffer holds at least `size` bytes.
@@ -600,7 +596,7 @@ impl DecoderCommon {
                 .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
         }
 
-        let base_layer = self.frame_array_layer(frame);
+        let base_layer = frame.array_layer;
 
         // A multi-planar image must be transitioned with the plane aspects that
         // the copy will use; a COLOR barrier does not cover PLANE_0/PLANE_1 and
@@ -787,7 +783,7 @@ impl DecoderCommon {
     /// destination is left in `TRANSFER_DST_OPTIMAL` (reported as the pooled
     /// frame's layout, which `download` then transitions from).
     pub fn copy_frame_to_image(&self, frame: &DecodedFrame, dst_image: vk::Image) -> Result<()> {
-        let base_layer = self.frame_array_layer(frame);
+        let base_layer = frame.array_layer;
         let device = self.context.device().clone();
         let aspects = vk::ImageAspectFlags::PLANE_0 | vk::ImageAspectFlags::PLANE_1;
         let range = |image: vk::Image, layer: u32| vk::ImageMemoryBarrier2 {
@@ -849,12 +845,7 @@ impl DecoderCommon {
             base_array_layer: 0,
             layer_count: 1,
         };
-        // Plane-1 (chroma) extents are in that plane's own coordinate space, so
-        // they are divided by the subsampling factor (2 for 4:2:0, 1 for 4:4:4).
-        let chroma_div = match self.session.as_ref().map(|s| s.pixel_format) {
-            Some(PixelFormat::Yuv444) => 1,
-            _ => 2,
-        };
+        let (cdiv_hor, cdiv_vert) = frame.pixel_format.chroma_div();
         let regions = [
             vk::ImageCopy2::default()
                 .src_subresource(vk::ImageSubresourceLayers {
@@ -874,8 +865,8 @@ impl DecoderCommon {
                 })
                 .dst_subresource(plane(vk::ImageAspectFlags::PLANE_1))
                 .extent(vk::Extent3D {
-                    width: frame.coded_width / chroma_div,
-                    height: frame.coded_height / chroma_div,
+                    width: frame.coded_width / cdiv_hor,
+                    height: frame.coded_height / cdiv_vert,
                     depth: 1,
                 }),
         ];
@@ -936,12 +927,8 @@ impl DecoderCommon {
         y_image: vk::Image,
         uv_image: vk::Image,
     ) -> Result<()> {
-        let base_layer = self.frame_array_layer(frame);
+        let base_layer = frame.array_layer;
         let device = self.context.device().clone();
-        let chroma_div = match self.session.as_ref().map(|s| s.pixel_format) {
-            Some(PixelFormat::Yuv444) => 1,
-            _ => 2,
-        };
 
         let color = vk::ImageSubresourceRange {
             aspect_mask: vk::ImageAspectFlags::COLOR,
@@ -1035,12 +1022,13 @@ impl DecoderCommon {
             .dst_image_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
             .regions(std::slice::from_ref(&y_region));
         // Chroma: source plane 1 -> uv_image, at chroma resolution.
+        let (cdiv_hor, cdiv_vert) = frame.pixel_format.chroma_div();
         let uv_region = vk::ImageCopy2::default()
             .src_subresource(color_layers(vk::ImageAspectFlags::PLANE_1, base_layer))
             .dst_subresource(color_layers(vk::ImageAspectFlags::COLOR, 0))
             .extent(vk::Extent3D {
-                width: frame.coded_width / chroma_div,
-                height: frame.coded_height / chroma_div,
+                width: frame.coded_width / cdiv_hor,
+                height: frame.coded_height / cdiv_vert,
                 depth: 1,
             });
         let uv_copy = vk::CopyImageInfo2::default()
@@ -1155,6 +1143,8 @@ struct ReorderEntry {
     height: u32,
     coded_width: u32,
     coded_height: u32,
+    array_layer: u32,
+    pixel_format: PixelFormat,
 }
 
 /// Reorders decoded pictures from decode order into display (POC) order.
@@ -1230,6 +1220,8 @@ impl ReorderBuffer {
             height: frame.height,
             coded_width: frame.coded_width,
             coded_height: frame.coded_height,
+            array_layer: frame.array_layer,
+            pixel_format: frame.pixel_format,
         });
 
         while self.buffered.len() > reorder_depth {
@@ -1275,6 +1267,8 @@ impl ReorderBuffer {
             image_view: vk::ImageView::null(),
             // copy_frame_to_image leaves the pool image in TRANSFER_DST layout.
             layout: vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            array_layer: entry.array_layer,
+            pixel_format: entry.pixel_format,
             width: entry.width,
             height: entry.height,
             coded_width: entry.coded_width,

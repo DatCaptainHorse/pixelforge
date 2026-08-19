@@ -74,15 +74,7 @@ impl VideoContextBuilder {
     ///
     /// Use this when you already have your own Vulkan device (e.g. a renderer's)
     /// and want to decode into images that device can use directly, without the
-    /// cross-device copy a separate context would require. The flow is:
-    ///
-    /// 1. Pick a physical device that supports both your needs and decode (this
-    ///    call fails if `physical_device` cannot decode the required codecs).
-    /// 2. Merge the returned queue families and extensions with your own, create
-    ///    one logical device, and enable the `synchronization2` feature.
-    /// 3. Adopt it with [`VideoContext::from_existing_decode`].
-    ///
-    /// Only the decode path is covered; encoding still needs [`Self::build`].
+    /// cross-device copy a separate context would require.
     pub fn decode_device_requirements(
         &self,
         entry: &ash::Entry,

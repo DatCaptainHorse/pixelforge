@@ -102,6 +102,12 @@ pub struct DecodedFrame {
     pub image_view: vk::ImageView,
     /// Current layout of `image`.
     pub layout: vk::ImageLayout,
+    /// Array layer within `image` holding this picture. Always 0 for a
+    /// non-layered DPB or a distinct output image; the DPB slot's layer
+    /// when the DPB is layered and the driver decoded straight into it.
+    pub array_layer: u32,
+    /// The pixel format of this frame.
+    pub pixel_format: PixelFormat,
     /// Visible (cropped) width in pixels.
     pub width: u32,
     /// Visible (cropped) height in pixels.

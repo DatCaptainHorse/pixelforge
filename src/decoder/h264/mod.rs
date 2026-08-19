@@ -1,6 +1,6 @@
 //! H.264 decoding on top of Vulkan Video.
 //!
-//! [`parser`] does the host-side syntax work; this module owns the Vulkan
+//! parser does the host-side syntax work; this module owns the Vulkan
 //! session, the decoded picture buffer and the per-picture record/submit flow.
 
 pub(crate) mod parser;

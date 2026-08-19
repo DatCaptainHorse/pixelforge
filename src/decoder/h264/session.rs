@@ -584,22 +584,19 @@ impl H264Decoder {
         let active = self.common.session.as_mut().expect("active");
         active.dpb_slot_active[slot as usize] = true;
 
-        let (image, image_view, layout) = if active.coincide {
-            let image = if active.use_layered_dpb {
-                active.dpb_images[0]
-            } else {
-                active.dpb_images[slot as usize]
-            };
+        let (image, image_view, layout, array_layer) = if active.coincide {
+            let (image, layer) = active.dpb_image_for_slot(slot);
             (
                 image,
                 active.dpb_views[slot as usize],
                 vk::ImageLayout::VIDEO_DECODE_DPB_KHR,
+                layer,
             )
         } else {
             let (image, _, view) = active
                 .output_image
                 .expect("non-coincide implies output image");
-            (image, view, vk::ImageLayout::VIDEO_DECODE_DST_KHR)
+            (image, view, vk::ImageLayout::VIDEO_DECODE_DST_KHR, 0)
         };
 
         let (width, height) = sps.display_dimensions();
@@ -607,6 +604,8 @@ impl H264Decoder {
             image,
             image_view,
             layout,
+            array_layer,
+            pixel_format: active.pixel_format,
             width,
             height,
             coded_width: active.coded_width,
