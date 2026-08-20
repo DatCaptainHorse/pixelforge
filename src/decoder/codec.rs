@@ -17,6 +17,8 @@
 //! This mirrors the encoder's [`crate::encoder::codec`] split deliberately, so
 //! the two directions read the same way.
 
+use std::sync::{Arc, Mutex};
+
 use ash::vk;
 
 use crate::decoder::{DecodedFrame, DecodedFrameData};
@@ -773,16 +775,20 @@ impl DecoderCommon {
         Ok(())
     }
 
-    /// Copy a decoded picture into a caller-owned image, so it survives past the
-    /// next `decode` call. Used by the reorder buffer to retain frames while
-    /// later pictures are decoded ahead of them in display order.
+    /// Copy a freshly decoded picture into a pool image, so it survives past the
+    /// next decode submission. This is what lets a [`DecodedFrame`] outlive the
+    /// DPB slot the picture was decoded into.
     ///
     /// Runs on the transfer queue, mirroring `download`: the decode is already
     /// fence-waited, so `NONE` is a correct source scope. The source's layout is
     /// restored afterward so a DPB image stays usable as a reference; the
     /// destination is left in `TRANSFER_DST_OPTIMAL` (reported as the pooled
     /// frame's layout, which `download` then transitions from).
-    pub fn copy_frame_to_image(&self, frame: &DecodedFrame, dst_image: vk::Image) -> Result<()> {
+    pub fn copy_picture_to_image(
+        &self,
+        frame: &DecodedPicture,
+        dst_image: vk::Image,
+    ) -> Result<()> {
         let base_layer = frame.array_layer;
         let device = self.context.device().clone();
         let aspects = vk::ImageAspectFlags::PLANE_0 | vk::ImageAspectFlags::PLANE_1;
@@ -1108,14 +1114,76 @@ impl Drop for DecoderCommon {
     }
 }
 
-/// State of one image in the reorder buffer's pool.
+/// A freshly decoded picture, before it is handed to the caller.
+///
+/// The pixels live in a DPB slot (or the session's decode output image), so this
+/// descriptor is only valid until the next decode submission. [`ReorderBuffer`]
+/// turns it into a [`DecodedFrame`], which owns its storage.
+pub(crate) struct DecodedPicture {
+    pub image: vk::Image,
+    pub image_view: vk::ImageView,
+    pub layout: vk::ImageLayout,
+    pub array_layer: u32,
+    pub pixel_format: PixelFormat,
+    pub width: u32,
+    pub height: u32,
+    pub coded_width: u32,
+    pub coded_height: u32,
+    pub pts: u64,
+    pub display_order: i32,
+    pub is_keyframe: bool,
+}
+
+/// What a [`FramePin`] holds reserved, and what releasing it frees.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum PinKind {
+    /// An image in the frame pool, by index.
+    PoolImage(usize),
+}
+
+/// Pins released by frames the caller has dropped, waiting to be reclaimed.
+///
+/// A [`DecodedFrame`] can be dropped on any thread, including while the decoder
+/// is submitting the next picture, so releases land here and the decoder folds
+/// them in the next time it needs storage.
+#[derive(Debug, Default)]
+pub(crate) struct ReleaseQueue {
+    released: Mutex<Vec<PinKind>>,
+}
+
+impl ReleaseQueue {
+    fn push(&self, kind: PinKind) {
+        self.released.lock().unwrap().push(kind);
+    }
+
+    fn take(&self) -> Vec<PinKind> {
+        std::mem::take(&mut *self.released.lock().unwrap())
+    }
+}
+
+/// Keeps a [`DecodedFrame`]'s storage reserved for as long as the frame lives.
+///
+/// Dropping the frame drops this, which returns the storage to the decoder.
+#[derive(Debug)]
+pub(crate) struct FramePin {
+    kind: PinKind,
+    releases: Arc<ReleaseQueue>,
+}
+
+impl Drop for FramePin {
+    fn drop(&mut self) {
+        self.releases.push(self.kind);
+    }
+}
+
+/// State of one image in the frame pool.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum PoolState {
     /// Reusable.
     Free,
     /// Holds a decoded picture awaiting its turn in display order.
     Buffered,
-    /// Returned to the caller; kept alive until the next `decode`/`flush`.
+    /// Handed to the caller; reserved until their [`DecodedFrame`] is dropped.
     HandedOut,
 }
 
@@ -1133,6 +1201,118 @@ struct PoolImage {
     state: PoolState,
 }
 
+/// Images that decoded pictures are copied into so they outlive their DPB slot.
+///
+/// The pool grows on demand and shrinks never: an image is reused as soon as the
+/// frame holding it is dropped, so steady-state size is "what the caller holds
+/// at once, plus the reorder depth". Nothing here blocks, because pool images
+/// are ordinary allocations rather than a hardware-bounded resource.
+struct FramePool {
+    images: Vec<PoolImage>,
+    releases: Arc<ReleaseQueue>,
+}
+
+impl FramePool {
+    fn new() -> Self {
+        Self {
+            images: Vec::new(),
+            releases: Arc::new(ReleaseQueue::default()),
+        }
+    }
+
+    /// Fold in the pins released by dropped frames.
+    fn reclaim(&mut self) {
+        for kind in self.releases.take() {
+            match kind {
+                PinKind::PoolImage(i) => self.images[i].state = PoolState::Free,
+            }
+        }
+    }
+
+    /// A free image matching `picture`'s geometry, creating or resizing one as
+    /// needed. Resolution changes recreate a mismatched image.
+    fn acquire(&mut self, common: &DecoderCommon, picture: &DecodedPicture) -> Result<usize> {
+        self.reclaim();
+
+        let format = common
+            .session
+            .as_ref()
+            .map(|s| s.picture_format)
+            .expect("session active while decoding");
+
+        let matching = self.images.iter().position(|p| {
+            p.state == PoolState::Free
+                && p.coded_width == picture.coded_width
+                && p.coded_height == picture.coded_height
+                && p.format == format
+        });
+        if let Some(i) = matching {
+            return Ok(i);
+        }
+
+        let (image, memory) = create_pool_image(
+            &common.context,
+            picture.coded_width,
+            picture.coded_height,
+            format,
+        )?;
+        let slot = PoolImage {
+            image,
+            memory,
+            coded_width: picture.coded_width,
+            coded_height: picture.coded_height,
+            format,
+            state: PoolState::Free,
+        };
+
+        // Reuse a free-but-mismatched image if one exists, else grow the pool.
+        if let Some(i) = self.images.iter().position(|p| p.state == PoolState::Free) {
+            self.destroy_image(common, i);
+            self.images[i] = slot;
+            Ok(i)
+        } else {
+            self.images.push(slot);
+            Ok(self.images.len() - 1)
+        }
+    }
+
+    /// Mark `index` as handed to the caller and mint its pin.
+    fn hand_out(&mut self, index: usize) -> FramePin {
+        self.images[index].state = PoolState::HandedOut;
+        FramePin {
+            kind: PinKind::PoolImage(index),
+            releases: self.releases.clone(),
+        }
+    }
+
+    fn destroy_image(&mut self, common: &DecoderCommon, i: usize) {
+        let p = &self.images[i];
+        if p.image == vk::Image::null() {
+            return;
+        }
+        unsafe {
+            common.context.device().device_wait_idle().ok();
+            common.context.device().destroy_image(p.image, None);
+            common.context.device().free_memory(p.memory, None);
+        }
+    }
+
+    /// Whether any frame handed to the caller is still alive.
+    fn has_live_frames(&mut self) -> bool {
+        self.reclaim();
+        self.images.iter().any(|p| p.state == PoolState::HandedOut)
+    }
+
+    /// Free every pool image. The caller must be done with handed-out frames.
+    fn destroy(&mut self, common: &DecoderCommon) {
+        for i in 0..self.images.len() {
+            self.destroy_image(common, i);
+            self.images[i].image = vk::Image::null();
+        }
+        self.images.clear();
+    }
+}
+
 /// A buffered picture, referencing its pool image by index.
 struct ReorderEntry {
     pool_index: usize,
@@ -1147,23 +1327,23 @@ struct ReorderEntry {
     pixel_format: PixelFormat,
 }
 
-/// Reorders decoded pictures from decode order into display (POC) order.
+/// Reorders decoded pictures from decode order into display order.
 ///
 /// Decoded pictures are returned in the order the hardware produces them, which
 /// for streams with B-frames is not display order. This buffer copies each
-/// decoded picture into a pool image — so it survives while later pictures are
-/// decoded ahead of it — and emits them in POC order.
+/// decoded picture into a pool image, so it survives while later pictures are
+/// decoded ahead of it, and emits them in display order.
 ///
 /// Emission follows the DPB bumping model: a picture is held until at most
-/// `max_num_reorder_frames` pictures precede it in the buffer, an IDR drains the
-/// previous coded video sequence (POC restarts at each IDR), and [`Self::flush`]
-/// drains the rest at end of stream.
+/// `reorder_depth` pictures precede it in the buffer, a keyframe drains the
+/// previous coded video sequence (display order restarts there), and
+/// [`Self::flush`] drains the rest at end of stream.
 ///
 /// When disabled (decode-order mode) it is a pass-through: no copy, no latency,
 /// and the returned frame points straight at the decoder's DPB image.
 pub(crate) struct ReorderBuffer {
     enabled: bool,
-    pool: Vec<PoolImage>,
+    pool: FramePool,
     buffered: Vec<ReorderEntry>,
 }
 
@@ -1171,57 +1351,62 @@ impl ReorderBuffer {
     pub fn new(enabled: bool) -> Self {
         Self {
             enabled,
-            pool: Vec::new(),
+            pool: FramePool::new(),
             buffered: Vec::new(),
-        }
-    }
-
-    /// Reclaim the images returned by the previous call. Must run before a
-    /// `decode`/`flush` produces new frames: it is what makes the "valid until
-    /// the next decode/flush" contract hold.
-    fn begin_batch(&mut self) {
-        for img in &mut self.pool {
-            if img.state == PoolState::HandedOut {
-                img.state = PoolState::Free;
-            }
         }
     }
 
     /// Add a freshly decoded picture and return whatever is now ready to output.
     ///
-    /// `reorder_depth` is the stream's `max_num_reorder_frames`.
+    /// `reorder_depth` is how many pictures may precede a held one before it
+    /// has to be emitted.
     pub fn push(
         &mut self,
         common: &DecoderCommon,
-        frame: &DecodedFrame,
+        picture: &DecodedPicture,
         reorder_depth: usize,
     ) -> Result<Vec<DecodedFrame>> {
         if !self.enabled {
-            return Ok(vec![frame.clone()]);
+            // Decode order: hand out the decoder's own image. Valid only until
+            // the next decode submission; see `DecodedFrame`.
+            return Ok(vec![DecodedFrame {
+                image: picture.image,
+                image_view: picture.image_view,
+                layout: picture.layout,
+                array_layer: picture.array_layer,
+                pixel_format: picture.pixel_format,
+                width: picture.width,
+                height: picture.height,
+                coded_width: picture.coded_width,
+                coded_height: picture.coded_height,
+                pts: picture.pts,
+                display_order: picture.display_order,
+                is_keyframe: picture.is_keyframe,
+                pin: None,
+            }]);
         }
-        self.begin_batch();
 
         let mut out = Vec::new();
-        // POC restarts at an IDR, so the previous sequence must be fully drained
-        // before this picture (which belongs to the new one) is buffered.
-        if frame.is_keyframe {
+        // Display order restarts at a keyframe, so the previous sequence must be
+        // fully drained before this picture, which belongs to the new one.
+        if picture.is_keyframe {
             out.extend(self.drain_all());
         }
 
-        let pool_index = self.acquire_slot(common, frame)?;
-        common.copy_frame_to_image(frame, self.pool[pool_index].image)?;
-        self.pool[pool_index].state = PoolState::Buffered;
+        let pool_index = self.pool.acquire(common, picture)?;
+        common.copy_picture_to_image(picture, self.pool.images[pool_index].image)?;
+        self.pool.images[pool_index].state = PoolState::Buffered;
         self.buffered.push(ReorderEntry {
             pool_index,
-            display_order: frame.display_order,
-            pts: frame.pts,
-            is_keyframe: frame.is_keyframe,
-            width: frame.width,
-            height: frame.height,
-            coded_width: frame.coded_width,
-            coded_height: frame.coded_height,
-            array_layer: frame.array_layer,
-            pixel_format: frame.pixel_format,
+            display_order: picture.display_order,
+            pts: picture.pts,
+            is_keyframe: picture.is_keyframe,
+            width: picture.width,
+            height: picture.height,
+            coded_width: picture.coded_width,
+            coded_height: picture.coded_height,
+            array_layer: picture.array_layer,
+            pixel_format: picture.pixel_format,
         });
 
         while self.buffered.len() > reorder_depth {
@@ -1235,11 +1420,10 @@ impl ReorderBuffer {
         if !self.enabled {
             return Vec::new();
         }
-        self.begin_batch();
         self.drain_all()
     }
 
-    /// Drain the whole buffer in ascending POC order.
+    /// Drain the whole buffer in ascending display order.
     fn drain_all(&mut self) -> Vec<DecodedFrame> {
         let mut out = Vec::with_capacity(self.buffered.len());
         while !self.buffered.is_empty() {
@@ -1248,7 +1432,7 @@ impl ReorderBuffer {
         out
     }
 
-    /// Remove and return the buffered picture with the smallest POC.
+    /// Remove and return the buffered picture that comes first in display order.
     fn pop_min_display_order(&mut self) -> DecodedFrame {
         let i = self
             .buffered
@@ -1258,14 +1442,13 @@ impl ReorderBuffer {
             .map(|(i, _)| i)
             .expect("buffer is non-empty");
         let entry = self.buffered.remove(i);
-        let img = &mut self.pool[entry.pool_index];
-        img.state = PoolState::HandedOut;
+        let pin = self.pool.hand_out(entry.pool_index);
         DecodedFrame {
-            image: img.image,
+            image: self.pool.images[entry.pool_index].image,
             // Pool images carry no view (see PoolImage); a caller needing one
             // for GPU work creates it over `image` with the usage it wants.
             image_view: vk::ImageView::null(),
-            // copy_frame_to_image leaves the pool image in TRANSFER_DST layout.
+            // copy_picture_to_image leaves the pool image in TRANSFER_DST layout.
             layout: vk::ImageLayout::TRANSFER_DST_OPTIMAL,
             array_layer: entry.array_layer,
             pixel_format: entry.pixel_format,
@@ -1276,73 +1459,22 @@ impl ReorderBuffer {
             pts: entry.pts,
             display_order: entry.display_order,
             is_keyframe: entry.is_keyframe,
+            pin: Some(pin),
         }
     }
 
-    /// A free pool image matching the picture, creating or resizing one as
-    /// needed. Resolution changes are handled by recreating a mismatched slot.
-    fn acquire_slot(&mut self, common: &DecoderCommon, frame: &DecodedFrame) -> Result<usize> {
-        let format = common
-            .session
-            .as_ref()
-            .map(|s| s.picture_format)
-            .expect("session active while decoding");
-
-        let matching = self.pool.iter().position(|p| {
-            p.state == PoolState::Free
-                && p.coded_width == frame.coded_width
-                && p.coded_height == frame.coded_height
-                && p.format == format
-        });
-        if let Some(i) = matching {
-            return Ok(i);
-        }
-
-        let (image, memory) = create_pool_image(
-            &common.context,
-            frame.coded_width,
-            frame.coded_height,
-            format,
-        )?;
-        let slot = PoolImage {
-            image,
-            memory,
-            coded_width: frame.coded_width,
-            coded_height: frame.coded_height,
-            format,
-            state: PoolState::Free,
-        };
-
-        // Reuse a free-but-mismatched slot if one exists, else grow the pool.
-        if let Some(i) = self.pool.iter().position(|p| p.state == PoolState::Free) {
-            self.destroy_pool_image(common, i);
-            self.pool[i] = slot;
-            Ok(i)
-        } else {
-            self.pool.push(slot);
-            Ok(self.pool.len() - 1)
-        }
-    }
-
-    fn destroy_pool_image(&mut self, common: &DecoderCommon, i: usize) {
-        let p = &self.pool[i];
-        if p.image == vk::Image::null() {
-            return;
-        }
-        unsafe {
-            common.context.device().device_wait_idle().ok();
-            common.context.device().destroy_image(p.image, None);
-            common.context.device().free_memory(p.memory, None);
-        }
-    }
-
-    /// Free every pool image. The caller must be done with handed-out frames.
+    /// Free every pool image.
+    ///
+    /// Frames the caller still holds point at these images, so this warns rather
+    /// than silently leaving dangling handles behind.
     pub fn destroy(&mut self, common: &DecoderCommon) {
-        for i in 0..self.pool.len() {
-            self.destroy_pool_image(common, i);
-            self.pool[i].image = vk::Image::null();
+        if self.pool.has_live_frames() {
+            tracing::warn!(
+                "decoder dropped while decoded frames are still alive; their images \
+                 are now invalid. Drop every DecodedFrame before the Decoder."
+            );
         }
-        self.pool.clear();
+        self.pool.destroy(common);
         self.buffered.clear();
     }
 }

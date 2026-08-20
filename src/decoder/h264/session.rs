@@ -7,7 +7,9 @@ use ash::vk;
 use ash::vk::TaggedStructure;
 use tracing::debug;
 
-use crate::decoder::codec::{DecoderCommon, ReorderBuffer, SessionPlan, query_decode_caps};
+use crate::decoder::codec::{
+    DecodedPicture, DecoderCommon, ReorderBuffer, SessionPlan, query_decode_caps,
+};
 use crate::decoder::h264::dpb::{DecodeDpb, PictureState};
 use crate::decoder::h264::parser::{
     self, NalType, NalUnit, Pps, SliceHeader, SliceType, Sps, iter_nal_units,
@@ -557,7 +559,7 @@ impl H264Decoder {
         picture: &Picture,
         sps: &Sps,
         pts: u64,
-    ) -> Result<Option<DecodedFrame>> {
+    ) -> Result<Option<DecodedPicture>> {
         // --- Host-side bookkeeping: POC, slot, reference set ---
         let state = {
             let dpb = self.dpb.as_mut().expect("activated above");
@@ -600,7 +602,7 @@ impl H264Decoder {
         };
 
         let (width, height) = sps.display_dimensions();
-        let frame = DecodedFrame {
+        let frame = DecodedPicture {
             image,
             image_view,
             layout,

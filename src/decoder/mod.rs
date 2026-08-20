@@ -84,13 +84,17 @@ impl DecodeConfig {
 ///
 /// # Validity
 ///
-/// [`image`](Self::image) is a decoder-owned GPU image. It remains valid and
-/// unmodified until **the next call to [`Decoder::decode`] or
-/// [`Decoder::flush`]**, at which point the decoder may reuse it. For zero-copy
-/// consumption, use the image (sample it, copy it, encode from it) before
-/// feeding more data to the decoder; for retention, use [`Decoder::download`]
-/// or copy it to an image you own.
-#[derive(Debug, Clone)]
+/// [`image`](Self::image) is a decoder-owned GPU image whose storage the frame
+/// keeps reserved: in [`OutputOrder::Display`] it stays valid and unmodified for
+/// as long as the frame is alive, and dropping the frame returns the image to
+/// the decoder for reuse. Hold frames only as long as needed, and drop every
+/// frame before the [`Decoder`] itself.
+///
+/// In [`OutputOrder::Decode`] the frame points straight at the decoder's DPB
+/// image with no copy, and is only valid until the next [`Decoder::decode`] or
+/// [`Decoder::flush`] call. For retention there, use [`Decoder::download`] or
+/// copy it into an image you own.
+#[derive(Debug)]
 pub struct DecodedFrame {
     /// The decoded picture on the GPU.
     ///
@@ -130,6 +134,11 @@ pub struct DecodedFrame {
     /// Whether this frame is a keyframe: a random-access point starting a new
     /// coded video sequence (H.264 IDR, H.265 IRAP, AV1 key frame).
     pub is_keyframe: bool,
+    /// Keeps this frame's storage reserved; releases it on drop. `None` for a
+    /// frame that borrows the decoder's DPB image (see the validity rules).
+    // Held purely for its `Drop`, which is what returns the storage.
+    #[allow(dead_code)]
+    pub(crate) pin: Option<codec::FramePin>,
 }
 
 /// Decoded frame data downloaded to the CPU.
