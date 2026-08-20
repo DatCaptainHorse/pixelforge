@@ -345,14 +345,16 @@ impl H264Decoder {
 
         debug!(
             "H.264 decode session: {}x{} {:?}, {} DPB slots ({} for output), \
-             layered={}, coincide={}",
+             layered={}, coincide={}, bitstream alignment {}/{} (offset/size)",
             coded_width,
             coded_height,
             picture_format,
             slot_count,
             output_slots,
             use_layered_dpb,
-            coincide
+            coincide,
+            self.common.bitstream_offset_alignment,
+            self.common.bitstream_size_alignment
         );
         Ok(())
     }
