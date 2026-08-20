@@ -7,6 +7,47 @@ use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
 use tracing::{debug, info, warn};
 
+/// Route validation-layer messages into `tracing`.
+///
+/// Without a messenger the validation layer has nowhere to report to and its
+/// findings are silently dropped, which makes "no validation errors" impossible
+/// to verify. Severities map onto tracing levels so `RUST_LOG` controls the
+/// noise: errors and warnings are always worth seeing, the layer's
+/// informational chatter sits at debug.
+unsafe extern "system" fn debug_utils_callback(
+    severity: vk::DebugUtilsMessageSeverityFlagsEXT,
+    message_types: vk::DebugUtilsMessageTypeFlagsEXT,
+    callback_data: *const vk::DebugUtilsMessengerCallbackDataEXT<'_>,
+    _user_data: *mut std::os::raw::c_void,
+) -> vk::Bool32 {
+    let data = unsafe { &*callback_data };
+    let message = if data.p_message.is_null() {
+        std::borrow::Cow::Borrowed("(no message)")
+    } else {
+        unsafe { CStr::from_ptr(data.p_message) }.to_string_lossy()
+    };
+    let kind = if message_types.contains(vk::DebugUtilsMessageTypeFlagsEXT::VALIDATION) {
+        "validation"
+    } else if message_types.contains(vk::DebugUtilsMessageTypeFlagsEXT::PERFORMANCE) {
+        "performance"
+    } else {
+        "general"
+    };
+
+    if severity.contains(vk::DebugUtilsMessageSeverityFlagsEXT::ERROR) {
+        tracing::error!("Vulkan {kind}: {message}");
+    } else if severity.contains(vk::DebugUtilsMessageSeverityFlagsEXT::WARNING) {
+        warn!("Vulkan {kind}: {message}");
+    } else if severity.contains(vk::DebugUtilsMessageSeverityFlagsEXT::INFO) {
+        debug!("Vulkan {kind}: {message}");
+    } else {
+        tracing::trace!("Vulkan {kind}: {message}");
+    }
+
+    // Never abort the offending call; the caller decides what to do about it.
+    vk::FALSE
+}
+
 /// Builder for creating a VideoContext.
 #[must_use]
 pub struct VideoContextBuilder {
@@ -284,6 +325,9 @@ struct VideoContextInner {
     /// instance. A context adopted from a caller's device via
     /// [`VideoContext::from_existing_decode`] borrows them and destroys neither.
     owns_device: bool,
+    /// Validation message sink, present only when validation is enabled and the
+    /// instance is ours. Destroyed before the instance it belongs to.
+    debug_messenger: Option<(ash::ext::debug_utils::Instance, vk::DebugUtilsMessengerEXT)>,
 }
 
 impl Drop for VideoContextInner {
@@ -293,6 +337,9 @@ impl Drop for VideoContextInner {
         if self.owns_device {
             unsafe {
                 self.device.destroy_device(None);
+                if let Some((debug_utils, messenger)) = &self.debug_messenger {
+                    debug_utils.destroy_debug_utils_messenger(*messenger, None);
+                }
                 self.instance.destroy_instance(None);
             }
         }
@@ -450,6 +497,25 @@ impl VideoContext {
             }
         }
 
+        // VK_EXT_debug_utils carries the messenger the layer reports through.
+        let mut has_debug_utils = false;
+        if enable_validation {
+            let available_exts = unsafe { entry.enumerate_instance_extension_properties(None) }
+                .map_err(|e| PixelForgeError::InstanceCreation(e.to_string()))?;
+            has_debug_utils = available_exts.iter().any(|ext| {
+                let name = unsafe { CStr::from_ptr(ext.extension_name.as_ptr()) };
+                name == ash::ext::debug_utils::NAME
+            });
+            if has_debug_utils {
+                instance_extensions.push(ash::ext::debug_utils::NAME.as_ptr());
+            } else {
+                warn!(
+                    "VK_EXT_debug_utils not available; validation layer messages will not be \
+                     reported"
+                );
+            }
+        }
+
         let create_info = vk::InstanceCreateInfo::default()
             .application_info(&app_info)
             .enabled_layer_names(&layer_names)
@@ -459,6 +525,28 @@ impl VideoContext {
             .map_err(|e| PixelForgeError::InstanceCreation(e.to_string()))?;
 
         info!("Created Vulkan instance");
+
+        let debug_messenger = if has_debug_utils {
+            let debug_utils = ash::ext::debug_utils::Instance::load(&entry, &instance);
+            let create_info = vk::DebugUtilsMessengerCreateInfoEXT::default()
+                .message_severity(
+                    vk::DebugUtilsMessageSeverityFlagsEXT::ERROR
+                        | vk::DebugUtilsMessageSeverityFlagsEXT::WARNING
+                        | vk::DebugUtilsMessageSeverityFlagsEXT::INFO,
+                )
+                .message_type(
+                    vk::DebugUtilsMessageTypeFlagsEXT::GENERAL
+                        | vk::DebugUtilsMessageTypeFlagsEXT::VALIDATION
+                        | vk::DebugUtilsMessageTypeFlagsEXT::PERFORMANCE,
+                )
+                .pfn_user_callback(Some(debug_utils_callback));
+            let messenger = unsafe { debug_utils.create_debug_utils_messenger(&create_info, None) }
+                .map_err(|e| PixelForgeError::InstanceCreation(e.to_string()))?;
+            info!("Validation layer messages are routed to tracing");
+            Some((debug_utils, messenger))
+        } else {
+            None
+        };
 
         // Find physical device with video support.
         let physical_devices = unsafe { instance.enumerate_physical_devices() }
@@ -922,6 +1010,7 @@ impl VideoContext {
                 supported_decode_codecs,
                 has_descriptor_buffer,
                 owns_device: true,
+                debug_messenger,
             }),
         })
     }
@@ -982,6 +1071,8 @@ impl VideoContext {
                 supported_decode_codecs,
                 has_descriptor_buffer: false,
                 owns_device: false,
+                // The caller owns the instance; reporting is theirs to set up.
+                debug_messenger: None,
             }),
         })
     }
