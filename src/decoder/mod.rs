@@ -1,8 +1,10 @@
 //! Hardware-accelerated video decoding using Vulkan Video.
 //!
-//! The decoder consumes a raw byte stream (Annex B for H.264: start-code
-//! delimited NAL units) and produces decoded frames as GPU images
-//! (`vk::Image`), optionally with CPU readback.
+//! The decoder consumes a coded byte stream and produces decoded frames as GPU
+//! images (`vk::Image`), optionally with CPU readback. Each [`Decoder::decode`]
+//! call takes the bytes of one coded frame, which [`Decoder::split`] carves out
+//! of a larger buffer using whatever framing the codec uses (Annex B start
+//! codes for H.264/H.265, OBU temporal units for AV1).
 //!
 //! # Design
 //!
@@ -39,15 +41,16 @@ use ash::vk;
 /// The order in which [`Decoder::decode`] returns frames.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutputOrder {
-    /// Presentation order (default). Frames come out sorted by picture order
-    /// count, matching how a player would show them. The decoder buffers a
-    /// bounded number of frames (the stream's `max_num_reorder_frames`), so
-    /// call [`Decoder::flush`] at end of stream to drain the rest. For streams
-    /// without B-frames this adds no latency and behaves like [`Self::Decode`].
+    /// Presentation order (default). Frames come out sorted by
+    /// [`display_order`](DecodedFrame::display_order), matching how a player
+    /// would show them. The decoder buffers a bounded number of frames (the
+    /// stream's own reorder depth), so call [`Decoder::flush`] at end of stream
+    /// to drain the rest. For streams without B-frames this adds no latency and
+    /// behaves like [`Self::Decode`].
     Display,
     /// Decode order: frames are returned the moment their GPU work completes,
     /// the lowest-latency option. With B-frames the caller must reorder by
-    /// [`DecodedFrame::poc`] if presentation order matters.
+    /// [`DecodedFrame::display_order`] if presentation order matters.
     Decode,
 }
 
@@ -118,11 +121,15 @@ pub struct DecodedFrame {
     pub coded_height: u32,
     /// Presentation timestamp, passed through from [`Decoder::decode`].
     pub pts: u64,
-    /// Picture order count (presentation order within a coded video sequence).
-    /// In [`OutputOrder::Decode`] mode, sort by this for presentation order.
-    pub poc: i32,
-    /// Whether this frame is an IDR (stream random-access point).
-    pub is_idr: bool,
+    /// Position of this frame in presentation order within the current coded
+    /// video sequence: the codec's own ordering value (H.26x picture order
+    /// count, AV1 order hint). Only the relative ordering carries meaning, and
+    /// it restarts at every keyframe. In [`OutputOrder::Decode`] mode, sort by
+    /// this for presentation order.
+    pub display_order: i32,
+    /// Whether this frame is a keyframe: a random-access point starting a new
+    /// coded video sequence (H.264 IDR, H.265 IRAP, AV1 key frame).
+    pub is_keyframe: bool,
 }
 
 /// Decoded frame data downloaded to the CPU.
@@ -146,64 +153,9 @@ pub struct DecodedFrameData {
     pub pixel_format: PixelFormat,
 }
 
-/// Split an Annex B stream into access units (one coded picture each).
-///
-/// [`Decoder::decode`] treats the end of its input as a picture boundary, so
-/// callers feeding a whole file must split it first. Feeding one access unit
-/// per call is also the lowest-latency usage.
-///
-/// A new access unit begins at each VCL NAL whose `first_mb_in_slice` is 0.
-/// Parameter sets, SEI and access unit delimiters are attached to the picture
-/// that follows them.
-///
-/// ```no_run
-/// # use pixelforge::decoder::{access_units, Decoder};
-/// # fn run(decoder: &mut Decoder, stream: &[u8]) -> pixelforge::error::Result<()> {
-/// for (i, au) in access_units(stream).enumerate() {
-///     for frame in decoder.decode(au, i as u64)? {
-///         // ... use frame before the next decode() call ...
-///     }
-/// }
-/// # Ok(())
-/// # }
-/// ```
-pub fn access_units(stream: &[u8]) -> impl Iterator<Item = &[u8]> {
-    let mut starts: Vec<usize> = Vec::new();
-    let mut pending_start: Option<usize> = None;
-
-    for nal in h264::parser::iter_nal_units_with_offsets(stream) {
-        let (offset, nal) = nal;
-        if nal.nal_type.is_slice() {
-            // first_mb_in_slice is the leading ue(v) of the slice header; it is
-            // zero — encoded as a leading `1` bit — exactly at a picture start.
-            let first_mb_is_zero = nal.payload().first().is_some_and(|b| b & 0x80 != 0);
-            if first_mb_is_zero {
-                starts.push(pending_start.take().unwrap_or(offset));
-            }
-            pending_start = None;
-        } else if pending_start.is_none() {
-            // Parameter sets / SEI / AUD belong to the picture they precede.
-            pending_start = Some(offset);
-        }
-    }
-
-    let ends: Vec<usize> = starts
-        .iter()
-        .skip(1)
-        .copied()
-        .chain(std::iter::once(stream.len()))
-        .collect();
-
-    starts
-        .into_iter()
-        .zip(ends)
-        .map(move |(start, end)| &stream[start..end])
-        .collect::<Vec<_>>()
-        .into_iter()
-}
-
 /// The codec-erased operations every codec decoder exposes.
 trait DecoderApi: Send {
+    fn split_stream<'a>(&self, stream: &'a [u8]) -> Vec<&'a [u8]>;
     fn decode(&mut self, data: &[u8], pts: u64) -> Result<Vec<DecodedFrame>>;
     fn flush(&mut self) -> Result<Vec<DecodedFrame>>;
     fn download(&mut self, frame: &DecodedFrame) -> Result<DecodedFrameData>;
@@ -250,22 +202,53 @@ impl Decoder {
         Ok(Decoder(inner))
     }
 
-    /// Decode a chunk of the raw byte stream.
+    /// Split a coded byte stream into one slice per coded frame.
     ///
-    /// `data` may contain any number of *complete* access units (Annex B
-    /// start codes for H.264): parameter sets, one access unit, or several.
-    /// The end of `data` is treated as an access-unit boundary, so a picture
-    /// must not be split across calls. For lowest latency, feed exactly one
-    /// access unit per call; the picture is decoded immediately and returned
-    /// from the same call.
+    /// [`decode`](Self::decode) treats the end of its input as a frame
+    /// boundary, so a caller holding a whole file or a large buffer must split
+    /// it first. Framing is the codec's own: Annex B start codes and slice
+    /// headers for H.264/H.265, OBU temporal units for AV1. Non-picture data
+    /// (parameter sets, SEI, sequence headers) is attached to the coded frame
+    /// that follows it, so feeding the pieces back in order is lossless.
+    ///
+    /// The returned slices borrow `stream`. Feeding one per [`decode`](Self::decode)
+    /// call is also the lowest-latency usage.
+    ///
+    /// ```no_run
+    /// # use pixelforge::decoder::Decoder;
+    /// # fn run(decoder: &mut Decoder, stream: &[u8]) -> pixelforge::error::Result<()> {
+    /// for (i, unit) in decoder.split(stream).enumerate() {
+    ///     for frame in decoder.decode(unit, i as u64)? {
+    ///         // ... use frame before the next decode() call ...
+    ///     }
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    //
+    // `use<'a>` keeps the iterator from capturing the borrow of `self`, so the
+    // caller can call `decode` while iterating the split units.
+    pub fn split<'a>(&self, stream: &'a [u8]) -> impl Iterator<Item = &'a [u8]> + use<'a> {
+        self.0.split_stream(stream).into_iter()
+    }
+
+    /// Decode a chunk of the coded byte stream.
+    ///
+    /// `data` may hold any number of *complete* coded frames, plus whatever
+    /// non-picture data the codec carries alongside them (H.26x parameter sets
+    /// and SEI, AV1 sequence headers). The end of `data` is treated as a frame
+    /// boundary, so a picture must not be split across calls: use
+    /// [`split`](Self::split) to carve a buffer into decodable pieces. For
+    /// lowest latency feed exactly one coded frame per call; the picture is
+    /// decoded immediately and returned from the same call.
     ///
     /// `pts` is attached to every frame produced by this call.
     ///
     /// Returns decoded frames in the configured [`OutputOrder`] (display order
-    /// by default). In display order the count returned per call varies — a
-    /// picture may be held back until later ones are decoded — so drain the
+    /// by default). In display order the count returned per call varies, since a
+    /// picture may be held back until later ones are decoded, so drain the
     /// remainder with [`flush`](Self::flush) at end of stream. In decode order
-    /// it is usually zero or one frame per access unit fed.
+    /// it is usually zero or one frame per coded frame fed.
     pub fn decode(&mut self, data: &[u8], pts: u64) -> Result<Vec<DecodedFrame>> {
         self.0.decode(data, pts)
     }

@@ -12,7 +12,7 @@
 use std::fs::File;
 use std::io::Write;
 
-use pixelforge::decoder::{DecodeConfig, Decoder, access_units};
+use pixelforge::decoder::{DecodeConfig, Decoder};
 use pixelforge::encoder::Codec;
 use pixelforge::vulkan::VideoContextBuilder;
 
@@ -70,7 +70,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Ok(())
     };
 
-    for au in access_units(&stream) {
+    for au in decoder.split(&stream) {
         let decoded = match decoder.decode(au, frame_count as u64) {
             Ok(frames) => frames,
             // Joining mid-stream (or after loss): skip until a keyframe. A live
@@ -80,13 +80,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
         for frame in decoded {
             write(&mut decoder, &frame, &mut output)?;
-            last_info = Some((frame.width, frame.height, frame.poc, frame.is_idr));
+            last_info = Some((
+                frame.width,
+                frame.height,
+                frame.display_order,
+                frame.is_keyframe,
+            ));
             frame_count += 1;
         }
     }
     for frame in decoder.flush()? {
         write(&mut decoder, &frame, &mut output)?;
-        last_info = Some((frame.width, frame.height, frame.poc, frame.is_idr));
+        last_info = Some((
+            frame.width,
+            frame.height,
+            frame.display_order,
+            frame.is_keyframe,
+        ));
         frame_count += 1;
     }
     let decode_time = start.elapsed();
@@ -97,8 +107,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         decode_time,
         frame_count as f64 / decode_time.as_secs_f64()
     );
-    if let Some((w, h, poc, idr)) = last_info {
-        println!("Last frame: {}x{} poc={} idr={}", w, h, poc, idr);
+    if let Some((w, h, order, key)) = last_info {
+        println!(
+            "Last frame: {}x{} display_order={} keyframe={}",
+            w, h, order, key
+        );
     }
     if let Some(path) = output_path {
         println!("Wrote raw frames to {}", path);

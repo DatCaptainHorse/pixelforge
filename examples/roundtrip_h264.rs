@@ -18,7 +18,7 @@ use std::collections::VecDeque;
 use std::fs::File;
 use std::io::{Read, Write};
 
-use pixelforge::decoder::{DecodeConfig, Decoder, access_units};
+use pixelforge::decoder::{DecodeConfig, Decoder};
 use pixelforge::{
     Codec, EncodeBitDepth, EncodeConfig, Encoder, InputImage, PixelFormat, RateControlMode,
     VideoContextBuilder,
@@ -117,7 +117,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Ok(())
     };
 
-    for au in access_units(&bitstream) {
+    for au in decoder.split(&bitstream) {
         for frame in decoder.decode(au, decoded_count as u64)? {
             write(&mut decoder, &frame, &mut out, &mut decoded_count)?;
         }

@@ -15,7 +15,7 @@ use std::io::Write;
 
 use ash::vk;
 use ash::vk::TaggedStructure;
-use pixelforge::decoder::{DecodeConfig, Decoder, access_units};
+use pixelforge::decoder::{DecodeConfig, Decoder};
 use pixelforge::encoder::Codec;
 use pixelforge::vulkan::VideoContextBuilder;
 
@@ -113,7 +113,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Ok(())
     };
 
-    for (i, au) in access_units(&stream).enumerate() {
+    for (i, au) in decoder.split(&stream).enumerate() {
         for frame in decoder.decode(au, i as u64)? {
             write(&mut decoder, &frame, &mut output, &mut count)?;
         }

@@ -303,17 +303,17 @@ fn parses_level_and_ref_frames() {
     }
 }
 
-/// `access_units` must split a stream into exactly one unit per coded picture,
+/// `split_stream` must split a stream into exactly one unit per coded picture,
 /// losing no bytes and keeping parameter sets with the picture they configure.
 #[test]
-fn splits_stream_into_access_units() {
+fn splits_stream_into_coded_frames() {
     for (name, data) in [
         ("baseline", BASELINE),
         ("zerolatency", ZEROLATENCY),
         ("bframes", BFRAMES),
         ("multislice", MULTISLICE),
     ] {
-        let units: Vec<_> = crate::decoder::access_units(data).collect();
+        let units = super::split_stream(data);
 
         // Each fixture is 30 coded pictures.
         assert_eq!(units.len(), 30, "{name}: one access unit per picture");
@@ -367,7 +367,7 @@ fn multislice_pictures_form_one_access_unit() {
     let slice_nals = iter_nal_units(MULTISLICE)
         .filter(|n| n.nal_type.is_slice())
         .count();
-    let units: Vec<_> = crate::decoder::access_units(MULTISLICE).collect();
+    let units = super::split_stream(MULTISLICE);
 
     // The fixture really is multi-slice: 4 slices per picture, 30 pictures.
     assert_eq!(slice_nals, 120, "fixture should hold 120 slice NALs");

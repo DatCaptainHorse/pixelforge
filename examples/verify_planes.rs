@@ -6,7 +6,7 @@
 
 use ash::vk;
 use ash::vk::TaggedStructure;
-use pixelforge::decoder::{DecodeConfig, Decoder, access_units};
+use pixelforge::decoder::{DecodeConfig, Decoder};
 use pixelforge::vulkan::VideoContextBuilder;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -120,7 +120,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Ok(())
     };
 
-    for (i, au) in access_units(&stream).enumerate() {
+    for (i, au) in decoder.split(&stream).enumerate() {
         for f in decoder.decode(au, i as u64)? {
             handle(&mut decoder, &f, &mut out)?;
             count += 1;

@@ -1136,9 +1136,9 @@ struct PoolImage {
 /// A buffered picture, referencing its pool image by index.
 struct ReorderEntry {
     pool_index: usize,
-    poc: i32,
+    display_order: i32,
     pts: u64,
-    is_idr: bool,
+    is_keyframe: bool,
     width: u32,
     height: u32,
     coded_width: u32,
@@ -1204,7 +1204,7 @@ impl ReorderBuffer {
         let mut out = Vec::new();
         // POC restarts at an IDR, so the previous sequence must be fully drained
         // before this picture (which belongs to the new one) is buffered.
-        if frame.is_idr {
+        if frame.is_keyframe {
             out.extend(self.drain_all());
         }
 
@@ -1213,9 +1213,9 @@ impl ReorderBuffer {
         self.pool[pool_index].state = PoolState::Buffered;
         self.buffered.push(ReorderEntry {
             pool_index,
-            poc: frame.poc,
+            display_order: frame.display_order,
             pts: frame.pts,
-            is_idr: frame.is_idr,
+            is_keyframe: frame.is_keyframe,
             width: frame.width,
             height: frame.height,
             coded_width: frame.coded_width,
@@ -1225,7 +1225,7 @@ impl ReorderBuffer {
         });
 
         while self.buffered.len() > reorder_depth {
-            out.push(self.pop_min_poc());
+            out.push(self.pop_min_display_order());
         }
         Ok(out)
     }
@@ -1243,18 +1243,18 @@ impl ReorderBuffer {
     fn drain_all(&mut self) -> Vec<DecodedFrame> {
         let mut out = Vec::with_capacity(self.buffered.len());
         while !self.buffered.is_empty() {
-            out.push(self.pop_min_poc());
+            out.push(self.pop_min_display_order());
         }
         out
     }
 
     /// Remove and return the buffered picture with the smallest POC.
-    fn pop_min_poc(&mut self) -> DecodedFrame {
+    fn pop_min_display_order(&mut self) -> DecodedFrame {
         let i = self
             .buffered
             .iter()
             .enumerate()
-            .min_by_key(|(_, e)| e.poc)
+            .min_by_key(|(_, e)| e.display_order)
             .map(|(i, _)| i)
             .expect("buffer is non-empty");
         let entry = self.buffered.remove(i);
@@ -1274,8 +1274,8 @@ impl ReorderBuffer {
             coded_width: entry.coded_width,
             coded_height: entry.coded_height,
             pts: entry.pts,
-            poc: entry.poc,
-            is_idr: entry.is_idr,
+            display_order: entry.display_order,
+            is_keyframe: entry.is_keyframe,
         }
     }
 

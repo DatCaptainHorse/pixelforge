@@ -611,8 +611,8 @@ impl H264Decoder {
             coded_width: active.coded_width,
             coded_height: active.coded_height,
             pts,
-            poc: state.poc,
-            is_idr: state.is_idr,
+            display_order: state.poc,
+            is_keyframe: state.is_idr,
         };
 
         self.dpb

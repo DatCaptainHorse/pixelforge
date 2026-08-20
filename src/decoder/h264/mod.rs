@@ -19,7 +19,49 @@ use ash::vk;
 
 pub(crate) use session::H264Decoder;
 
+/// Split an Annex B stream into one slice per coded picture.
+///
+/// A new picture begins at each VCL NAL whose `first_mb_in_slice` is 0.
+/// Parameter sets, SEI and access unit delimiters are attached to the picture
+/// that follows them, so the units can be fed back in order without loss.
+pub(crate) fn split_stream(stream: &[u8]) -> Vec<&[u8]> {
+    let mut starts: Vec<usize> = Vec::new();
+    let mut pending_start: Option<usize> = None;
+
+    for (offset, nal) in parser::iter_nal_units_with_offsets(stream) {
+        if nal.nal_type.is_slice() {
+            // first_mb_in_slice is the leading ue(v) of the slice header; it is
+            // zero -- encoded as a leading `1` bit -- exactly at a picture start.
+            let first_mb_is_zero = nal.payload().first().is_some_and(|b| b & 0x80 != 0);
+            if first_mb_is_zero {
+                starts.push(pending_start.take().unwrap_or(offset));
+            }
+            pending_start = None;
+        } else if pending_start.is_none() {
+            // Parameter sets / SEI / AUD belong to the picture they precede.
+            pending_start = Some(offset);
+        }
+    }
+
+    let ends = starts
+        .iter()
+        .skip(1)
+        .copied()
+        .chain(std::iter::once(stream.len()));
+
+    starts
+        .iter()
+        .copied()
+        .zip(ends)
+        .map(|(start, end)| &stream[start..end])
+        .collect()
+}
+
 impl crate::decoder::DecoderApi for H264Decoder {
+    fn split_stream<'a>(&self, stream: &'a [u8]) -> Vec<&'a [u8]> {
+        split_stream(stream)
+    }
+
     fn decode(&mut self, data: &[u8], pts: u64) -> Result<Vec<DecodedFrame>> {
         H264Decoder::decode(self, data, pts)
     }
