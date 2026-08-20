@@ -80,10 +80,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         reqs.extensions.iter().map(|e| e.as_ptr()).collect();
 
     let mut sync2 = vk::PhysicalDeviceSynchronization2Features::default().synchronization2(true);
+    // The decoder orders its pipelined submissions with timeline semaphores.
+    let mut timeline =
+        vk::PhysicalDeviceTimelineSemaphoreFeatures::default().timeline_semaphore(true);
     let device_info = vk::DeviceCreateInfo::default()
         .queue_create_infos(&queue_infos)
         .enabled_extension_names(&ext_ptrs)
-        .push(&mut sync2);
+        .push(&mut sync2)
+        .push(&mut timeline);
     let device = unsafe { instance.create_device(physical_device, &device_info, None)? };
 
     // --- Hand the app's device to pixelforge ---
@@ -114,11 +118,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     for (i, au) in decoder.split(&stream).enumerate() {
-        for frame in decoder.decode(au, i as u64)? {
+        for frame in pollster::block_on(decoder.decode(au, i as u64)?)? {
             write(&mut decoder, &frame, &mut output, &mut count)?;
         }
     }
-    for frame in decoder.flush()? {
+    for frame in pollster::block_on(decoder.flush()?)? {
         write(&mut decoder, &frame, &mut output, &mut count)?;
     }
     println!("Decoded {} frames on the adopted device", count);

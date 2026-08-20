@@ -118,11 +118,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     for au in decoder.split(&bitstream) {
-        for frame in decoder.decode(au, decoded_count as u64)? {
+        for frame in pollster::block_on(decoder.decode(au, decoded_count as u64)?)? {
             write(&mut decoder, &frame, &mut out, &mut decoded_count)?;
         }
     }
-    for frame in decoder.flush()? {
+    for frame in pollster::block_on(decoder.flush()?)? {
         write(&mut decoder, &frame, &mut out, &mut decoded_count)?;
     }
     println!("Decoded {} frames", decoded_count);

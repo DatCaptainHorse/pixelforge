@@ -21,17 +21,15 @@ use std::sync::{Arc, Condvar, Mutex};
 
 use ash::vk;
 
+use crate::decoder::pipeline::{DecodeFuture, DecodePipeline};
 use crate::decoder::{DecodedFrame, DecodedFrameData};
 use crate::encoder::{BitDepth, PixelFormat};
 use crate::error::{PixelForgeError, Result};
 use crate::video::{
-    VideoImageParams, allocate_session_memory, create_bitstream_buffer, create_dpb_images,
-    create_video_image, find_memory_type, map_bitstream_buffer,
+    VideoImageParams, allocate_session_memory, create_dpb_images, create_video_image,
+    find_memory_type,
 };
 use crate::vulkan::VideoContext;
-
-/// Initial size of the coded-data staging buffer; grows as needed.
-const INITIAL_BITSTREAM_BUFFER_SIZE: usize = 1024 * 1024;
 
 /// Annex B start code prefixed to each slice handed to the driver.
 pub(crate) const START_CODE: [u8; 4] = [0, 0, 0, 1];
@@ -152,22 +150,21 @@ pub(crate) struct DecoderCommon {
     pub decode_queue_family: u32,
 
     pub command_pool: vk::CommandPool,
-    pub command_buffer: vk::CommandBuffer,
-    pub fence: vk::Fence,
 
     /// Readback resources. The video decode queue family is a dedicated engine
     /// that does not advertise `TRANSFER_BIT` (true on RADV, among others), so
     /// copies must be recorded and submitted on the transfer queue instead.
     pub transfer_queue: vk::Queue,
     pub transfer_pool: vk::CommandPool,
+    /// Command buffer for the synchronous, caller-driven copies (`download`,
+    /// `copy_frame_to_planes`). Pipelined reorder copies use the slot's own.
     pub transfer_command_buffer: vk::CommandBuffer,
     pub transfer_fence: vk::Fence,
 
-    /// Staging buffer for coded data handed to the decode queue.
-    pub bitstream_buffer: vk::Buffer,
-    pub bitstream_memory: vk::DeviceMemory,
-    pub bitstream_ptr: *mut u8,
-    pub bitstream_size: usize,
+    /// In-flight decode submissions, their per-picture resources and the
+    /// completion thread that resolves their futures.
+    pub pipeline: DecodePipeline,
+
     /// Required alignment of bitstream buffer offsets/ranges.
     pub bitstream_offset_alignment: u64,
     pub bitstream_size_alignment: u64,
@@ -201,10 +198,10 @@ impl DecoderCommon {
         let video_decode_fn =
             ash::khr::video_decode_queue::Device::load(context.instance(), context.device());
 
-        let (command_pool, command_buffer, fence) =
-            create_command_resources(&context, decode_queue_family, "decode")?;
+        let command_pool = create_command_pool(&context, decode_queue_family, "decode")?;
         let (transfer_pool, transfer_command_buffer, transfer_fence) =
             create_command_resources(&context, context.transfer_queue_family(), "decode transfer")?;
+        let pipeline = DecodePipeline::new(&context, command_pool, transfer_pool)?;
 
         Ok(Self {
             transfer_queue: context.transfer_queue(),
@@ -214,15 +211,10 @@ impl DecoderCommon {
             decode_queue,
             decode_queue_family,
             command_pool,
-            command_buffer,
-            fence,
             transfer_pool,
             transfer_command_buffer,
             transfer_fence,
-            bitstream_buffer: vk::Buffer::null(),
-            bitstream_memory: vk::DeviceMemory::null(),
-            bitstream_ptr: std::ptr::null_mut(),
-            bitstream_size: 0,
+            pipeline,
             bitstream_offset_alignment: 1,
             bitstream_size_alignment: 1,
             readback: None,
@@ -335,6 +327,9 @@ impl DecoderCommon {
     }
 
     pub fn destroy_session(&mut self) {
+        // Let every in-flight decode finish and its future resolve before the
+        // session, DPB images and slots they refer to stop existing.
+        self.pipeline.wait_all_free();
         let Some(session) = self.session.take() else {
             return;
         };
@@ -372,43 +367,6 @@ impl DecoderCommon {
         }
     }
 
-    /// Ensure the coded-data staging buffer holds at least `size` bytes.
-    pub fn ensure_bitstream_capacity(
-        &mut self,
-        size: usize,
-        profile_info: &vk::VideoProfileInfoKHR,
-    ) -> Result<()> {
-        if self.bitstream_size >= size && self.bitstream_buffer != vk::Buffer::null() {
-            return Ok(());
-        }
-        let new_size = size.max(INITIAL_BITSTREAM_BUFFER_SIZE).next_power_of_two();
-
-        if self.bitstream_buffer != vk::Buffer::null() {
-            unsafe {
-                self.context.device().device_wait_idle().ok();
-                self.context.device().unmap_memory(self.bitstream_memory);
-                self.context
-                    .device()
-                    .destroy_buffer(self.bitstream_buffer, None);
-                self.context
-                    .device()
-                    .free_memory(self.bitstream_memory, None);
-            }
-        }
-
-        let (buffer, memory) = create_bitstream_buffer(
-            &self.context,
-            new_size,
-            vk::BufferUsageFlags::VIDEO_DECODE_SRC_KHR,
-            profile_info,
-        )?;
-        self.bitstream_ptr = map_bitstream_buffer(&self.context, memory, new_size)?;
-        self.bitstream_buffer = buffer;
-        self.bitstream_memory = memory;
-        self.bitstream_size = new_size;
-        Ok(())
-    }
-
     /// Copy a picture's slices into the staging buffer, each prefixed with a
     /// start code, and report the buffer range plus each slice's offset.
     pub fn stage_slices(
@@ -419,7 +377,9 @@ impl DecoderCommon {
         let total: usize = slices.iter().map(|s| s.len() + START_CODE.len()).sum();
         let aligned_total =
             crate::video::align_up(total as u32, self.bitstream_size_alignment as u32) as usize;
-        self.ensure_bitstream_capacity(aligned_total, profile_info)?;
+        self.pipeline
+            .ensure_bitstream_capacity(&self.context, aligned_total, profile_info)?;
+        let dst = self.pipeline.current().bitstream_ptr;
 
         let mut offsets = Vec::with_capacity(slices.len());
         let mut cursor = 0usize;
@@ -428,22 +388,18 @@ impl DecoderCommon {
             unsafe {
                 std::ptr::copy_nonoverlapping(
                     START_CODE.as_ptr(),
-                    self.bitstream_ptr.add(cursor),
+                    dst.add(cursor),
                     START_CODE.len(),
                 );
                 cursor += START_CODE.len();
-                std::ptr::copy_nonoverlapping(
-                    slice.as_ptr(),
-                    self.bitstream_ptr.add(cursor),
-                    slice.len(),
-                );
+                std::ptr::copy_nonoverlapping(slice.as_ptr(), dst.add(cursor), slice.len());
                 cursor += slice.len();
             }
         }
         // Zero the alignment padding so the driver never reads stale bytes.
         if aligned_total > cursor {
             unsafe {
-                std::ptr::write_bytes(self.bitstream_ptr.add(cursor), 0, aligned_total - cursor);
+                std::ptr::write_bytes(dst.add(cursor), 0, aligned_total - cursor);
             }
         }
         Ok((aligned_total as u64, offsets))
@@ -503,20 +459,35 @@ impl DecoderCommon {
         }
 
         let dependency = vk::DependencyInfo::default().image_memory_barriers(&barriers);
-        unsafe { device.cmd_pipeline_barrier2(self.command_buffer, &dependency) };
+        unsafe { device.cmd_pipeline_barrier2(self.decode_command_buffer(), &dependency) };
     }
 
-    /// Begin recording this picture's decode command buffer.
+    /// The decode command buffer of the picture currently being recorded.
+    pub fn decode_command_buffer(&self) -> vk::CommandBuffer {
+        self.pipeline.current().decode_command_buffer
+    }
+
+    /// The coded-data staging buffer of the picture currently being recorded.
+    pub fn bitstream_buffer(&self) -> vk::Buffer {
+        self.pipeline.current().bitstream_buffer
+    }
+
+    /// Wait until the next picture's slot is free, then begin recording into it.
+    ///
+    /// Waiting here is what makes the staging buffer and command buffers safe to
+    /// overwrite: the slot is busy until its previous submission has completed.
     pub fn begin_decode_commands(&self) -> Result<()> {
+        self.pipeline.wait_current_free();
         let device = self.context.device();
+        let command_buffer = self.decode_command_buffer();
         unsafe {
             device
-                .reset_command_buffer(self.command_buffer, vk::CommandBufferResetFlags::empty())
+                .reset_command_buffer(command_buffer, vk::CommandBufferResetFlags::empty())
                 .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
             let begin_info = vk::CommandBufferBeginInfo::default()
                 .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
             device
-                .begin_command_buffer(self.command_buffer, &begin_info)
+                .begin_command_buffer(command_buffer, &begin_info)
                 .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
         }
         Ok(())
@@ -569,6 +540,26 @@ impl DecoderCommon {
         Ok(())
     }
 
+    /// Wait for in-flight decodes when a caller-driven copy would otherwise race
+    /// them.
+    ///
+    /// Reading a frame means transitioning its image out of its current layout
+    /// and back. That is harmless for a pool image, which nothing else touches,
+    /// but a zero-copy frame's image is a live DPB slot: later pictures may
+    /// still be reading it as a reference, and moving its layout underneath them
+    /// corrupts their output. These copies submit on the transfer queue with no
+    /// dependency on the decode queue, so the only correct answer is to let the
+    /// decode queue drain first.
+    fn wait_before_reading(&self, frame: &DecodedFrame) {
+        if frame
+            .pin
+            .as_ref()
+            .is_some_and(|pin| pin.borrows_dpb_image())
+        {
+            self.pipeline.wait_all_free();
+        }
+    }
+
     /// Copy a decoded picture back to the host, cropped to its visible region.
     ///
     /// Entirely codec-independent: it copies planes out of an image the decode
@@ -578,6 +569,7 @@ impl DecoderCommon {
     /// dedicated engine that need not advertise `TRANSFER_BIT` (it does not on
     /// RADV), so recording a copy there is invalid.
     pub fn download(&mut self, frame: &DecodedFrame) -> Result<DecodedFrameData> {
+        self.wait_before_reading(frame);
         let (bit_depth, pixel_format) = {
             let session = self.session()?;
             (session.bit_depth, session.pixel_format)
@@ -775,42 +767,43 @@ impl DecoderCommon {
         })
     }
 
-    /// Submit the recorded decode and wait for it to complete.
-    pub fn submit_decode(&self) -> Result<()> {
-        let device = self.context.device();
-        unsafe {
-            device
-                .end_command_buffer(self.command_buffer)
-                .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
-            let command_buffers = [self.command_buffer];
-            let submit = vk::SubmitInfo::default().command_buffers(&command_buffers);
-            device
-                .reset_fences(&[self.fence])
-                .map_err(|e| PixelForgeError::Synchronization(e.to_string()))?;
-            device
-                .queue_submit(self.decode_queue, &[submit], self.fence)
-                .map_err(|e| PixelForgeError::Synchronization(e.to_string()))?;
-            device
-                .wait_for_fences(&[self.fence], true, u64::MAX)
-                .map_err(|e| PixelForgeError::Synchronization(e.to_string()))?;
-        }
-        Ok(())
+    /// Submit the recorded decode without waiting for it.
+    ///
+    /// The submission is chained onto the decode timeline, so the GPU still runs
+    /// decodes in decode order despite the CPU running ahead.
+    pub fn submit_decode(&mut self) -> Result<()> {
+        let device = self.context.device().clone();
+        let queue = self.decode_queue;
+        self.pipeline.submit_decode(&device, queue)
+    }
+
+    /// Close off the current picture and hand `frames` to the completion thread.
+    pub fn end_picture(&mut self, frames: Vec<DecodedFrame>) {
+        self.pipeline.end_picture(frames);
+    }
+
+    /// Close off a `decode`/`flush` call, returning the future for its frames.
+    pub fn finish_batch(&mut self, frames: Vec<DecodedFrame>) -> DecodeFuture {
+        self.pipeline.finish_batch(frames)
     }
 
     /// Copy a freshly decoded picture into a pool image, so it survives past the
     /// next decode submission. This is what lets a [`DecodedFrame`] outlive the
     /// DPB slot the picture was decoded into.
     ///
-    /// Runs on the transfer queue, mirroring `download`: the decode is already
-    /// fence-waited, so `NONE` is a correct source scope. The source's layout is
-    /// restored afterward so a DPB image stays usable as a reference; the
-    /// destination is left in `TRANSFER_DST_OPTIMAL` (reported as the pooled
-    /// frame's layout, which `download` then transitions from).
-    pub fn copy_picture_to_image(
-        &self,
-        frame: &DecodedPicture,
-        dst_image: vk::Image,
-    ) -> Result<()> {
+    /// Records only; [`Self::submit_copy`] submits it. The copy runs on the
+    /// transfer queue, because a dedicated video decode queue need not support
+    /// transfer operations, and waits on the decode's timeline value rather than
+    /// a fence. A semaphore wait makes the decode's writes available and
+    /// visible, so `NONE` remains a correct source scope, and the DPB image is
+    /// created with concurrent sharing between the two families so no ownership
+    /// transfer is needed.
+    ///
+    /// The source's layout is restored afterward so a DPB image stays usable as
+    /// a reference; the destination is left in `TRANSFER_DST_OPTIMAL` (reported
+    /// as the pooled frame's layout, which `download` then transitions from).
+    pub fn record_picture_copy(&self, frame: &DecodedPicture, dst_image: vk::Image) -> Result<()> {
+        let command_buffer = self.pipeline.current().transfer_command_buffer;
         let base_layer = frame.array_layer;
         let device = self.context.device().clone();
         let aspects = vk::ImageAspectFlags::PLANE_0 | vk::ImageAspectFlags::PLANE_1;
@@ -830,14 +823,11 @@ impl DecoderCommon {
 
         unsafe {
             device
-                .reset_command_buffer(
-                    self.transfer_command_buffer,
-                    vk::CommandBufferResetFlags::empty(),
-                )
+                .reset_command_buffer(command_buffer, vk::CommandBufferResetFlags::empty())
                 .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
             device
                 .begin_command_buffer(
-                    self.transfer_command_buffer,
+                    command_buffer,
                     &vk::CommandBufferBeginInfo::default()
                         .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
                 )
@@ -865,7 +855,7 @@ impl DecoderCommon {
             },
         ];
         let dep = vk::DependencyInfo::default().image_memory_barriers(&to_transfer);
-        unsafe { device.cmd_pipeline_barrier2(self.transfer_command_buffer, &dep) };
+        unsafe { device.cmd_pipeline_barrier2(command_buffer, &dep) };
 
         let plane = |aspect: vk::ImageAspectFlags| vk::ImageSubresourceLayers {
             aspect_mask: aspect,
@@ -904,7 +894,7 @@ impl DecoderCommon {
             .dst_image(dst_image)
             .dst_image_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
             .regions(&regions);
-        unsafe { device.cmd_copy_image2(self.transfer_command_buffer, &copy) };
+        unsafe { device.cmd_copy_image2(command_buffer, &copy) };
 
         // Restore the source layout so a DPB image stays a valid reference.
         let restore = [vk::ImageMemoryBarrier2 {
@@ -917,25 +907,16 @@ impl DecoderCommon {
             ..range(frame.image, base_layer)
         }];
         let dep = vk::DependencyInfo::default().image_memory_barriers(&restore);
-        unsafe { device.cmd_pipeline_barrier2(self.transfer_command_buffer, &dep) };
+        unsafe { device.cmd_pipeline_barrier2(command_buffer, &dep) };
 
-        unsafe {
-            device
-                .end_command_buffer(self.transfer_command_buffer)
-                .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
-            let command_buffers = [self.transfer_command_buffer];
-            let submit = vk::SubmitInfo::default().command_buffers(&command_buffers);
-            device
-                .reset_fences(&[self.transfer_fence])
-                .map_err(|e| PixelForgeError::Synchronization(e.to_string()))?;
-            device
-                .queue_submit(self.transfer_queue, &[submit], self.transfer_fence)
-                .map_err(|e| PixelForgeError::Synchronization(e.to_string()))?;
-            device
-                .wait_for_fences(&[self.transfer_fence], true, u64::MAX)
-                .map_err(|e| PixelForgeError::Synchronization(e.to_string()))?;
-        }
         Ok(())
+    }
+
+    /// Submit the recorded reorder copy without waiting for it.
+    pub fn submit_copy(&mut self) -> Result<()> {
+        let device = self.context.device().clone();
+        let queue = self.transfer_queue;
+        self.pipeline.submit_copy(&device, queue)
     }
 
     /// Copy a decoded picture's two planes into two single-plane caller images:
@@ -955,6 +936,7 @@ impl DecoderCommon {
         y_image: vk::Image,
         uv_image: vk::Image,
     ) -> Result<()> {
+        self.wait_before_reading(frame);
         let base_layer = frame.array_layer;
         let device = self.context.device().clone();
 
@@ -1106,6 +1088,8 @@ impl DecoderCommon {
 
 impl Drop for DecoderCommon {
     fn drop(&mut self) {
+        // `destroy_session` drains the pipeline first, so by the time the
+        // staging buffers and fences below are freed nothing is in flight.
         self.destroy_session();
         unsafe {
             self.context.device().device_wait_idle().ok();
@@ -1113,16 +1097,8 @@ impl Drop for DecoderCommon {
                 self.context.device().destroy_buffer(buffer, None);
                 self.context.device().free_memory(memory, None);
             }
-            if self.bitstream_buffer != vk::Buffer::null() {
-                self.context.device().unmap_memory(self.bitstream_memory);
-                self.context
-                    .device()
-                    .destroy_buffer(self.bitstream_buffer, None);
-                self.context
-                    .device()
-                    .free_memory(self.bitstream_memory, None);
-            }
-            self.context.device().destroy_fence(self.fence, None);
+            let device = self.context.device().clone();
+            self.pipeline.destroy(&device);
             self.context
                 .device()
                 .destroy_command_pool(self.command_pool, None);
@@ -1248,6 +1224,14 @@ pub(crate) enum FramePin {
     /// The DPB slot the picture was decoded into, handed out without a copy.
     /// Released eagerly, because a decode may be blocked waiting for it.
     DpbSlot { slot: u8, pins: Arc<SlotPins> },
+}
+
+impl FramePin {
+    /// Whether this frame's image is a DPB slot the decoder is still using,
+    /// rather than a private copy.
+    fn borrows_dpb_image(&self) -> bool {
+        matches!(self, FramePin::DpbSlot { .. })
+    }
 }
 
 impl Drop for FramePin {
@@ -1443,7 +1427,7 @@ impl ReorderBuffer {
     /// has to be emitted.
     pub fn push(
         &mut self,
-        common: &DecoderCommon,
+        common: &mut DecoderCommon,
         picture: &DecodedPicture,
         reorder_depth: usize,
     ) -> Result<Vec<DecodedFrame>> {
@@ -1459,7 +1443,8 @@ impl ReorderBuffer {
         }
 
         let pool_index = self.pool.acquire(common, picture)?;
-        common.copy_picture_to_image(picture, self.pool.images[pool_index].image)?;
+        common.record_picture_copy(picture, self.pool.images[pool_index].image)?;
+        common.submit_copy()?;
         self.pool.images[pool_index].state = PoolState::Buffered;
         self.buffered.push(ReorderEntry {
             pool_index,
@@ -1490,7 +1475,7 @@ impl ReorderBuffer {
     /// image instead.
     fn emit_immediately(
         &mut self,
-        common: &DecoderCommon,
+        common: &mut DecoderCommon,
         picture: &DecodedPicture,
     ) -> Result<DecodedFrame> {
         let session = common.session()?;
@@ -1521,11 +1506,12 @@ impl ReorderBuffer {
     /// Copy a picture into a pool image and hand out the copy.
     fn emit_copy(
         &mut self,
-        common: &DecoderCommon,
+        common: &mut DecoderCommon,
         picture: &DecodedPicture,
     ) -> Result<DecodedFrame> {
         let index = self.pool.acquire(common, picture)?;
-        common.copy_picture_to_image(picture, self.pool.images[index].image)?;
+        common.record_picture_copy(picture, self.pool.images[index].image)?;
+        common.submit_copy()?;
         let pin = self.pool.hand_out(index);
         Ok(DecodedFrame {
             image: self.pool.images[index].image,
@@ -1657,17 +1643,26 @@ fn create_pool_image(
     Ok((image, memory))
 }
 
+/// A command pool for `family`, with reset-per-buffer semantics.
+fn create_command_pool(
+    context: &VideoContext,
+    family: u32,
+    label: &str,
+) -> Result<vk::CommandPool> {
+    let pool_info = vk::CommandPoolCreateInfo::default()
+        .queue_family_index(family)
+        .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
+    unsafe { context.device().create_command_pool(&pool_info, None) }
+        .map_err(|e| PixelForgeError::ResourceCreation(format!("{} command pool: {}", label, e)))
+}
+
 /// A command pool, one primary command buffer, and a fence for `family`.
 fn create_command_resources(
     context: &VideoContext,
     family: u32,
     label: &str,
 ) -> Result<(vk::CommandPool, vk::CommandBuffer, vk::Fence)> {
-    let pool_info = vk::CommandPoolCreateInfo::default()
-        .queue_family_index(family)
-        .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
-    let pool = unsafe { context.device().create_command_pool(&pool_info, None) }
-        .map_err(|e| PixelForgeError::ResourceCreation(format!("{} command pool: {}", label, e)))?;
+    let pool = create_command_pool(context, family, label)?;
 
     let alloc_info = vk::CommandBufferAllocateInfo::default()
         .command_pool(pool)

@@ -14,6 +14,7 @@ use crate::decoder::h264::dpb::{DecodeDpb, PictureState};
 use crate::decoder::h264::parser::{
     self, NalType, NalUnit, Pps, SliceHeader, SliceType, Sps, iter_nal_units,
 };
+use crate::decoder::pipeline::DecodeFuture;
 use crate::decoder::{DecodeConfig, DecodedFrame, DecodedFrameData, OutputOrder};
 use crate::encoder::{BitDepth, PixelFormat};
 use crate::error::{PixelForgeError, Result};
@@ -97,8 +98,13 @@ impl H264Decoder {
     }
 
     /// Emit any pictures still held for reordering. Call at end of stream.
-    pub(crate) fn flush(&mut self) -> Result<Vec<DecodedFrame>> {
-        Ok(self.reorder.flush())
+    ///
+    /// These pictures were copied out by earlier calls, so this submits no new
+    /// GPU work; the future still resolves in call order behind whatever is
+    /// already in flight.
+    pub(crate) fn flush(&mut self) -> Result<DecodeFuture> {
+        let frames = self.reorder.flush();
+        Ok(self.common.finish_batch(frames))
     }
 
     pub(crate) fn picture_format(&self) -> Option<vk::Format> {
@@ -515,13 +521,15 @@ impl H264Decoder {
         Ok((pictures, awaiting))
     }
 
-    pub(crate) fn decode(&mut self, data: &[u8], pts: u64) -> Result<Vec<DecodedFrame>> {
+    pub(crate) fn decode(&mut self, data: &[u8], pts: u64) -> Result<DecodeFuture> {
         // What is missing when a picture cannot be decoded yet; set only while
         // no frame has been produced, so a keyframe later in the same buffer
         // still yields output. Seeded with slices skipped during splitting for
         // missing parameter sets.
         let (pictures, mut awaiting) = self.split_pictures(data)?;
-        let mut frames = Vec::with_capacity(pictures.len());
+        // Whether any picture actually reached the GPU, which decides between
+        // returning a batch and asking for a keyframe.
+        let mut decoded_any = false;
 
         for picture in pictures {
             let is_idr = picture.nal_type == NalType::IdrSlice;
@@ -571,23 +579,25 @@ impl H264Decoder {
                     self.awaiting_keyframe = false;
                 }
                 let depth_reorder = self.reorder_depth;
-                let ready = self.reorder.push(&self.common, &frame, depth_reorder)?;
-                frames.extend(ready);
+                let ready = self.reorder.push(&mut self.common, &frame, depth_reorder)?;
+                decoded_any = true;
+                // The picture's submissions are complete as far as recording
+                // goes; hand its slot and frames to the completion thread and
+                // move on to the next slot.
+                self.common.end_picture(ready);
             }
         }
 
-        // Only surface the keyframe request when nothing was produced: if a
-        // keyframe arrived later in the same buffer, its frames take priority.
-        if frames.is_empty()
-            && let Some(reason) = awaiting
-        {
+        // Only surface the keyframe request when nothing was decoded: if a
+        // keyframe arrived later in the same buffer, its pictures take priority.
+        if !decoded_any && let Some(reason) = awaiting {
             return Err(PixelForgeError::NeedsKeyframe(format!(
                 "H.264 decode: {}",
                 reason
             )));
         }
 
-        Ok(frames)
+        Ok(self.common.finish_batch(Vec::new()))
     }
 
     /// Record and submit the decode of a single picture, and wait for it.
@@ -820,7 +830,7 @@ impl H264Decoder {
         unsafe {
             self.common
                 .video_queue_fn
-                .cmd_begin_video_coding(self.common.command_buffer, &begin_info);
+                .cmd_begin_video_coding(self.common.decode_command_buffer(), &begin_info);
         }
 
         // On the first use of the session, all DPB slots must be reset.
@@ -830,7 +840,7 @@ impl H264Decoder {
             unsafe {
                 self.common
                     .video_queue_fn
-                    .cmd_control_video_coding(self.common.command_buffer, &control);
+                    .cmd_control_video_coding(self.common.decode_command_buffer(), &control);
             }
         }
 
@@ -897,7 +907,7 @@ impl H264Decoder {
         }
 
         let decode_info = vk::VideoDecodeInfoKHR::default()
-            .src_buffer(self.common.bitstream_buffer)
+            .src_buffer(self.common.bitstream_buffer())
             .src_buffer_offset(0)
             .src_buffer_range(buffer_range)
             .dst_picture_resource(output_resource)
@@ -908,9 +918,9 @@ impl H264Decoder {
         unsafe {
             self.common
                 .video_decode_fn
-                .cmd_decode_video(self.common.command_buffer, &decode_info);
+                .cmd_decode_video(self.common.decode_command_buffer(), &decode_info);
             self.common.video_queue_fn.cmd_end_video_coding(
-                self.common.command_buffer,
+                self.common.decode_command_buffer(),
                 &vk::VideoEndCodingInfoKHR::default(),
             );
         }

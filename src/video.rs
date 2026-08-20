@@ -591,3 +591,51 @@ pub(crate) fn create_dpb_images(
 
     Ok((vec![image], vec![memory], views))
 }
+
+/// Cross-thread per-slot readiness for a pipelined encode or decode.
+///
+/// A slot is "busy" from the moment its work is submitted until the completion
+/// thread has finished with it (read the bitstream back, or observed the decode
+/// fence). The submitting thread waits for a slot to be free before recording
+/// over its command buffer and staging memory, which is also what covers the
+/// write-after-read hazard on those resources.
+pub(crate) struct SlotSync {
+    busy: std::sync::Mutex<Vec<bool>>,
+    cv: std::sync::Condvar,
+}
+
+impl SlotSync {
+    pub(crate) fn new(slot_count: usize) -> Self {
+        Self {
+            busy: std::sync::Mutex::new(vec![false; slot_count]),
+            cv: std::sync::Condvar::new(),
+        }
+    }
+
+    /// Block until slot `index` is free (its previous submission is finished).
+    pub(crate) fn wait_free(&self, index: usize) {
+        let mut busy = self.busy.lock().unwrap();
+        while busy[index] {
+            busy = self.cv.wait(busy).unwrap();
+        }
+    }
+
+    /// Block until every slot is free (nothing in flight).
+    pub(crate) fn wait_all_free(&self) {
+        let mut busy = self.busy.lock().unwrap();
+        while busy.iter().any(|b| *b) {
+            busy = self.cv.wait(busy).unwrap();
+        }
+    }
+
+    /// Mark a slot busy at submit time. No notify: nobody waits to *enter* busy.
+    pub(crate) fn set_busy(&self, index: usize) {
+        self.busy.lock().unwrap()[index] = true;
+    }
+
+    /// Mark a slot free once its submission is finished; wake any waiters.
+    pub(crate) fn set_free(&self, index: usize) {
+        self.busy.lock().unwrap()[index] = false;
+        self.cv.notify_all();
+    }
+}

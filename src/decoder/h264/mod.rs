@@ -13,6 +13,7 @@ mod parser_tests;
 mod dpb;
 mod session;
 
+use crate::decoder::pipeline::DecodeFuture;
 use crate::decoder::{DecodedFrame, DecodedFrameData};
 use crate::error::Result;
 use ash::vk;
@@ -62,11 +63,11 @@ impl crate::decoder::DecoderApi for H264Decoder {
         split_stream(stream)
     }
 
-    fn decode(&mut self, data: &[u8], pts: u64) -> Result<Vec<DecodedFrame>> {
+    fn decode(&mut self, data: &[u8], pts: u64) -> Result<DecodeFuture> {
         H264Decoder::decode(self, data, pts)
     }
 
-    fn flush(&mut self) -> Result<Vec<DecodedFrame>> {
+    fn flush(&mut self) -> Result<DecodeFuture> {
         H264Decoder::flush(self)
     }
 

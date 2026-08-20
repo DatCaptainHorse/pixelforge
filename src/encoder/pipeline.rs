@@ -22,7 +22,8 @@
 //! the timeline; the completion thread only waits on fences and reads bitstream
 //! buffers, so the two never race on the same Vulkan object.
 //!
-//! Slot reuse is coordinated with a per-slot "busy" flag ([`SlotSync`]): a slot
+//! Slot reuse is coordinated with a per-slot "busy" flag
+//! ([`SlotSync`](crate::video::SlotSync)): a slot
 //! is busy from submit until the completion thread has finished reading its
 //! bitstream. The calling thread waits for the current slot to be free before
 //! converting into / recording over it, which also covers the write-after-read
@@ -30,8 +31,8 @@
 
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender};
-use std::sync::{Arc, Condvar, Mutex};
 use std::task::{Context, Poll};
 use std::thread::JoinHandle;
 
@@ -46,6 +47,7 @@ use crate::encoder::resources::{
 };
 use crate::encoder::{BitDepth, EncodedPacket, FrameType, PixelFormat};
 use crate::error::{PixelForgeError, Result};
+use crate::video::SlotSync;
 use crate::vulkan::VideoContext;
 
 /// A handle to the packet a single `EncodePipeline::submit_current` will
@@ -128,49 +130,6 @@ struct WorkItem {
     submit_time: std::time::Instant,
     /// Resolves this frame's [`EncodeFuture`] once the bitstream is read back.
     result_tx: oneshot::Sender<Result<EncodedPacket>>,
-}
-
-/// Cross-thread per-slot readiness. A slot is "busy" from the moment its encode
-/// is submitted until the completion thread has finished reading its bitstream.
-struct SlotSync {
-    busy: Mutex<Vec<bool>>,
-    cv: Condvar,
-}
-
-impl SlotSync {
-    fn new(slot_count: usize) -> Self {
-        Self {
-            busy: Mutex::new(vec![false; slot_count]),
-            cv: Condvar::new(),
-        }
-    }
-
-    /// Block until slot `index` is free (its previous encode has been read back).
-    fn wait_free(&self, index: usize) {
-        let mut busy = self.busy.lock().unwrap();
-        while busy[index] {
-            busy = self.cv.wait(busy).unwrap();
-        }
-    }
-
-    /// Block until every slot is free (no submissions in flight).
-    fn wait_all_free(&self) {
-        let mut busy = self.busy.lock().unwrap();
-        while busy.iter().any(|b| *b) {
-            busy = self.cv.wait(busy).unwrap();
-        }
-    }
-
-    /// Mark a slot busy at submit time. No notify: nobody waits to *enter* busy.
-    fn set_busy(&self, index: usize) {
-        self.busy.lock().unwrap()[index] = true;
-    }
-
-    /// Mark a slot free once its bitstream has been read; wake any waiters.
-    fn set_free(&self, index: usize) {
-        self.busy.lock().unwrap()[index] = false;
-        self.cv.notify_all();
-    }
 }
 
 /// All per-frame resources that must be private to a single in-flight encode.

@@ -56,48 +56,74 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut frame_count = 0usize;
     let mut last_info = None;
 
-    // Write each frame as it comes out. `flush` at the end drains the frames
-    // the reorder buffer was still holding.
-    let write = |decoder: &mut Decoder,
-                 frame: &pixelforge::decoder::DecodedFrame,
-                 output: &mut Option<File>|
+    // Write out one resolved batch. Dropping each frame at the end of the loop
+    // hands its storage back to the decoder.
+    let write_batch = |decoder: &mut Decoder,
+                       frames: Vec<pixelforge::decoder::DecodedFrame>,
+                       output: &mut Option<File>,
+                       frame_count: &mut usize,
+                       last_info: &mut Option<(u32, u32, i32, bool)>|
      -> Result<(), Box<dyn std::error::Error>> {
-        if let Some(file) = output.as_mut() {
-            let data = decoder.download(frame)?;
-            file.write_all(&data.y)?;
-            file.write_all(&data.uv)?;
-        }
-        Ok(())
-    };
-
-    for au in decoder.split(&stream) {
-        let decoded = match decoder.decode(au, frame_count as u64) {
-            Ok(frames) => frames,
-            // Joining mid-stream (or after loss): skip until a keyframe. A live
-            // client would ask the sender for an IDR here.
-            Err(pixelforge::error::PixelForgeError::NeedsKeyframe(_)) => continue,
-            Err(e) => return Err(e.into()),
-        };
-        for frame in decoded {
-            write(&mut decoder, &frame, &mut output)?;
-            last_info = Some((
+        for frame in frames {
+            if let Some(file) = output.as_mut() {
+                let data = decoder.download(&frame)?;
+                file.write_all(&data.y)?;
+                file.write_all(&data.uv)?;
+            }
+            *last_info = Some((
                 frame.width,
                 frame.height,
                 frame.display_order,
                 frame.is_keyframe,
             ));
-            frame_count += 1;
+            *frame_count += 1;
+        }
+        Ok(())
+    };
+
+    // Each `decode()` returns a future for the frames that call produces. Keep
+    // a couple in flight so parsing and submission overlap the GPU decode, and
+    // drain the oldest once the pipeline is full, which preserves output order.
+    //
+    // The depth is bounded by `DecodeConfig::output_depth` (2 by default): in
+    // decode-order mode every un-dropped frame holds a DPB slot, so holding
+    // more batches than there are output slots would make `decode` wait for a
+    // frame that only this loop can release.
+    let mut pending: std::collections::VecDeque<pixelforge::decoder::DecodeFuture> =
+        std::collections::VecDeque::new();
+
+    for au in decoder.split(&stream) {
+        match decoder.decode(au, frame_count as u64) {
+            Ok(batch) => pending.push_back(batch),
+            // Joining mid-stream (or after loss): skip until a keyframe. A live
+            // client would ask the sender for an IDR here.
+            Err(pixelforge::error::PixelForgeError::NeedsKeyframe(_)) => continue,
+            Err(e) => return Err(e.into()),
+        }
+        while pending.len() >= 2 {
+            let frames = pollster::block_on(pending.pop_front().unwrap())?;
+            write_batch(
+                &mut decoder,
+                frames,
+                &mut output,
+                &mut frame_count,
+                &mut last_info,
+            )?;
         }
     }
-    for frame in decoder.flush()? {
-        write(&mut decoder, &frame, &mut output)?;
-        last_info = Some((
-            frame.width,
-            frame.height,
-            frame.display_order,
-            frame.is_keyframe,
-        ));
-        frame_count += 1;
+
+    // `flush` emits whatever the reorder buffer still holds; its future resolves
+    // behind everything already in flight.
+    pending.push_back(decoder.flush()?);
+    while let Some(batch) = pending.pop_front() {
+        let frames = pollster::block_on(batch)?;
+        write_batch(
+            &mut decoder,
+            frames,
+            &mut output,
+            &mut frame_count,
+            &mut last_info,
+        )?;
     }
     let decode_time = start.elapsed();
 

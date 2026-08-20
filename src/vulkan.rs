@@ -138,7 +138,9 @@ impl VideoContextBuilder {
     ///
     /// The device must have been created with the queue families and extensions
     /// reported by [`Self::decode_device_requirements`] for the same
-    /// `physical_device`, and with the `synchronization2` feature enabled. The
+    /// `physical_device`, and with the `synchronization2` and
+    /// `timelineSemaphore` features enabled (the decoder orders its pipelined
+    /// submissions with timeline semaphores). The
     /// resulting context **borrows** `instance` and `device`: dropping it frees
     /// neither, so the caller must keep both alive for at least as long as the
     /// context and anything decoded with it.
@@ -161,7 +163,10 @@ impl VideoContextBuilder {
 
 /// Queue families and extensions a caller's device must provide to decode.
 ///
-/// Returned by [`VideoContextBuilder::decode_device_requirements`].
+/// Returned by [`VideoContextBuilder::decode_device_requirements`]. Two device
+/// features must be enabled as well, and are not listed here because they are
+/// feature-struct fields rather than extensions: `synchronization2` and
+/// `timelineSemaphore`.
 #[derive(Debug, Clone)]
 pub struct DeviceRequirements {
     /// Queue families pixelforge needs a queue created for. Merge these with

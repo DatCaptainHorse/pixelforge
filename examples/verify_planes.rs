@@ -52,13 +52,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .collect();
     let exts: Vec<_> = reqs.extensions.iter().map(|e| e.as_ptr()).collect();
     let mut sync2 = vk::PhysicalDeviceSynchronization2Features::default().synchronization2(true);
+    // The decoder orders its pipelined submissions with timeline semaphores.
+    let mut timeline =
+        vk::PhysicalDeviceTimelineSemaphoreFeatures::default().timeline_semaphore(true);
     let device = unsafe {
         instance.create_device(
             pdevice,
             &vk::DeviceCreateInfo::default()
                 .queue_create_infos(&qinfos)
                 .enabled_extension_names(&exts)
-                .push(&mut sync2),
+                .push(&mut sync2)
+                .push(&mut timeline),
             None,
         )?
     };
@@ -121,12 +125,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     for (i, au) in decoder.split(&stream).enumerate() {
-        for f in decoder.decode(au, i as u64)? {
+        for f in pollster::block_on(decoder.decode(au, i as u64)?)? {
             handle(&mut decoder, &f, &mut out)?;
             count += 1;
         }
     }
-    for f in decoder.flush()? {
+    for f in pollster::block_on(decoder.flush()?)? {
         handle(&mut decoder, &f, &mut out)?;
         count += 1;
     }

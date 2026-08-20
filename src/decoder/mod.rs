@@ -8,6 +8,10 @@
 //!
 //! # Design
 //!
+//! - **Asynchronous**: [`Decoder::decode`] records and submits, then returns a
+//!   [`DecodeFuture`] rather than waiting for the GPU, so the CPU can parse and
+//!   submit the next picture while the current one decodes. Mirrors
+//!   [`Encoder::encode`](crate::encoder::Encoder::encode).
 //! - **Stream-driven**: the Vulkan video session is created lazily from the
 //!   stream's own parameter sets, so no dimensions or profile need to be
 //!   configured up front. Mid-stream resolution changes recreate the session
@@ -33,6 +37,9 @@ pub(crate) mod bitreader;
 pub(crate) mod codec;
 /// H.264 decoding.
 pub mod h264;
+pub(crate) mod pipeline;
+
+pub use pipeline::DecodeFuture;
 
 use crate::encoder::{BitDepth, Codec, PixelFormat};
 use crate::error::{PixelForgeError, Result};
@@ -97,6 +104,12 @@ impl DecodeConfig {
     /// Clamped to what the device's DPB slot limit allows for the stream. If
     /// nothing is left over, decode-order frames fall back to a copy rather
     /// than failing, exactly like [`OutputOrder::Display`] always does.
+    ///
+    /// This also bounds how many [`DecodeFuture`]s a decode-order caller can
+    /// usefully keep in flight: an unresolved future holds the frames it will
+    /// deliver, and each of those holds a slot. Keeping more batches pending
+    /// than there are output slots makes [`Decoder::decode`] wait for a frame
+    /// only the caller can release, so keep the two numbers in step.
     pub fn with_output_depth(mut self, depth: usize) -> Self {
         self.output_depth = depth;
         self
@@ -199,8 +212,8 @@ pub struct DecodedFrameData {
 /// The codec-erased operations every codec decoder exposes.
 trait DecoderApi: Send {
     fn split_stream<'a>(&self, stream: &'a [u8]) -> Vec<&'a [u8]>;
-    fn decode(&mut self, data: &[u8], pts: u64) -> Result<Vec<DecodedFrame>>;
-    fn flush(&mut self) -> Result<Vec<DecodedFrame>>;
+    fn decode(&mut self, data: &[u8], pts: u64) -> Result<DecodeFuture>;
+    fn flush(&mut self) -> Result<DecodeFuture>;
     fn download(&mut self, frame: &DecodedFrame) -> Result<DecodedFrameData>;
     fn copy_frame_to_planes(
         &mut self,
@@ -260,8 +273,9 @@ impl Decoder {
     /// # use pixelforge::decoder::Decoder;
     /// # fn run(decoder: &mut Decoder, stream: &[u8]) -> pixelforge::error::Result<()> {
     /// for (i, unit) in decoder.split(stream).enumerate() {
-    ///     for frame in decoder.decode(unit, i as u64)? {
-    ///         // ... use frame before the next decode() call ...
+    ///     let batch = decoder.decode(unit, i as u64)?;
+    ///     for frame in pollster::block_on(batch)? {
+    ///         // ... use the frame, then drop it to release its storage ...
     ///     }
     /// }
     /// # Ok(())
@@ -286,21 +300,32 @@ impl Decoder {
     ///
     /// `pts` is attached to every frame produced by this call.
     ///
-    /// Returns decoded frames in the configured [`OutputOrder`] (display order
-    /// by default). In display order the count returned per call varies, since a
-    /// picture may be held back until later ones are decoded, so drain the
-    /// remainder with [`flush`](Self::flush) at end of stream. In decode order
-    /// it is usually zero or one frame per coded frame fed.
-    pub fn decode(&mut self, data: &[u8], pts: u64) -> Result<Vec<DecodedFrame>> {
+    /// Returns immediately with a [`DecodeFuture`], without waiting for the GPU:
+    /// the picture is recorded and submitted, and awaiting the future yields the
+    /// frames that call emits once their decode has completed. Keep a couple of
+    /// futures in flight to overlap parsing and submission with GPU decode, the
+    /// same way [`Encoder::encode`](crate::encoder::Encoder::encode) is used.
+    ///
+    /// Frames come back in the configured [`OutputOrder`] (display order by
+    /// default). In display order the count per call varies, since a picture may
+    /// be held back until later ones are decoded, so drain the remainder with
+    /// [`flush`](Self::flush) at end of stream. In decode order it is usually
+    /// zero or one frame per coded frame fed.
+    ///
+    /// This call blocks in one case: when every output slot is held by a frame
+    /// the caller has not dropped. See
+    /// [`DecodeConfig::with_output_depth`].
+    pub fn decode(&mut self, data: &[u8], pts: u64) -> Result<DecodeFuture> {
         self.0.decode(data, pts)
     }
 
     /// Return any frames still held for display-order reordering.
     ///
     /// Call once after the last [`decode`](Self::decode) to emit the tail of
-    /// the stream. Frames come back in presentation order. Harmless (returns
-    /// empty) in decode-order mode.
-    pub fn flush(&mut self) -> Result<Vec<DecodedFrame>> {
+    /// the stream. Frames come back in presentation order, through a future that
+    /// resolves behind every decode already in flight. Harmless (resolves empty)
+    /// in decode-order mode.
+    pub fn flush(&mut self) -> Result<DecodeFuture> {
         self.0.flush()
     }
 
