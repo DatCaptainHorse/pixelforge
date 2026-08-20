@@ -18,11 +18,12 @@ Decoding on Intel Arc under Mesa needs the video queues enabled explicitly:
 The `README.md` is generated from the doc comments in `src/lib.rs` using the `README.tpl` template.
 To regenerate:
 ```bash
-cargo readme --no-title > README.md
+cargo readme > README.md
 ```
 
-(`--no-indent-headings` would flatten every section to `#`, which does not match
-the committed `README.md`.)
+This is the exact command CI compares against (`diff --brief <(cargo readme)
+README.md`). Do not add `--no-indent-headings`: it flattens every section to `#`
+and the diff then fails.
 Do not edit `README.md` directly; update the doc comments in `src/lib.rs` instead.
 
 To verify the quality of the encoded videos, run:

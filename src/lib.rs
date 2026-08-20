@@ -159,7 +159,7 @@
 //! }
 //! ```
 //!
-//! For the lowest latency, [`OutputOrder::Decode`](decoder::OutputOrder::Decode)
+//! For the lowest latency, [`OutputOrder::Decode`]
 //! returns each frame as soon as its GPU work completes, with no copy: the frame
 //! *is* the decoder's DPB image, pinned until dropped. With B-frames the caller
 //! then has to sort by [`DecodedFrame::display_order`](decoder::DecodedFrame).
