@@ -592,6 +592,110 @@ pub(crate) fn create_dpb_images(
     Ok((vec![image], vec![memory], views))
 }
 
+/// A command pool for `family`, with per-buffer reset.
+///
+/// `label` names the pool in the error message, since a decoder holds several
+/// for different queue families.
+pub(crate) fn create_command_pool(
+    context: &VideoContext,
+    family: u32,
+    label: &str,
+) -> Result<vk::CommandPool> {
+    let pool_info = vk::CommandPoolCreateInfo::default()
+        .queue_family_index(family)
+        .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
+    unsafe { context.device().create_command_pool(&pool_info, None) }
+        .map_err(|e| PixelForgeError::ResourceCreation(format!("{} command pool: {}", label, e)))
+}
+
+/// Allocate `count` primary command buffers from `pool`.
+pub(crate) fn allocate_command_buffers(
+    context: &VideoContext,
+    pool: vk::CommandPool,
+    count: u32,
+) -> Result<Vec<vk::CommandBuffer>> {
+    let info = vk::CommandBufferAllocateInfo::default()
+        .command_pool(pool)
+        .level(vk::CommandBufferLevel::PRIMARY)
+        .command_buffer_count(count);
+    unsafe { context.device().allocate_command_buffers(&info) }
+        .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))
+}
+
+/// A fence, created signaled when it will be waited on before its first submit.
+pub(crate) fn create_fence(context: &VideoContext, signaled: bool) -> Result<vk::Fence> {
+    let mut info = vk::FenceCreateInfo::default();
+    if signaled {
+        info = info.flags(vk::FenceCreateFlags::SIGNALED);
+    }
+    unsafe { context.device().create_fence(&info, None) }
+        .map_err(|e| PixelForgeError::Synchronization(e.to_string()))
+}
+
+/// A chain of submissions ordered by one timeline semaphore.
+///
+/// Video submissions that share a session and DPB must execute in order even
+/// when the CPU runs ahead of the GPU. Each submission waits on the value the
+/// previous one signals and signals its own, which this tracks: [`Self::wait`]
+/// for what to wait on, [`Self::pending_signal`] for what to signal, and
+/// [`Self::commit`] once the submit has actually succeeded.
+///
+/// Committing separately matters: advancing the chain for a submission that
+/// failed to submit would leave every later submission waiting on a value
+/// nothing will ever signal.
+pub(crate) struct TimelineChain {
+    semaphore: vk::Semaphore,
+    /// Value the next submission will signal.
+    next: u64,
+    /// Value the most recent committed submission signals; 0 = none yet.
+    last: u64,
+}
+
+impl TimelineChain {
+    pub(crate) fn new(context: &VideoContext) -> Result<Self> {
+        Ok(Self {
+            semaphore: create_timeline_semaphore(context)?,
+            next: 1,
+            last: 0,
+        })
+    }
+
+    /// What a new submission must wait on to run after the previous one, or
+    /// `None` when nothing has been submitted yet.
+    pub(crate) fn wait(&self) -> Option<(vk::Semaphore, u64)> {
+        (self.last > 0).then_some((self.semaphore, self.last))
+    }
+
+    /// The value most recently committed. A timeline wait on 0 is satisfied
+    /// immediately, so callers that always wait can use this directly.
+    pub(crate) fn last_value(&self) -> u64 {
+        self.last
+    }
+
+    pub(crate) fn semaphore(&self) -> vk::Semaphore {
+        self.semaphore
+    }
+
+    /// What a new submission should signal. Not recorded until [`Self::commit`].
+    pub(crate) fn pending_signal(&self) -> (vk::Semaphore, u64) {
+        (self.semaphore, self.next)
+    }
+
+    /// Record the pending signal as committed, after a successful submit.
+    pub(crate) fn commit(&mut self) {
+        self.last = self.next;
+        self.next += 1;
+    }
+
+    /// # Safety
+    ///
+    /// Every submission that waits on or signals this semaphore must have
+    /// completed.
+    pub(crate) unsafe fn destroy(&self, device: &ash::Device) {
+        unsafe { device.destroy_semaphore(self.semaphore, None) };
+    }
+}
+
 /// Cross-thread per-slot readiness for a pipelined encode or decode.
 ///
 /// A slot is "busy" from the moment its work is submitted until the completion

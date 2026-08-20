@@ -14,7 +14,7 @@
 
 use std::sync::Arc;
 
-use crate::decoder::codec::SlotPins;
+use crate::decoder::frames::SlotPins;
 use crate::decoder::h264::parser::{Mmco, NalType, RefPicMarking, SliceHeader, Sps};
 use crate::error::{PixelForgeError, Result};
 

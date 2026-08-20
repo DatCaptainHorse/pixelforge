@@ -7,9 +7,8 @@ use ash::vk;
 use ash::vk::TaggedStructure;
 use tracing::debug;
 
-use crate::decoder::codec::{
-    DecodedPicture, DecoderCommon, ReorderBuffer, SessionPlan, query_decode_caps,
-};
+use crate::decoder::common::{DecoderCommon, SessionPlan, query_decode_caps};
+use crate::decoder::frames::{DecodedPicture, ReorderBuffer};
 use crate::decoder::h264::dpb::{DecodeDpb, PictureState};
 use crate::decoder::h264::parser::{
     self, NalType, NalUnit, Pps, SliceHeader, SliceType, Sps, iter_nal_units,

@@ -10,10 +10,10 @@ use std::ptr;
 #[cfg(test)]
 pub(crate) use crate::video::gcd;
 pub(crate) use crate::video::{
-    VideoImageParams, align_up, allocate_session_memory, create_bitstream_buffer,
-    create_buffer_with_device_address, create_dpb_images as create_dpb_images_shared,
-    create_timeline_semaphore, create_video_image, find_memory_type, get_video_format, lcm,
-    map_bitstream_buffer, query_supported_video_formats,
+    VideoImageParams, align_up, allocate_command_buffers, allocate_session_memory,
+    create_bitstream_buffer, create_buffer_with_device_address, create_command_pool,
+    create_dpb_images as create_dpb_images_shared, create_fence, create_video_image,
+    find_memory_type, get_video_format, lcm, map_bitstream_buffer, query_supported_video_formats,
 };
 
 /// Create the encoder's DPB images.
@@ -143,52 +143,20 @@ pub(crate) fn create_command_resources(
     encode_queue_family: u32,
     upload_queue_family: u32,
 ) -> Result<CommandResources> {
-    // Create command pool for encode commands.
-    let pool_create_info = vk::CommandPoolCreateInfo::default()
-        .queue_family_index(encode_queue_family)
-        .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
+    let command_pool = create_command_pool(context, encode_queue_family, "encode")?;
 
-    let command_pool = unsafe {
-        context
-            .device()
-            .create_command_pool(&pool_create_info, None)
-    }
-    .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
-
-    // Create command pool for upload commands (may be the same family).
+    // The upload pool is the encode pool when one family does both.
     let upload_command_pool = if upload_queue_family == encode_queue_family {
         command_pool
     } else {
-        let upload_pool_info = vk::CommandPoolCreateInfo::default()
-            .queue_family_index(upload_queue_family)
-            .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
-        unsafe {
-            context
-                .device()
-                .create_command_pool(&upload_pool_info, None)
-        }
-        .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?
+        create_command_pool(context, upload_queue_family, "encode upload")?
     };
 
-    // Allocate upload command buffer from the upload pool.
-    let upload_alloc_info = vk::CommandBufferAllocateInfo::default()
-        .command_pool(upload_command_pool)
-        .level(vk::CommandBufferLevel::PRIMARY)
-        .command_buffer_count(1);
+    let upload_command_buffer = allocate_command_buffers(context, upload_command_pool, 1)?[0];
 
-    let upload_command_buffers = unsafe {
-        context
-            .device()
-            .allocate_command_buffers(&upload_alloc_info)
-    }
-    .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
-    let upload_command_buffer = upload_command_buffers[0];
-
-    // Upload fence is created unsignaled. Per-slot encode fences are created by
-    // the encode pipeline (see `encoder::pipeline`).
-    let fence_create_info = vk::FenceCreateInfo::default();
-    let upload_fence = unsafe { context.device().create_fence(&fence_create_info, None) }
-        .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
+    // Unsignaled: the upload path always submits before it waits. Per-slot
+    // encode fences are created by the encode pipeline (see `encoder::pipeline`).
+    let upload_fence = create_fence(context, false)?;
 
     Ok(CommandResources {
         command_pool,

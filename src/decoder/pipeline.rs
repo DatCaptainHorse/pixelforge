@@ -41,7 +41,8 @@ use futures_channel::oneshot;
 use crate::decoder::DecodedFrame;
 use crate::error::{PixelForgeError, Result};
 use crate::video::{
-    SlotSync, create_bitstream_buffer, create_timeline_semaphore, map_bitstream_buffer,
+    SlotSync, TimelineChain, allocate_command_buffers, create_bitstream_buffer, create_fence,
+    map_bitstream_buffer,
 };
 use crate::vulkan::VideoContext;
 
@@ -128,14 +129,9 @@ pub(crate) struct DecodePipeline {
     current_slot: usize,
 
     /// Orders decode submissions, which share DPB state.
-    decode_timeline: vk::Semaphore,
-    next_decode_value: u64,
-    last_decode_value: u64,
-
+    decodes: TimelineChain,
     /// Orders reorder copies against each other.
-    copy_timeline: vk::Semaphore,
-    next_copy_value: u64,
-    last_copy_value: u64,
+    copies: TimelineChain,
 
     /// The fence of the most recent submission, whichever queue it went to.
     last_fence: Option<vk::Fence>,
@@ -156,26 +152,16 @@ impl DecodePipeline {
     ) -> Result<Self> {
         let device = context.device();
 
-        let alloc = |pool: vk::CommandPool| -> Result<Vec<vk::CommandBuffer>> {
-            let info = vk::CommandBufferAllocateInfo::default()
-                .command_pool(pool)
-                .level(vk::CommandBufferLevel::PRIMARY)
-                .command_buffer_count(DECODE_PIPELINE_DEPTH as u32);
-            unsafe { device.allocate_command_buffers(&info) }
-                .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))
-        };
-        let decode_buffers = alloc(decode_pool)?;
-        let transfer_buffers = alloc(transfer_pool)?;
+        let depth = DECODE_PIPELINE_DEPTH as u32;
+        let decode_buffers = allocate_command_buffers(context, decode_pool, depth)?;
+        let transfer_buffers = allocate_command_buffers(context, transfer_pool, depth)?;
 
         let mut slots = Vec::with_capacity(DECODE_PIPELINE_DEPTH);
         for i in 0..DECODE_PIPELINE_DEPTH {
             // Created signaled: nothing has been submitted yet, so a wait must
             // return immediately.
-            let fence_info = vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED);
-            let decode_fence = unsafe { device.create_fence(&fence_info, None) }
-                .map_err(|e| PixelForgeError::Synchronization(e.to_string()))?;
-            let transfer_fence = unsafe { device.create_fence(&fence_info, None) }
-                .map_err(|e| PixelForgeError::Synchronization(e.to_string()))?;
+            let decode_fence = create_fence(context, true)?;
+            let transfer_fence = create_fence(context, true)?;
             slots.push(DecodeSlot {
                 bitstream_buffer: vk::Buffer::null(),
                 bitstream_memory: vk::DeviceMemory::null(),
@@ -200,12 +186,8 @@ impl DecodePipeline {
         Ok(Self {
             slots,
             current_slot: 0,
-            decode_timeline: create_timeline_semaphore(context)?,
-            next_decode_value: 1,
-            last_decode_value: 0,
-            copy_timeline: create_timeline_semaphore(context)?,
-            next_copy_value: 1,
-            last_copy_value: 0,
+            decodes: TimelineChain::new(context)?,
+            copies: TimelineChain::new(context)?,
             last_fence: None,
             slot_sync,
             work_tx: Some(work_tx),
@@ -275,7 +257,7 @@ impl DecodePipeline {
         decode_queue: vk::Queue,
     ) -> Result<()> {
         let slot = &self.slots[self.current_slot];
-        let signal_value = self.next_decode_value;
+        let (semaphore, signal_value) = self.decodes.pending_signal();
 
         unsafe {
             device
@@ -289,11 +271,11 @@ impl DecodePipeline {
         // A timeline wait on value 0 is satisfied immediately, so the first
         // submission needs no special case.
         let waits = [vk::SemaphoreSubmitInfo::default()
-            .semaphore(self.decode_timeline)
-            .value(self.last_decode_value)
+            .semaphore(semaphore)
+            .value(self.decodes.last_value())
             .stage_mask(vk::PipelineStageFlags2::VIDEO_DECODE_KHR)];
         let signals = [vk::SemaphoreSubmitInfo::default()
-            .semaphore(self.decode_timeline)
+            .semaphore(semaphore)
             .value(signal_value)
             .stage_mask(vk::PipelineStageFlags2::VIDEO_DECODE_KHR)];
         let command_buffers =
@@ -309,9 +291,8 @@ impl DecodePipeline {
                 .map_err(|e| PixelForgeError::Synchronization(e.to_string()))?;
         }
 
-        self.last_decode_value = signal_value;
-        self.next_decode_value = signal_value + 1;
-        self.last_fence = Some(slot.decode_fence);
+        self.decodes.commit();
+        self.last_fence = Some(self.slots[self.current_slot].decode_fence);
         Ok(())
     }
 
@@ -325,7 +306,7 @@ impl DecodePipeline {
         transfer_queue: vk::Queue,
     ) -> Result<()> {
         let slot = &self.slots[self.current_slot];
-        let signal_value = self.next_copy_value;
+        let (copy_semaphore, signal_value) = self.copies.pending_signal();
 
         unsafe {
             device
@@ -339,17 +320,17 @@ impl DecodePipeline {
         let waits = [
             // The decode that produced the picture we are copying.
             vk::SemaphoreSubmitInfo::default()
-                .semaphore(self.decode_timeline)
-                .value(self.last_decode_value)
+                .semaphore(self.decodes.semaphore())
+                .value(self.decodes.last_value())
                 .stage_mask(vk::PipelineStageFlags2::COPY),
             // The previous copy, so copies complete in submission order.
             vk::SemaphoreSubmitInfo::default()
-                .semaphore(self.copy_timeline)
-                .value(self.last_copy_value)
+                .semaphore(copy_semaphore)
+                .value(self.copies.last_value())
                 .stage_mask(vk::PipelineStageFlags2::COPY),
         ];
         let signals = [vk::SemaphoreSubmitInfo::default()
-            .semaphore(self.copy_timeline)
+            .semaphore(copy_semaphore)
             .value(signal_value)
             .stage_mask(vk::PipelineStageFlags2::COPY)];
         let command_buffers =
@@ -365,9 +346,8 @@ impl DecodePipeline {
                 .map_err(|e| PixelForgeError::Synchronization(e.to_string()))?;
         }
 
-        self.last_copy_value = signal_value;
-        self.next_copy_value = signal_value + 1;
-        self.last_fence = Some(slot.transfer_fence);
+        self.copies.commit();
+        self.last_fence = Some(self.slots[self.current_slot].transfer_fence);
         Ok(())
     }
 
@@ -449,8 +429,8 @@ impl DecodePipeline {
             }
         }
         unsafe {
-            device.destroy_semaphore(self.decode_timeline, None);
-            device.destroy_semaphore(self.copy_timeline, None);
+            self.decodes.destroy(device);
+            self.copies.destroy(device);
         }
     }
 }

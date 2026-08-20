@@ -40,14 +40,14 @@ use ash::vk::{self, Handle};
 use futures_channel::oneshot;
 
 use crate::encoder::resources::{
-    ClearImageParams, clear_input_image, create_bitstream_buffer,
-    create_encode_feedback_query_pool, create_encode_timestamp_query_pool, create_image,
-    create_timeline_semaphore, map_bitstream_buffer, query_timestamp_diff, submit_encode_only,
+    ClearImageParams, allocate_command_buffers, clear_input_image, create_bitstream_buffer,
+    create_encode_feedback_query_pool, create_encode_timestamp_query_pool, create_fence,
+    create_image, map_bitstream_buffer, query_timestamp_diff, submit_encode_only,
     wait_and_read_bitstream,
 };
 use crate::encoder::{BitDepth, EncodedPacket, FrameType, PixelFormat};
 use crate::error::{PixelForgeError, Result};
-use crate::video::SlotSync;
+use crate::video::{SlotSync, TimelineChain};
 use crate::vulkan::VideoContext;
 
 /// A handle to the packet a single `EncodePipeline::submit_current` will
@@ -182,11 +182,7 @@ pub(crate) struct EncodePipeline {
     slots: Vec<EncodeSlot>,
     current_slot: usize,
     /// Orders encode submissions that share DPB state.
-    timeline: vk::Semaphore,
-    /// Value the next submit will signal.
-    next_value: u64,
-    /// Value the most recent submit signaled (0 = none yet).
-    last_value: u64,
+    timeline: TimelineChain,
 
     /// Per-slot busy flags shared with the completion thread.
     slot_sync: Arc<SlotSync>,
@@ -204,14 +200,8 @@ impl EncodePipeline {
         let context = config.context;
         let device = context.device();
 
-        let timeline = create_timeline_semaphore(context)?;
-
-        let alloc_info = vk::CommandBufferAllocateInfo::default()
-            .command_pool(config.command_pool)
-            .level(vk::CommandBufferLevel::PRIMARY)
-            .command_buffer_count(ENCODE_PIPELINE_DEPTH as u32);
-        let command_buffers = unsafe { device.allocate_command_buffers(&alloc_info) }
-            .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
+        let command_buffers =
+            allocate_command_buffers(context, config.command_pool, ENCODE_PIPELINE_DEPTH as u32)?;
 
         // Timestamp queries are only legal on a queue family with non-zero
         // `timestampValidBits` (VUID-vkCmdWriteTimestamp-timestampValidBits-00829).
@@ -270,10 +260,7 @@ impl EncodePipeline {
 
             // Created signaled so it is safe to wait on before the first encode;
             // `submit_encode_only` resets it before each submit.
-            let fence_create_info =
-                vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED);
-            let encode_fence = unsafe { device.create_fence(&fence_create_info, None) }
-                .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
+            let encode_fence = create_fence(context, true)?;
 
             let mut profile = *config.profile_info;
             let query_pool = create_encode_feedback_query_pool(context, &mut profile)?;
@@ -320,9 +307,7 @@ impl EncodePipeline {
         Ok(Self {
             slots,
             current_slot: 0,
-            timeline,
-            next_value: 1,
-            last_value: 0,
+            timeline: TimelineChain::new(context)?,
             slot_sync,
             work_tx: Some(work_tx),
             completion_thread: Some(completion_thread),
@@ -374,8 +359,8 @@ impl EncodePipeline {
         device: &ash::Device,
         encode_queue: vk::Queue,
     ) -> Result<EncodeFuture> {
-        let wait = (self.last_value > 0).then_some((self.timeline, self.last_value));
-        let signal_value = self.next_value;
+        let wait = self.timeline.wait();
+        let signal = self.timeline.pending_signal();
         let slot_index = self.current_slot;
 
         // Capture the Copy handles + metadata, releasing the slot borrow before
@@ -415,13 +400,12 @@ impl EncodePipeline {
                 fence,
                 encode_queue,
                 wait,
-                Some((self.timeline, signal_value)),
+                Some(signal),
             )?;
         }
         let submit_time = std::time::Instant::now();
 
-        self.last_value = signal_value;
-        self.next_value = signal_value + 1;
+        self.timeline.commit();
 
         // Mark busy *before* handing the work off, so the completion thread can
         // never clear the flag before it is set.
@@ -507,7 +491,7 @@ impl EncodePipeline {
             }
         }
         unsafe {
-            device.destroy_semaphore(self.timeline, None);
+            self.timeline.destroy(device);
         }
     }
 }

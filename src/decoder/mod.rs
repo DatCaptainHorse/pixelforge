@@ -34,10 +34,15 @@
 //! and friends, including B-pyramid — decodes correctly.
 
 pub(crate) mod bitreader;
-pub(crate) mod codec;
+/// The Vulkan video session and the per-decoder state every codec shares.
+pub(crate) mod common;
+/// Frame ownership: pool images, DPB slot pins, display-order reordering.
+pub(crate) mod frames;
 /// H.264 decoding.
 pub mod h264;
 pub(crate) mod pipeline;
+/// Readback and copies, all of which run on the transfer queue.
+pub(crate) mod transfer;
 
 pub use pipeline::DecodeFuture;
 
@@ -185,7 +190,7 @@ pub struct DecodedFrame {
     /// frame that borrows the decoder's DPB image (see the validity rules).
     // Held purely for its `Drop`, which is what returns the storage.
     #[allow(dead_code)]
-    pub(crate) pin: Option<codec::FramePin>,
+    pub(crate) pin: Option<frames::FramePin>,
 }
 
 /// Decoded frame data downloaded to the CPU.
