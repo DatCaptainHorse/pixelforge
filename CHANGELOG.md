@@ -5,6 +5,32 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- H.264 hardware decoding via Vulkan Video: `Decoder`, `DecodeConfig`, and
+  `Decoder::split` for carving a stream into coded frames. Stream-driven, so the
+  Vulkan session is created from the stream's own parameter sets and a mid-stream
+  resolution change is handled transparently. Verified byte-identical to
+  `ffmpeg -pix_fmt nv12` on AMD (RADV), NVIDIA and Intel (ANV).
+- Asynchronous decoding: `Decoder::decode` and `Decoder::flush` submit without
+  waiting and return a `DecodeFuture`, mirroring `Encoder::encode`. Measured
+  10-21% higher decode throughput depending on GPU and resolution.
+- `OutputOrder` selects presentation-order output (default) or decode-order
+  output, which is zero-copy: the frame is the decoder's own DPB image, pinned
+  until dropped.
+- `DecodeConfig::with_output_depth` reserves DPB slots so decoded frames can be
+  held while decoding continues.
+- Validation layer messages are now routed into `tracing` through a
+  `VK_EXT_debug_utils` messenger. Previously the layer was loaded with nowhere to
+  report, so enabling validation verified nothing.
+
+### Changed
+
+- Adopting a caller-created device for decode (`build_from_existing_decode`) now
+  requires the `timelineSemaphore` feature in addition to `synchronization2`.
+
 ## [0.9.1] - 01-09-2026
 
 ### Fixed

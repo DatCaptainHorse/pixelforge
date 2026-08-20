@@ -1,9 +1,12 @@
-//! A Vulkan-based video encoding library for Rust, supporting H.264, H.265, and AV1 codecs.
+//! A Vulkan-based video encoding and decoding library for Rust, supporting H.264,
+//! H.265 and AV1 encode, and H.264 decode.
 //!
 //! # Features
 //!
-//! - **Hardware-accelerated** video encoding using Vulkan Video extensions.
-//! - **Multiple codec support**: H.264/AVC, H.265/HEVC, AV1.
+//! - **Hardware-accelerated** video encoding and decoding using Vulkan Video extensions.
+//! - **Multiple codec support**: H.264/AVC, H.265/HEVC, AV1 encode; H.264 decode.
+//! - **Asynchronous pipelines**: both directions submit without waiting and hand
+//!   back a future ([`EncodeFuture`], [`DecodeFuture`]).
 //! - **GPU color conversion**: RGB/BGR → YUV via Vulkan compute shaders (BT.709, BT.2020, sRGB→BT.2020+PQ, scRGB-linear→BT.2020+PQ).
 //! - **HDR support**: 10-bit encoding (P010, YUV444P10), PQ transfer function, BT.2020 color space.
 //! - **GPU-native API**: Encode directly from Vulkan images (`vk::Image`).
@@ -16,15 +19,20 @@
 //!
 //! # Supported Codecs
 //!
-//! | Codec | Encode |
-//! |-------|--------|
-//! | H.264/AVC | ✓ |
-//! | H.265/HEVC | ✓ |
-//! | AV1 | ✓ |
+//! | Codec | Encode | Decode |
+//! |-------|--------|--------|
+//! | H.264/AVC | ✓ | ✓ |
+//! | H.265/HEVC | ✓ | |
+//! | AV1 | ✓ | |
+//!
+//! H.264 decoding is verified byte-identical to `ffmpeg -pix_fmt nv12` on AMD
+//! (RADV), NVIDIA and Intel (ANV).
 //!
 //! # Requirements
 //!
-//! - A GPU with Vulkan video encoding support (e.g., NVIDIA RTX series, AMD RDNA2+, Intel Arc)
+//! - A GPU with Vulkan video support (e.g., NVIDIA RTX series, AMD RDNA2+, Intel Arc).
+//!   Decoding additionally needs a video decode queue; on Intel Arc under Mesa it
+//!   currently has to be enabled with `ANV_DEBUG=video-decode,video-encode`.
 //!
 //! # Installation
 //!
@@ -110,6 +118,52 @@
 //! }
 //! ```
 //!
+//! ## Decoding Video
+//!
+//! The decoder is stream-driven: it creates its Vulkan session from the
+//! stream's own parameter sets, so nothing has to be configured up front, and a
+//! mid-stream resolution change is handled transparently.
+//!
+//! [`Decoder::decode`](decoder::Decoder::decode) submits without waiting and
+//! returns a [`DecodeFuture`], mirroring [`Encoder::encode`]. Keep a couple in
+//! flight to overlap parsing with GPU decode. Frames come out in presentation
+//! order by default; drop each frame when done, which returns its storage to the
+//! decoder.
+//!
+//! ```rust,no_run
+//! use pixelforge::{Codec, VideoContextBuilder};
+//! use pixelforge::decoder::{DecodeConfig, Decoder};
+//!
+//! fn main() -> Result<(), Box<dyn std::error::Error>> {
+//!     let context = VideoContextBuilder::new()
+//!         .app_name("Decoder Example")
+//!         .require_decode(Codec::H264)
+//!         .build()?;
+//!
+//!     let mut decoder = Decoder::new(context, DecodeConfig::h264())?;
+//!     let stream: Vec<u8> = std::fs::read("input.264")?;
+//!
+//!     // `split` carves the stream into one chunk per coded frame.
+//!     for (i, unit) in decoder.split(&stream).enumerate() {
+//!         for frame in pollster::block_on(decoder.decode(unit, i as u64)?)? {
+//!             // `frame.image` is a decoder-owned GPU image, valid until dropped.
+//!             let data = decoder.download(&frame)?;
+//!             let _ = (data.y, data.uv);
+//!         }
+//!     }
+//!     // Drain whatever the reorder buffer still holds.
+//!     for frame in pollster::block_on(decoder.flush()?)? {
+//!         let _ = decoder.download(&frame)?;
+//!     }
+//!     Ok(())
+//! }
+//! ```
+//!
+//! For the lowest latency, [`OutputOrder::Decode`](decoder::OutputOrder::Decode)
+//! returns each frame as soon as its GPU work completes, with no copy: the frame
+//! *is* the decoder's DPB image, pinned until dropped. With B-frames the caller
+//! then has to sort by [`DecodedFrame::display_order`](decoder::DecodedFrame).
+//!
 //! ## Color Conversion (RGB → YUV)
 //!
 //! PixelForge includes a GPU compute shader for converting RGB input to YUV output, supporting multiple color spaces:
@@ -157,6 +211,9 @@
 //! # Query codec capabilities
 //! cargo run --example query_capabilities
 //!
+//! # H.264 decoding to raw YUV
+//! cargo run --example decode_h264 -- input.264 output.yuv
+//!
 //! # H.264 encoding example
 //! cargo run --example encode_h264
 //!
@@ -177,8 +234,8 @@
 //!
 //! # TODO's
 //!
-//! 1. [] Decoding.
-//! 1. [] B-frames support.
+//! 1. [] H.265 and AV1 decoding.
+//! 1. [] B-frames support (encode).
 //!
 //! # Contributing
 //!
@@ -206,6 +263,9 @@ pub(crate) const fn align4(size: usize) -> usize {
 }
 
 pub use converter::{ColorConverter, ColorConverterConfig, ColorSpace, InputFormat, OutputFormat};
+pub use decoder::{
+    DecodeConfig, DecodeFuture, DecodedFrame, DecodedFrameData, Decoder, OutputOrder,
+};
 pub use encoder::{
     BitDepth as EncodeBitDepth, Codec, ColorDescription, DEFAULT_FRAME_RATE, DEFAULT_GOP_SIZE,
     DEFAULT_H264_QP, DEFAULT_H265_QP, DEFAULT_MAX_BITRATE, DEFAULT_MAX_REFERENCE_FRAMES,

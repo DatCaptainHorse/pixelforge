@@ -1,21 +1,28 @@
 # Agent Instructions
 
 ## Project Overview
-Pixelforge is a Rust library for video encoding using Vulkan Video.
+Pixelforge is a Rust library for video encoding and decoding using Vulkan Video.
 
 ## Build & Test
 ```bash
 cargo build
 cargo test
 cargo run --example encode_h264
+cargo run --example decode_h264 -- input.264 output.yuv
 ```
+
+Decoding on Intel Arc under Mesa needs the video queues enabled explicitly:
+`ANV_DEBUG=video-decode,video-encode`.
 
 ## README Generation
 The `README.md` is generated from the doc comments in `src/lib.rs` using the `README.tpl` template.
 To regenerate:
 ```bash
-cargo readme --no-title --no-indent-headings > README.md
+cargo readme --no-title > README.md
 ```
+
+(`--no-indent-headings` would flatten every section to `#`, which does not match
+the committed `README.md`.)
 Do not edit `README.md` directly; update the doc comments in `src/lib.rs` instead.
 
 To verify the quality of the encoded videos, run:
@@ -27,7 +34,21 @@ cargo run --example encode_h265 \
     && ffmpeg -hide_banner -loglevel info -s 320x240 -pix_fmt yuv420p -f rawvideo -i testdata/test_frames.yuv -s 320x240 -pix_fmt yuv420p -f rawvideo -i decoded.yuv -lavfi psnr -f null -
 ```
 
-Make sure there are no Vulkan validation layer errors during execution.
+To verify decoding, decode a stream and compare against ffmpeg's software
+decoder, which should be byte-identical:
+
+```bash
+cargo run --example decode_h264 -- tests/data/bframes.264 out.yuv \
+    && ffmpeg -hide_banner -loglevel error -y -i tests/data/bframes.264 -pix_fmt nv12 ref.yuv \
+    && cmp ref.yuv out.yuv && echo "decode matches ffmpeg"
+```
+
+Make sure there are no Vulkan validation layer errors during execution. Enable
+them with `PIXELFORGE_VALIDATION=1`; the layer's messages are routed through
+`tracing`, so pair it with `RUST_LOG=warn` (or `debug` for the layer's own
+chatter). Without `VK_LAYER_KHRONOS_validation` installed, pixelforge logs a
+warning and carries on with validation disabled, so absence of errors means
+nothing if the layer is missing.
 
 ## Code Style
 - Follow `rustfmt.toml` formatting rules
@@ -38,8 +59,10 @@ Make sure there are no Vulkan validation layer errors during execution.
 
 ## Project Structure
 - `src/` - Library source code
-- `examples/` - Usage examples for encoding
-- `testdata/` - Test input files
+- `examples/` - Usage examples for encoding and decoding
+- `testdata/` - Test input files (note: `test_frames.yuv` is a git-LFS pointer;
+  generate frames locally if LFS content is unavailable)
+- `tests/data/` - Small H.264 streams used by the decoder tests
 
 ## Key Dependencies
 - Vulkan Video API

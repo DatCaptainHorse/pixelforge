@@ -257,6 +257,7 @@ impl H264Decoder {
 
         let coincide =
             decode_flags.contains(vk::VideoDecodeCapabilityFlagsKHR::DPB_AND_OUTPUT_COINCIDE);
+        debug!("H.264 decode capability flags: {:?}", decode_flags);
         let use_layered_dpb =
             !cap_flags.contains(vk::VideoCapabilityFlagsKHR::SEPARATE_REFERENCE_IMAGES);
 
