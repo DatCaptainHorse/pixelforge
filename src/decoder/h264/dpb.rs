@@ -12,6 +12,9 @@
 //! MMCO whenever B-pyramid is enabled, and applying the sliding window in its
 //! place silently decodes the wrong pictures.
 
+use std::sync::Arc;
+
+use crate::decoder::codec::SlotPins;
 use crate::decoder::h264::parser::{Mmco, NalType, RefPicMarking, SliceHeader, Sps};
 use crate::error::{PixelForgeError, Result};
 
@@ -65,6 +68,9 @@ pub(crate) struct PictureState {
 
 /// Decode-side DPB: POC state machine plus the reference picture set.
 pub(crate) struct DecodeDpb {
+    /// Slots reserved by decoded frames the caller still holds. Never handed
+    /// out for a new picture, however the reference rules mark them.
+    pins: Arc<SlotPins>,
     /// Reference pictures, most recently decoded last.
     refs: Vec<RefPicture>,
     /// Which slots are occupied (by a reference or the in-flight picture).
@@ -85,8 +91,9 @@ pub(crate) struct DecodeDpb {
 }
 
 impl DecodeDpb {
-    pub fn new(slot_count: usize) -> Self {
+    pub fn new(slot_count: usize, pins: Arc<SlotPins>) -> Self {
         Self {
+            pins,
             refs: Vec::new(),
             slot_used: [false; MAX_DPB_SLOTS],
             slot_count: slot_count.min(MAX_DPB_SLOTS),
@@ -269,21 +276,26 @@ impl DecodeDpb {
         if is_reference { 2 * temp } else { 2 * temp - 1 }
     }
 
-    /// Reserve a DPB slot for the current picture.
+    /// Reserve a DPB slot for the current picture, if one is available.
     ///
     /// The current picture always needs a slot, even when it is not a
-    /// reference, because Vulkan decodes into a DPB resource. Returns an error
-    /// only if the DPB is inconsistent (more references live than slots).
-    pub fn allocate_slot(&mut self) -> Result<u8> {
-        for (slot, used) in self.slot_used.iter_mut().take(self.slot_count).enumerate() {
-            if !*used {
-                *used = true;
-                return Ok(slot as u8);
+    /// reference, because Vulkan decodes into a DPB resource. Slots pinned by
+    /// a handed-out frame are skipped: the caller is still reading them.
+    /// `None` means every slot is either a live reference or pinned.
+    pub fn try_allocate_slot(&mut self) -> Option<u8> {
+        for slot in 0..self.slot_count {
+            if !self.slot_used[slot] && !self.pins.is_pinned(slot as u8) {
+                self.slot_used[slot] = true;
+                return Some(slot as u8);
             }
         }
-        Err(PixelForgeError::InvalidInput(
-            "H.264 decode: no free DPB slot (stream exceeds negotiated DPB size)".to_string(),
-        ))
+        None
+    }
+
+    /// Whether any slot is held by a frame the caller has not dropped, which
+    /// means waiting could free one.
+    pub fn has_pinned_slots(&self) -> bool {
+        self.pins.any_pinned()
     }
 
     /// Release a slot that was allocated for a non-reference picture.
@@ -509,7 +521,7 @@ mod tests {
         let state = dpb
             .begin_picture(NalType::Slice, 2, header, sps, false)
             .unwrap();
-        let slot = dpb.allocate_slot().unwrap();
+        let slot = dpb.try_allocate_slot().unwrap();
         dpb.end_picture(slot, &state, sps);
         slot
     }
@@ -525,7 +537,7 @@ mod tests {
     #[test]
     fn test_poc_type0_wraps() {
         let sps = sps(0);
-        let mut dpb = DecodeDpb::new(4);
+        let mut dpb = DecodeDpb::new(4, Arc::default());
         // IDR at POC 0.
         let s = dpb
             .begin_picture(NalType::IdrSlice, 3, &header(0, 0), &sps, true)
@@ -552,7 +564,7 @@ mod tests {
     #[test]
     fn test_poc_type2_is_decode_order() {
         let sps = sps(2);
-        let mut dpb = DecodeDpb::new(4);
+        let mut dpb = DecodeDpb::new(4, Arc::default());
         let s = dpb
             .begin_picture(NalType::IdrSlice, 3, &header(0, 0), &sps, true)
             .unwrap();
@@ -570,13 +582,13 @@ mod tests {
     #[test]
     fn test_sliding_window_evicts_oldest() {
         let sps = sps(0); // max_num_ref_frames = 2
-        let mut dpb = DecodeDpb::new(4);
+        let mut dpb = DecodeDpb::new(4, Arc::default());
 
         // IDR.
         let s = dpb
             .begin_picture(NalType::IdrSlice, 3, &header(0, 0), &sps, true)
             .unwrap();
-        let slot = dpb.allocate_slot().unwrap();
+        let slot = dpb.try_allocate_slot().unwrap();
         dpb.end_picture(slot, &s, &sps);
         assert_eq!(dpb.references().len(), 1);
 
@@ -585,7 +597,7 @@ mod tests {
             let s = dpb
                 .begin_picture(NalType::Slice, 2, &header(i, i * 2), &sps, false)
                 .unwrap();
-            let slot = dpb.allocate_slot().unwrap();
+            let slot = dpb.try_allocate_slot().unwrap();
             dpb.end_picture(slot, &s, &sps);
         }
         assert_eq!(dpb.references().len(), 2);
@@ -599,12 +611,12 @@ mod tests {
     fn test_mmco1_forgets_specific_short_term_ref() {
         let mut sps = sps(0);
         sps.max_num_ref_frames = 4; // Sliding window would not evict anything.
-        let mut dpb = DecodeDpb::new(6);
+        let mut dpb = DecodeDpb::new(6, Arc::default());
 
         let idr = dpb
             .begin_picture(NalType::IdrSlice, 3, &header(0, 0), &sps, true)
             .unwrap();
-        let idr_slot = dpb.allocate_slot().unwrap();
+        let idr_slot = dpb.try_allocate_slot().unwrap();
         dpb.end_picture(idr_slot, &idr, &sps);
         let s1 = decode_ref(&mut dpb, &sps, &header(1, 2));
         decode_ref(&mut dpb, &sps, &header(2, 4));
@@ -624,7 +636,7 @@ mod tests {
         let frame_nums: Vec<u16> = dpb.references().iter().map(|r| r.frame_num).collect();
         assert_eq!(frame_nums, vec![0, 2, 3], "frame_num 1 should be retired");
         // Its slot must be reusable now.
-        assert_eq!(dpb.allocate_slot().unwrap(), s1);
+        assert_eq!(dpb.try_allocate_slot().unwrap(), s1);
     }
 
     /// MMCO 6 marks the current picture long-term; MMCO 2 later drops it by
@@ -632,12 +644,12 @@ mod tests {
     #[test]
     fn test_mmco6_and_mmco2_long_term_lifecycle() {
         let sps = sps(0); // max_num_ref_frames = 2
-        let mut dpb = DecodeDpb::new(6);
+        let mut dpb = DecodeDpb::new(6, Arc::default());
 
         let idr = dpb
             .begin_picture(NalType::IdrSlice, 3, &header(0, 0), &sps, true)
             .unwrap();
-        let slot = dpb.allocate_slot().unwrap();
+        let slot = dpb.try_allocate_slot().unwrap();
         dpb.end_picture(slot, &idr, &sps);
 
         // Current picture becomes long-term index 0.
@@ -680,12 +692,12 @@ mod tests {
     fn test_mmco3_converts_short_to_long_term() {
         let mut sps = sps(0);
         sps.max_num_ref_frames = 4;
-        let mut dpb = DecodeDpb::new(6);
+        let mut dpb = DecodeDpb::new(6, Arc::default());
 
         let idr = dpb
             .begin_picture(NalType::IdrSlice, 3, &header(0, 0), &sps, true)
             .unwrap();
-        let slot = dpb.allocate_slot().unwrap();
+        let slot = dpb.try_allocate_slot().unwrap();
         dpb.end_picture(slot, &idr, &sps);
         decode_ref(&mut dpb, &sps, &header(1, 2));
 
@@ -714,12 +726,12 @@ mod tests {
     fn test_mmco4_bounds_long_term_indices() {
         let mut sps = sps(0);
         sps.max_num_ref_frames = 4;
-        let mut dpb = DecodeDpb::new(6);
+        let mut dpb = DecodeDpb::new(6, Arc::default());
 
         let idr = dpb
             .begin_picture(NalType::IdrSlice, 3, &header(0, 0), &sps, true)
             .unwrap();
-        let slot = dpb.allocate_slot().unwrap();
+        let slot = dpb.try_allocate_slot().unwrap();
         dpb.end_picture(slot, &idr, &sps);
 
         let marked = header_with_mmco(
@@ -752,12 +764,12 @@ mod tests {
     #[test]
     fn test_mmco5_resets_dpb_and_poc() {
         let sps = sps(0);
-        let mut dpb = DecodeDpb::new(6);
+        let mut dpb = DecodeDpb::new(6, Arc::default());
 
         let idr = dpb
             .begin_picture(NalType::IdrSlice, 3, &header(0, 0), &sps, true)
             .unwrap();
-        let slot = dpb.allocate_slot().unwrap();
+        let slot = dpb.try_allocate_slot().unwrap();
         dpb.end_picture(slot, &idr, &sps);
         decode_ref(&mut dpb, &sps, &header(1, 2));
         assert_eq!(dpb.references().len(), 2);
@@ -769,7 +781,7 @@ mod tests {
         // The picture is rebased rather than keeping poc 4 / frame_num 2.
         assert_eq!(state.poc, 0);
         assert_eq!(state.frame_num, 0);
-        let slot = dpb.allocate_slot().unwrap();
+        let slot = dpb.try_allocate_slot().unwrap();
         dpb.end_picture(slot, &state, &sps);
 
         // Everything prior is gone; only the rebased picture remains.
@@ -786,11 +798,11 @@ mod tests {
     #[test]
     fn test_non_reference_picture_ignores_marking() {
         let sps = sps(0);
-        let mut dpb = DecodeDpb::new(4);
+        let mut dpb = DecodeDpb::new(4, Arc::default());
         let idr = dpb
             .begin_picture(NalType::IdrSlice, 3, &header(0, 0), &sps, true)
             .unwrap();
-        let slot = dpb.allocate_slot().unwrap();
+        let slot = dpb.try_allocate_slot().unwrap();
         dpb.end_picture(slot, &idr, &sps);
 
         // nal_ref_idc == 0, so dec_ref_pic_marking() is not even present.
@@ -798,7 +810,7 @@ mod tests {
         let state = dpb
             .begin_picture(NalType::Slice, 0, &marked, &sps, false)
             .unwrap();
-        let slot = dpb.allocate_slot().unwrap();
+        let slot = dpb.try_allocate_slot().unwrap();
         dpb.end_picture(slot, &state, &sps);
         assert_eq!(dpb.references().len(), 1, "IDR must survive");
     }
@@ -806,11 +818,11 @@ mod tests {
     #[test]
     fn test_non_reference_picture_releases_slot() {
         let sps = sps(0);
-        let mut dpb = DecodeDpb::new(4);
+        let mut dpb = DecodeDpb::new(4, Arc::default());
         let s = dpb
             .begin_picture(NalType::IdrSlice, 3, &header(0, 0), &sps, true)
             .unwrap();
-        let slot = dpb.allocate_slot().unwrap();
+        let slot = dpb.try_allocate_slot().unwrap();
         dpb.end_picture(slot, &s, &sps);
 
         // nal_ref_idc == 0 => disposable picture.
@@ -818,17 +830,17 @@ mod tests {
             .begin_picture(NalType::Slice, 0, &header(1, 2), &sps, false)
             .unwrap();
         assert!(!s.is_reference);
-        let slot = dpb.allocate_slot().unwrap();
+        let slot = dpb.try_allocate_slot().unwrap();
         dpb.end_picture(slot, &s, &sps);
         assert_eq!(dpb.references().len(), 1);
         // The slot is reusable immediately.
-        assert_eq!(dpb.allocate_slot().unwrap(), slot);
+        assert_eq!(dpb.try_allocate_slot().unwrap(), slot);
     }
 
     #[test]
     fn test_idr_flushes_dpb() {
         let sps = sps(0);
-        let mut dpb = DecodeDpb::new(4);
+        let mut dpb = DecodeDpb::new(4, Arc::default());
         for i in 0..2u32 {
             let nal = if i == 0 {
                 NalType::IdrSlice
@@ -838,7 +850,7 @@ mod tests {
             let s = dpb
                 .begin_picture(nal, 3, &header(i, i * 2), &sps, i == 0)
                 .unwrap();
-            let slot = dpb.allocate_slot().unwrap();
+            let slot = dpb.try_allocate_slot().unwrap();
             dpb.end_picture(slot, &s, &sps);
         }
         assert_eq!(dpb.references().len(), 2);
@@ -849,19 +861,65 @@ mod tests {
         assert_eq!(s.poc, 0);
         assert!(dpb.references().is_empty());
         // All slots freed by the IDR.
-        assert_eq!(dpb.allocate_slot().unwrap(), 0);
+        assert_eq!(dpb.try_allocate_slot().unwrap(), 0);
     }
 
     #[test]
     fn test_field_pictures_rejected() {
         let mut sps = sps(0);
         sps.frame_mbs_only_flag = false;
-        let mut dpb = DecodeDpb::new(4);
+        let mut dpb = DecodeDpb::new(4, Arc::default());
         let mut h = header(0, 0);
         h.field_pic_flag = true;
         assert!(
             dpb.begin_picture(NalType::IdrSlice, 3, &h, &sps, true)
                 .is_err()
         );
+    }
+
+    /// A slot a handed-out frame is reading must not be decoded over, even once
+    /// the reference rules are done with it.
+    #[test]
+    fn pinned_slots_are_not_reallocated() {
+        let pins = Arc::new(SlotPins::default());
+        let mut dpb = DecodeDpb::new(2, pins.clone());
+
+        // Decode a non-reference picture and hand it to the caller.
+        let handed_out = dpb.try_allocate_slot().unwrap();
+        pins.pin(handed_out);
+        dpb.release_slot(handed_out);
+        assert!(dpb.has_pinned_slots());
+
+        // The DPB has no use for the slot any more, but the caller is reading it.
+        let next = dpb.try_allocate_slot().unwrap();
+        assert_ne!(next, handed_out);
+        assert_eq!(dpb.try_allocate_slot(), None, "both slots are busy");
+
+        // Dropping the frame releases the pin.
+        pins.release(handed_out);
+        assert!(!dpb.has_pinned_slots());
+        assert_eq!(dpb.try_allocate_slot(), Some(handed_out));
+    }
+
+    /// Waiting when nothing is pinned would never wake, so it must not wait.
+    #[test]
+    fn waiting_with_nothing_pinned_returns_immediately() {
+        let pins = SlotPins::default();
+        pins.wait_for_release();
+    }
+
+    /// Clearing pins (session teardown) makes every slot allocatable again.
+    #[test]
+    fn clearing_pins_frees_every_slot() {
+        let pins = Arc::new(SlotPins::default());
+        let mut dpb = DecodeDpb::new(2, pins.clone());
+        let slot = dpb.try_allocate_slot().unwrap();
+        pins.pin(slot);
+        dpb.release_slot(slot);
+        assert_eq!(dpb.try_allocate_slot(), Some(1));
+
+        pins.clear();
+        dpb.release_slot(1);
+        assert_eq!(dpb.try_allocate_slot(), Some(slot));
     }
 }

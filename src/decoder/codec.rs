@@ -17,7 +17,7 @@
 //! This mirrors the encoder's [`crate::encoder::codec`] split deliberately, so
 //! the two directions read the same way.
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 
 use ash::vk;
 
@@ -76,8 +76,14 @@ pub(crate) struct SessionPlan {
     pub picture_format: vk::Format,
     pub bit_depth: BitDepth,
     pub pixel_format: PixelFormat,
-    /// DPB slots: references plus the picture being decoded.
+    /// DPB slots: references, the picture being decoded, and `output_slots`.
     pub slot_count: usize,
+    /// How many of `slot_count` are spare capacity for pinned output frames.
+    /// Zero means decode-order output has to be copied instead of pinned.
+    pub output_slots: usize,
+    /// References the driver may use for a single picture, which is
+    /// `slot_count` minus the current picture and the output reservation.
+    pub max_active_references: u32,
     /// Driver decodes straight into the DPB image (`DPB_AND_OUTPUT_COINCIDE`).
     pub coincide: bool,
     /// One layered DPB image rather than one image per slot.
@@ -114,6 +120,8 @@ pub(crate) struct DecodeSession {
     /// True when the driver decodes into the DPB image directly; false when a
     /// distinct output image is required.
     pub coincide: bool,
+    /// Spare DPB slots available for pinning handed-out frames.
+    pub output_slots: usize,
     /// Distinct decode output image, only when `!coincide`.
     pub output_image: Option<(vk::Image, vk::DeviceMemory, vk::ImageView)>,
 }
@@ -169,6 +177,10 @@ pub(crate) struct DecoderCommon {
 
     /// The active session, created lazily from the stream's parameter sets.
     pub session: Option<DecodeSession>,
+
+    /// DPB slots reserved by frames the caller still holds. Shared with those
+    /// frames, which release their slot when dropped.
+    pub slot_pins: Arc<SlotPins>,
 }
 
 // `bitstream_ptr` is a persistently mapped host-visible allocation owned by
@@ -215,6 +227,7 @@ impl DecoderCommon {
             bitstream_size_alignment: 1,
             readback: None,
             session: None,
+            slot_pins: Arc::new(SlotPins::default()),
         })
     }
 
@@ -250,7 +263,7 @@ impl DecoderCommon {
             })
             .reference_picture_format(plan.picture_format)
             .max_dpb_slots(plan.slot_count as u32)
-            .max_active_reference_pictures(plan.slot_count as u32 - 1)
+            .max_active_reference_pictures(plan.max_active_references)
             .std_header_version(std_header_version);
 
         let session = unsafe {
@@ -315,6 +328,7 @@ impl DecoderCommon {
             dpb_slot_active: vec![false; plan.slot_count],
             use_layered_dpb: plan.use_layered_dpb,
             coincide: plan.coincide,
+            output_slots: plan.output_slots,
             output_image,
         });
         Ok(())
@@ -324,6 +338,14 @@ impl DecoderCommon {
         let Some(session) = self.session.take() else {
             return;
         };
+        // The slots these pins refer to are about to stop existing.
+        if self.slot_pins.any_pinned() {
+            tracing::warn!(
+                "decode session torn down while decoded frames still hold DPB slots; \
+                 those frames' images are now invalid"
+            );
+        }
+        self.slot_pins.clear();
         unsafe {
             self.context.device().device_wait_idle().ok();
             self.video_queue_fn
@@ -1120,6 +1142,8 @@ impl Drop for DecoderCommon {
 /// descriptor is only valid until the next decode submission. [`ReorderBuffer`]
 /// turns it into a [`DecodedFrame`], which owns its storage.
 pub(crate) struct DecodedPicture {
+    /// DPB slot the picture was decoded into.
+    pub slot: u8,
     pub image: vk::Image,
     pub image_view: vk::ImageView,
     pub layout: vk::ImageLayout,
@@ -1134,11 +1158,60 @@ pub(crate) struct DecodedPicture {
     pub is_keyframe: bool,
 }
 
-/// What a [`FramePin`] holds reserved, and what releasing it frees.
+/// An image in the frame pool, by index.
 #[derive(Debug, Clone, Copy)]
-pub(crate) enum PinKind {
-    /// An image in the frame pool, by index.
-    PoolImage(usize),
+pub(crate) struct PoolIndex(usize);
+
+/// DPB slots reserved by frames the caller is still holding.
+///
+/// A pinned slot is one the driver decoded into and the caller is now reading,
+/// so the codec must not decode over it. Releases come from [`FramePin::drop`]
+/// on whatever thread the frame died on, which is why the decoder waits on the
+/// condition variable rather than polling.
+#[derive(Debug, Default)]
+pub(crate) struct SlotPins {
+    /// One bit per DPB slot.
+    pinned: Mutex<u32>,
+    released: Condvar,
+}
+
+impl SlotPins {
+    pub fn is_pinned(&self, slot: u8) -> bool {
+        *self.pinned.lock().unwrap() & (1 << slot) != 0
+    }
+
+    pub fn any_pinned(&self) -> bool {
+        *self.pinned.lock().unwrap() != 0
+    }
+
+    pub fn pin(&self, slot: u8) {
+        *self.pinned.lock().unwrap() |= 1 << slot;
+    }
+
+    pub fn release(&self, slot: u8) {
+        *self.pinned.lock().unwrap() &= !(1 << slot);
+        self.released.notify_all();
+    }
+
+    /// Block until at least one pinned slot is released. Returns immediately if
+    /// nothing is pinned, since then no release can ever come.
+    pub fn wait_for_release(&self) {
+        let mut pinned = self.pinned.lock().unwrap();
+        let before = *pinned;
+        if before == 0 {
+            return;
+        }
+        while *pinned == before {
+            pinned = self.released.wait(pinned).unwrap();
+        }
+    }
+
+    /// Forget every pin. Called when the session is torn down and the slots it
+    /// refers to no longer exist.
+    pub fn clear(&self) {
+        *self.pinned.lock().unwrap() = 0;
+        self.released.notify_all();
+    }
 }
 
 /// Pins released by frames the caller has dropped, waiting to be reclaimed.
@@ -1148,15 +1221,15 @@ pub(crate) enum PinKind {
 /// them in the next time it needs storage.
 #[derive(Debug, Default)]
 pub(crate) struct ReleaseQueue {
-    released: Mutex<Vec<PinKind>>,
+    released: Mutex<Vec<PoolIndex>>,
 }
 
 impl ReleaseQueue {
-    fn push(&self, kind: PinKind) {
-        self.released.lock().unwrap().push(kind);
+    fn push(&self, index: PoolIndex) {
+        self.released.lock().unwrap().push(index);
     }
 
-    fn take(&self) -> Vec<PinKind> {
+    fn take(&self) -> Vec<PoolIndex> {
         std::mem::take(&mut *self.released.lock().unwrap())
     }
 }
@@ -1165,14 +1238,24 @@ impl ReleaseQueue {
 ///
 /// Dropping the frame drops this, which returns the storage to the decoder.
 #[derive(Debug)]
-pub(crate) struct FramePin {
-    kind: PinKind,
-    releases: Arc<ReleaseQueue>,
+pub(crate) enum FramePin {
+    /// A copy in the frame pool. Released lazily: the decoder never waits on
+    /// pool images, it just allocates another one.
+    Pool {
+        index: PoolIndex,
+        releases: Arc<ReleaseQueue>,
+    },
+    /// The DPB slot the picture was decoded into, handed out without a copy.
+    /// Released eagerly, because a decode may be blocked waiting for it.
+    DpbSlot { slot: u8, pins: Arc<SlotPins> },
 }
 
 impl Drop for FramePin {
     fn drop(&mut self) {
-        self.releases.push(self.kind);
+        match self {
+            FramePin::Pool { index, releases } => releases.push(*index),
+            FramePin::DpbSlot { slot, pins } => pins.release(*slot),
+        }
     }
 }
 
@@ -1220,12 +1303,10 @@ impl FramePool {
         }
     }
 
-    /// Fold in the pins released by dropped frames.
+    /// Fold in the images released by dropped frames.
     fn reclaim(&mut self) {
-        for kind in self.releases.take() {
-            match kind {
-                PinKind::PoolImage(i) => self.images[i].state = PoolState::Free,
-            }
+        for PoolIndex(i) in self.releases.take() {
+            self.images[i].state = PoolState::Free;
         }
     }
 
@@ -1279,8 +1360,8 @@ impl FramePool {
     /// Mark `index` as handed to the caller and mint its pin.
     fn hand_out(&mut self, index: usize) -> FramePin {
         self.images[index].state = PoolState::HandedOut;
-        FramePin {
-            kind: PinKind::PoolImage(index),
+        FramePin::Pool {
+            index: PoolIndex(index),
             releases: self.releases.clone(),
         }
     }
@@ -1367,23 +1448,7 @@ impl ReorderBuffer {
         reorder_depth: usize,
     ) -> Result<Vec<DecodedFrame>> {
         if !self.enabled {
-            // Decode order: hand out the decoder's own image. Valid only until
-            // the next decode submission; see `DecodedFrame`.
-            return Ok(vec![DecodedFrame {
-                image: picture.image,
-                image_view: picture.image_view,
-                layout: picture.layout,
-                array_layer: picture.array_layer,
-                pixel_format: picture.pixel_format,
-                width: picture.width,
-                height: picture.height,
-                coded_width: picture.coded_width,
-                coded_height: picture.coded_height,
-                pts: picture.pts,
-                display_order: picture.display_order,
-                is_keyframe: picture.is_keyframe,
-                pin: None,
-            }]);
+            return Ok(vec![self.emit_immediately(common, picture)?]);
         }
 
         let mut out = Vec::new();
@@ -1413,6 +1478,73 @@ impl ReorderBuffer {
             out.push(self.pop_min_display_order());
         }
         Ok(out)
+    }
+
+    /// Hand a picture straight to the caller (decode-order mode).
+    ///
+    /// Zero-copy when the driver decoded into the DPB image and the session
+    /// reserved a spare slot for it: the slot is pinned, so the codec will not
+    /// decode over it until the frame is dropped. Otherwise the picture lives
+    /// somewhere that the next decode overwrites (the session's single output
+    /// image, or a DPB slot the stream needs back), so it is copied into a pool
+    /// image instead.
+    fn emit_immediately(
+        &mut self,
+        common: &DecoderCommon,
+        picture: &DecodedPicture,
+    ) -> Result<DecodedFrame> {
+        let session = common.session()?;
+        if session.coincide && session.output_slots > 0 {
+            common.slot_pins.pin(picture.slot);
+            return Ok(DecodedFrame {
+                image: picture.image,
+                image_view: picture.image_view,
+                layout: picture.layout,
+                array_layer: picture.array_layer,
+                pixel_format: picture.pixel_format,
+                width: picture.width,
+                height: picture.height,
+                coded_width: picture.coded_width,
+                coded_height: picture.coded_height,
+                pts: picture.pts,
+                display_order: picture.display_order,
+                is_keyframe: picture.is_keyframe,
+                pin: Some(FramePin::DpbSlot {
+                    slot: picture.slot,
+                    pins: common.slot_pins.clone(),
+                }),
+            });
+        }
+        self.emit_copy(common, picture)
+    }
+
+    /// Copy a picture into a pool image and hand out the copy.
+    fn emit_copy(
+        &mut self,
+        common: &DecoderCommon,
+        picture: &DecodedPicture,
+    ) -> Result<DecodedFrame> {
+        let index = self.pool.acquire(common, picture)?;
+        common.copy_picture_to_image(picture, self.pool.images[index].image)?;
+        let pin = self.pool.hand_out(index);
+        Ok(DecodedFrame {
+            image: self.pool.images[index].image,
+            // Pool images carry no view (see PoolImage); a caller needing one
+            // for GPU work creates it over `image` with the usage it wants.
+            image_view: vk::ImageView::null(),
+            // copy_picture_to_image leaves the pool image in TRANSFER_DST layout.
+            layout: vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            array_layer: 0,
+            pixel_format: picture.pixel_format,
+            width: picture.width,
+            height: picture.height,
+            coded_width: picture.coded_width,
+            coded_height: picture.coded_height,
+            pts: picture.pts,
+            display_order: picture.display_order,
+            is_keyframe: picture.is_keyframe,
+            pin: Some(pin),
+        })
     }
 
     /// Emit every buffered picture in display order. Call at end of stream.

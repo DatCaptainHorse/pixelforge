@@ -16,8 +16,9 @@
 //!   [`OutputOrder`]); drain the reorder buffer with [`Decoder::flush`] at end
 //!   of stream. Streams without B-frames add no latency. Switch to
 //!   [`OutputOrder::Decode`] for the lowest-latency decode-order output.
-//! - **Zero-copy output**: [`DecodedFrame::image`] is a decoder-owned GPU
-//!   image. See [`DecodedFrame`] for validity rules.
+//! - **Zero-copy output**: in [`OutputOrder::Decode`] a [`DecodedFrame`] is the
+//!   decoder's own DPB image, pinned until the frame is dropped. See
+//!   [`DecodedFrame`] for validity rules and what holding one costs.
 //!
 //! # Limitations (H.264)
 //!
@@ -49,10 +50,18 @@ pub enum OutputOrder {
     /// behaves like [`Self::Decode`].
     Display,
     /// Decode order: frames are returned the moment their GPU work completes,
-    /// the lowest-latency option. With B-frames the caller must reorder by
+    /// the lowest-latency option, and without copying the picture out of the
+    /// DPB. With B-frames the caller must reorder by
     /// [`DecodedFrame::display_order`] if presentation order matters.
     Decode,
 }
+
+/// How many decoded frames the caller may hold at once, by default.
+///
+/// Matches the encoder's pipeline depth: enough to overlap consuming one frame
+/// with decoding the next, without growing the decoded picture buffer further
+/// than the hardware is comfortable with.
+pub const DEFAULT_OUTPUT_DEPTH: usize = 2;
 
 /// Configuration for creating a [`Decoder`].
 #[derive(Debug, Clone)]
@@ -61,6 +70,9 @@ pub struct DecodeConfig {
     pub codec: Codec,
     /// The order frames are returned in. Defaults to [`OutputOrder::Display`].
     pub output_order: OutputOrder,
+    /// How many decoded frames the caller may hold at once. Defaults to
+    /// [`DEFAULT_OUTPUT_DEPTH`]. See [`DecodeConfig::with_output_depth`].
+    pub output_depth: usize,
 }
 
 impl DecodeConfig {
@@ -69,7 +81,25 @@ impl DecodeConfig {
         Self {
             codec: Codec::H264,
             output_order: OutputOrder::Display,
+            output_depth: DEFAULT_OUTPUT_DEPTH,
         }
+    }
+
+    /// How many decoded frames the caller may hold at once.
+    ///
+    /// In [`OutputOrder::Decode`] a frame is the decoder's own DPB image, so
+    /// holding one keeps a DPB slot reserved. The decoder allocates this many
+    /// slots beyond what the stream's reference count needs, and
+    /// [`Decoder::decode`] blocks once every one of them is held, until a frame
+    /// is dropped. Raise it to let a consumer fall further behind, at the cost
+    /// of one decoded picture's worth of memory per slot.
+    ///
+    /// Clamped to what the device's DPB slot limit allows for the stream. If
+    /// nothing is left over, decode-order frames fall back to a copy rather
+    /// than failing, exactly like [`OutputOrder::Display`] always does.
+    pub fn with_output_depth(mut self, depth: usize) -> Self {
+        self.output_depth = depth;
+        self
     }
 
     /// Return frames in decode order for lowest latency, rather than sorting
@@ -84,16 +114,20 @@ impl DecodeConfig {
 ///
 /// # Validity
 ///
-/// [`image`](Self::image) is a decoder-owned GPU image whose storage the frame
-/// keeps reserved: in [`OutputOrder::Display`] it stays valid and unmodified for
-/// as long as the frame is alive, and dropping the frame returns the image to
-/// the decoder for reuse. Hold frames only as long as needed, and drop every
-/// frame before the [`Decoder`] itself.
+/// [`image`](Self::image) is a decoder-owned GPU image whose storage this frame
+/// keeps reserved. It stays valid and unmodified for as long as the frame is
+/// alive; dropping the frame hands the storage back to the decoder.
 ///
-/// In [`OutputOrder::Decode`] the frame points straight at the decoder's DPB
-/// image with no copy, and is only valid until the next [`Decoder::decode`] or
-/// [`Decoder::flush`] call. For retention there, use [`Decoder::download`] or
-/// copy it into an image you own.
+/// Two consequences worth planning for:
+///
+/// - Holding frames costs the decoder something. In [`OutputOrder::Decode`] the
+///   image *is* a DPB slot (no copy), so a held frame reserves one of the
+///   [`DecodeConfig::with_output_depth`] spare slots, and [`Decoder::decode`]
+///   blocks once they are all held. In [`OutputOrder::Display`] frames are pool
+///   copies, so holding them grows the pool instead of blocking.
+/// - Drop every frame before the [`Decoder`], and before feeding a stream that
+///   changes resolution (which rebuilds the session and its images). The
+///   decoder warns rather than leaving handles silently dangling.
 #[derive(Debug)]
 pub struct DecodedFrame {
     /// The decoded picture on the GPU.
@@ -198,9 +232,8 @@ impl Decoder {
                 config.codec
             )));
         }
-        let display_order = config.output_order == OutputOrder::Display;
         let inner: Box<dyn DecoderApi> = match config.codec {
-            Codec::H264 => Box::new(h264::H264Decoder::create(context, display_order)?),
+            Codec::H264 => Box::new(h264::H264Decoder::create(context, &config)?),
             other => {
                 return Err(PixelForgeError::CodecNotSupported(format!(
                     "{:?} decoding is not implemented yet",

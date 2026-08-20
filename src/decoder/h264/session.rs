@@ -14,7 +14,7 @@ use crate::decoder::h264::dpb::{DecodeDpb, PictureState};
 use crate::decoder::h264::parser::{
     self, NalType, NalUnit, Pps, SliceHeader, SliceType, Sps, iter_nal_units,
 };
-use crate::decoder::{DecodedFrame, DecodedFrameData};
+use crate::decoder::{DecodeConfig, DecodedFrame, DecodedFrameData, OutputOrder};
 use crate::encoder::{BitDepth, PixelFormat};
 use crate::error::{PixelForgeError, Result};
 use crate::video::{align_up, get_video_format, query_supported_video_formats};
@@ -26,6 +26,10 @@ use crate::vulkan::VideoContext;
 /// POC / reference-marking state. Everything Vulkan lives in [`DecoderCommon`].
 pub(crate) struct H264Decoder {
     common: DecoderCommon,
+
+    /// How many DPB slots to reserve beyond the stream's needs, so the caller
+    /// can hold decoded frames while decoding continues.
+    output_depth: usize,
 
     /// Parameter sets seen so far, by id.
     sps_map: HashMap<u8, Sps>,
@@ -62,15 +66,16 @@ struct Picture<'a> {
 }
 
 impl H264Decoder {
-    pub(crate) fn create(context: VideoContext, display_order: bool) -> Result<Self> {
+    pub(crate) fn create(context: VideoContext, config: &DecodeConfig) -> Result<Self> {
         Ok(Self {
             common: DecoderCommon::new(context)?,
+            output_depth: config.output_depth,
             sps_map: HashMap::new(),
             pps_map: HashMap::new(),
             active_sps_id: 0,
             active_pps_id: 0,
             dpb: None,
-            reorder: ReorderBuffer::new(display_order),
+            reorder: ReorderBuffer::new(config.output_order == OutputOrder::Display),
             reorder_depth: 0,
             awaiting_keyframe: true,
         })
@@ -210,6 +215,7 @@ impl H264Decoder {
             max_coded_extent,
             picture_access_granularity,
             max_dpb_slots,
+            max_active_reference_pictures,
             cap_flags,
             std_header_version,
             min_bitstream_buffer_offset_alignment,
@@ -223,6 +229,7 @@ impl H264Decoder {
                 caps.max_coded_extent,
                 caps.picture_access_granularity,
                 caps.max_dpb_slots,
+                caps.max_active_reference_pictures,
                 caps.flags,
                 caps.std_header_version,
                 caps.min_bitstream_buffer_offset_alignment,
@@ -249,15 +256,36 @@ impl H264Decoder {
             !cap_flags.contains(vk::VideoCapabilityFlagsKHR::SEPARATE_REFERENCE_IMAGES);
 
         // The stream needs max_num_ref_frames references plus the current
-        // picture; the device caps bound how many we can actually have.
-        let slot_count = ((sps.max_num_ref_frames as u32 + 1).max(2))
-            .min(max_dpb_slots)
-            .min(crate::decoder::h264::dpb::MAX_DPB_SLOTS as u32) as usize;
-        if (slot_count as u32) < sps.max_num_ref_frames as u32 + 1 {
+        // picture. On top of that we reserve `output_depth` slots so decoded
+        // frames can be handed out without a copy while decoding continues; the
+        // device caps bound the total.
+        let required = (sps.max_num_ref_frames as u32 + 1).max(2);
+        let slot_limit = max_dpb_slots.min(crate::decoder::h264::dpb::MAX_DPB_SLOTS as u32);
+        if required > slot_limit {
             return Err(PixelForgeError::InvalidInput(format!(
                 "H.264 decode: stream needs {} DPB slots, device supports {}",
-                sps.max_num_ref_frames as u32 + 1,
-                max_dpb_slots
+                required, max_dpb_slots
+            )));
+        }
+        let slot_count = (required + self.output_depth as u32).min(slot_limit) as usize;
+        let output_slots = slot_count - required as usize;
+        if output_slots < self.output_depth {
+            debug!(
+                "H.264 decode: {} of {} requested output slots available \
+                 (stream needs {} of the device's {} DPB slots); \
+                 decode-order frames beyond that are copied",
+                output_slots, self.output_depth, required, max_dpb_slots
+            );
+        }
+
+        // Only the reference pictures are ever active at once: the current
+        // picture and the output reservation are not references.
+        let max_active_references = (required - 1).min(max_active_reference_pictures);
+        if max_active_references < required - 1 {
+            return Err(PixelForgeError::InvalidInput(format!(
+                "H.264 decode: stream needs {} active reference pictures, device supports {}",
+                required - 1,
+                max_active_reference_pictures
             )));
         }
 
@@ -292,6 +320,8 @@ impl H264Decoder {
             bit_depth,
             pixel_format,
             slot_count,
+            output_slots,
+            max_active_references,
             coincide,
             use_layered_dpb,
             dpb_usage,
@@ -305,11 +335,18 @@ impl H264Decoder {
 
         self.active_sps_id = sps.sps_id;
         self.active_pps_id = pps.pps_id;
-        self.dpb = Some(DecodeDpb::new(slot_count));
+        self.dpb = Some(DecodeDpb::new(slot_count, self.common.slot_pins.clone()));
 
         debug!(
-            "H.264 decode session: {}x{} {:?}, {} DPB slots, layered={}, coincide={}",
-            coded_width, coded_height, picture_format, slot_count, use_layered_dpb, coincide
+            "H.264 decode session: {}x{} {:?}, {} DPB slots ({} for output), \
+             layered={}, coincide={}",
+            coded_width,
+            coded_height,
+            picture_format,
+            slot_count,
+            output_slots,
+            use_layered_dpb,
+            coincide
         );
         Ok(())
     }
@@ -571,7 +608,22 @@ impl H264Decoder {
                 picture.is_intra,
             )?
         };
-        let slot = self.dpb.as_mut().expect("active").allocate_slot()?;
+        // Every slot can be busy for two reasons: the stream keeps that many
+        // references (a hard error), or a frame the caller still holds pins one
+        // (wait for them to drop it, like the encoder waits for a free slot).
+        let slot = loop {
+            let dpb = self.dpb.as_mut().expect("active");
+            if let Some(slot) = dpb.try_allocate_slot() {
+                break slot;
+            }
+            if !dpb.has_pinned_slots() {
+                return Err(PixelForgeError::InvalidInput(
+                    "H.264 decode: no free DPB slot (stream exceeds negotiated DPB size)"
+                        .to_string(),
+                ));
+            }
+            self.common.slot_pins.wait_for_release();
+        };
 
         // --- Pack the slice data into the staging buffer ---
         let (buffer_range, slice_offsets) = self.stage_slices(picture, sps)?;
@@ -603,6 +655,7 @@ impl H264Decoder {
 
         let (width, height) = sps.display_dimensions();
         let frame = DecodedPicture {
+            slot,
             image,
             image_view,
             layout,
