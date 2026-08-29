@@ -52,7 +52,7 @@ pub(crate) struct VideoImageParams<'a> {
 
 /// Deduplicate `families` and decide CONCURRENT vs EXCLUSIVE sharing mode.
 /// Returns an empty family list for EXCLUSIVE, in which case Vulkan ignores it.
-fn resolve_sharing_mode(families: &[u32]) -> (Vec<u32>, vk::SharingMode) {
+pub(crate) fn resolve_sharing_mode(families: &[u32]) -> (Vec<u32>, vk::SharingMode) {
     let mut deduped: Vec<u32> = Vec::new();
     for &family in families {
         if !deduped.contains(&family) {
@@ -139,13 +139,26 @@ fn create_video_image_raw(
     }
 }
 
+/// A view over a video picture image, for use as a decode/encode picture
+/// resource.
+///
+/// `image_usage` is the usage the image was created with. The view narrows it
+/// to everything except `SAMPLED`, which matters when the image *is*
+/// sampleable: a view of a multi-planar YCbCr format that includes `SAMPLED`
+/// must carry a `VkSamplerYcbcrConversion`, and a video picture resource must
+/// not have one. Declaring the narrower usage says what this view is actually
+/// for and keeps both requirements satisfiable at once.
 fn create_video_image_view(
     context: &VideoContext,
     image: vk::Image,
     format: vk::Format,
     layer: u32,
+    image_usage: vk::ImageUsageFlags,
 ) -> Result<vk::ImageView> {
+    let mut view_usage =
+        vk::ImageViewUsageCreateInfo::default().usage(image_usage & !vk::ImageUsageFlags::SAMPLED);
     let view_create_info = vk::ImageViewCreateInfo::default()
+        .push(&mut view_usage)
         .image(image)
         .view_type(vk::ImageViewType::TYPE_2D)
         .format(format)
@@ -390,7 +403,7 @@ pub(crate) fn create_video_image(
     profile_info: &vk::VideoProfileInfoKHR,
 ) -> Result<(vk::Image, vk::DeviceMemory, vk::ImageView)> {
     let (image, memory) = create_video_image_raw(context, params, 1, profile_info)?;
-    match create_video_image_view(context, image, params.format, 0) {
+    match create_video_image_view(context, image, params.format, 0, params.usage) {
         Ok(view) => Ok((image, memory, view)),
         Err(e) => {
             unsafe {
@@ -574,7 +587,7 @@ pub(crate) fn create_dpb_images(
 
     let mut views = Vec::with_capacity(count);
     for layer in 0..count as u32 {
-        match create_video_image_view(context, image, params.format, layer) {
+        match create_video_image_view(context, image, params.format, layer, params.usage) {
             Ok(view) => views.push(view),
             Err(e) => {
                 unsafe {

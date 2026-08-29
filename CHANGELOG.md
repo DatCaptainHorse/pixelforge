@@ -24,6 +24,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stream fall back to copying rather than failing.
 - `DecodeConfig::with_output_depth` reserves DPB slots so decoded frames can be
   held while decoding continues.
+- Decoded pictures are created with `SAMPLED` usage where the device allows it,
+  so a renderer can read a `DecodedFrame` in a shader instead of copying it out
+  first. `DecodedFrame::sampleable` reports whether it worked.
+- `DecodeConfig::with_consumer_queue_family` names the queue family that will
+  read decoded frames, adding it to each picture's sharing set so frames can be
+  used from a graphics queue with no ownership transfer.
 - Validation layer messages are now routed into `tracing` through a
   `VK_EXT_debug_utils` messenger. Previously the layer was loaded with nowhere to
   report, so enabling validation verified nothing.

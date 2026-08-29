@@ -232,6 +232,7 @@ impl FramePool {
             picture.coded_width,
             picture.coded_height,
             format,
+            &common.picture_sharing_families(),
         )?;
         let slot = PoolImage {
             image,
@@ -314,6 +315,9 @@ enum Retained {
 /// A buffered picture, awaiting its turn in display order.
 struct ReorderEntry {
     retained: Retained,
+    /// Whether this picture's image can be sampled without a copy. Recorded at
+    /// retain time, since it depends on which storage the picture ended up in.
+    sampleable: bool,
     display_order: i32,
     pts: u64,
     is_keyframe: bool,
@@ -374,8 +378,15 @@ impl ReorderBuffer {
         }
 
         let retained = self.retain(common, picture)?;
+        // A pool copy is always sampleable; a pinned DPB image only if the
+        // device gave the session a picture format supporting SAMPLED.
+        let sampleable = match retained {
+            Retained::Slot { .. } => common.session()?.sampleable,
+            Retained::Pool { .. } => true,
+        };
         self.buffered.push(ReorderEntry {
             retained,
+            sampleable,
             display_order: picture.display_order,
             pts: picture.pts,
             is_keyframe: picture.is_keyframe,
@@ -495,6 +506,7 @@ impl ReorderBuffer {
             pts: entry.pts,
             display_order: entry.display_order,
             is_keyframe: entry.is_keyframe,
+            sampleable: entry.sampleable,
             pin: Some(pin),
         }
     }
@@ -517,14 +529,17 @@ impl ReorderBuffer {
     }
 }
 
-/// A plain device-local image for the reorder pool: a copy target and readback
-/// source, with no view and no video profile (so it works on every driver).
+/// A plain device-local image for the reorder pool: a copy target, readback
+/// source and sampling source, with no view and no video profile (so it works
+/// on every driver).
 fn create_pool_image(
     context: &VideoContext,
     width: u32,
     height: u32,
     format: vk::Format,
+    sharing_families: &[u32],
 ) -> Result<(vk::Image, vk::DeviceMemory)> {
+    let (families, sharing_mode) = crate::video::resolve_sharing_mode(sharing_families);
     let create_info = vk::ImageCreateInfo::default()
         .image_type(vk::ImageType::TYPE_2D)
         .format(format)
@@ -537,8 +552,16 @@ fn create_pool_image(
         .array_layers(1)
         .samples(vk::SampleCountFlags::TYPE_1)
         .tiling(vk::ImageTiling::OPTIMAL)
-        .usage(vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::TRANSFER_SRC)
-        .sharing_mode(vk::SharingMode::EXCLUSIVE)
+        // SAMPLED unconditionally: a pool image carries no video profile, so it
+        // is an ordinary image and every driver can sample one. That keeps a
+        // copied-out frame as usable to a renderer as a pinned one.
+        .usage(
+            vk::ImageUsageFlags::TRANSFER_DST
+                | vk::ImageUsageFlags::TRANSFER_SRC
+                | vk::ImageUsageFlags::SAMPLED,
+        )
+        .sharing_mode(sharing_mode)
+        .queue_family_indices(&families)
         .initial_layout(vk::ImageLayout::UNDEFINED);
     let image = unsafe { context.device().create_image(&create_info, None) }
         .map_err(|e| PixelForgeError::ResourceCreation(format!("reorder pool image: {}", e)))?;

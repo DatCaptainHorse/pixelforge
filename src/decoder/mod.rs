@@ -66,6 +66,9 @@ pub struct DecodeConfig {
     /// How many decoded frames the caller may hold at once. Defaults to
     /// [`DEFAULT_OUTPUT_DEPTH`]. See [`DecodeConfig::with_output_depth`].
     pub output_depth: usize,
+    /// Queue family that will read decoded frames, if it is not the decoder's
+    /// own. See [`DecodeConfig::with_consumer_queue_family`].
+    pub consumer_queue_family: Option<u32>,
 }
 
 impl DecodeConfig {
@@ -74,6 +77,7 @@ impl DecodeConfig {
         Self {
             codec: Codec::H264,
             output_depth: DEFAULT_OUTPUT_DEPTH,
+            consumer_queue_family: None,
         }
     }
 
@@ -96,6 +100,28 @@ impl DecodeConfig {
     /// can release, so keep the two numbers in step.
     pub fn with_output_depth(mut self, depth: usize) -> Self {
         self.output_depth = depth;
+        self
+    }
+
+    /// Name the queue family that will read decoded frames.
+    ///
+    /// A [`DecodedFrame`] is a decoder-owned image, and images are shared
+    /// between queue families explicitly. By default the decoder shares its
+    /// pictures with its own decode and transfer families only, which is all
+    /// [`Decoder::download`] needs. A renderer sampling frames from a graphics
+    /// queue is a *third* family, and reading an image from a family it was not
+    /// shared with is undefined behaviour unless the caller performs a queue
+    /// family ownership transfer themselves.
+    ///
+    /// Passing that family here adds it to the sharing set, so frames can be
+    /// sampled directly with no ownership transfer and no copy. Set it whenever
+    /// frames are consumed by anything other than
+    /// [`Decoder::download`]; for a context adopted from an existing device
+    /// (see
+    /// [`build_from_existing_decode`](crate::vulkan::VideoContextBuilder::build_from_existing_decode))
+    /// this is the family the caller already renders on.
+    pub fn with_consumer_queue_family(mut self, family: u32) -> Self {
+        self.consumer_queue_family = Some(family);
         self
     }
 }
@@ -128,6 +154,11 @@ pub struct DecodedFrame {
     /// in `VIDEO_DECODE_DPB_KHR` or `VIDEO_DECODE_DST_KHR` layout (see
     /// [`layout`](Self::layout)) and sized to the coded dimensions; only the
     /// `width` x `height` top-left region contains the visible picture.
+    ///
+    /// Created with `TRANSFER_SRC` and, where the device allows it,
+    /// `SAMPLED` (see [`sampleable`](Self::sampleable)). Reading it from a
+    /// queue family other than the decoder's own requires
+    /// [`DecodeConfig::with_consumer_queue_family`].
     pub image: vk::Image,
     /// An image view over the whole decoded picture.
     pub image_view: vk::ImageView,
@@ -157,6 +188,17 @@ pub struct DecodedFrame {
     /// Whether this frame is a keyframe: a random-access point starting a new
     /// coded video sequence (H.264 IDR, H.265 IRAP, AV1 key frame).
     pub is_keyframe: bool,
+    /// Whether [`image`](Self::image) was created with `SAMPLED` usage, so a
+    /// shader can read it directly rather than copying from it first.
+    ///
+    /// True on every driver tested so far. It is false only where the device
+    /// reports no usable picture format for a sampleable decode image, in which
+    /// case the frame can still be copied from (`TRANSFER_SRC`).
+    ///
+    /// Sampling also needs a view of the caller's own: the format is
+    /// multi-planar YCbCr, so it takes a `VkSamplerYcbcrConversion`, and the
+    /// image must be transitioned out of [`layout`](Self::layout) first.
+    pub sampleable: bool,
     /// Keeps this frame's storage reserved; releases it on drop. `None` for a
     /// frame that borrows the decoder's DPB image (see the validity rules).
     // Held purely for its `Drop`, which is what returns the storage.

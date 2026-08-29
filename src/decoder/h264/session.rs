@@ -70,7 +70,7 @@ struct Picture<'a> {
 impl H264Decoder {
     pub(crate) fn create(context: VideoContext, config: &DecodeConfig) -> Result<Self> {
         Ok(Self {
-            common: DecoderCommon::new(context)?,
+            common: DecoderCommon::new(context, config.consumer_queue_family)?,
             output_depth: config.output_depth,
             sps_map: HashMap::new(),
             pps_map: HashMap::new(),
@@ -313,15 +313,35 @@ impl H264Decoder {
         }
 
         // Pick a picture format the device actually supports for decode.
-        let dpb_usage = if coincide {
+        //
+        // Ask for SAMPLED as well: a coincident DPB image is what the caller
+        // receives, and SAMPLED is what lets them read it in a shader instead
+        // of copying it out first. Fall back to the plain usage if the device
+        // reports no sampleable format, which costs the caller a copy but keeps
+        // decoding working. With a distinct output image nothing asks, since
+        // those pictures reach the caller as pool copies, which are sampleable
+        // whatever the device says about video images.
+        let base_usage = if coincide {
             vk::ImageUsageFlags::VIDEO_DECODE_DPB_KHR
                 | vk::ImageUsageFlags::VIDEO_DECODE_DST_KHR
                 | vk::ImageUsageFlags::TRANSFER_SRC
         } else {
             vk::ImageUsageFlags::VIDEO_DECODE_DPB_KHR
         };
-        let supported =
-            query_supported_video_formats(&self.common.context, &profile_info, dpb_usage)?;
+        let sampled_usage = base_usage | vk::ImageUsageFlags::SAMPLED;
+        let sampled_formats = if coincide {
+            query_supported_video_formats(&self.common.context, &profile_info, sampled_usage)
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let (dpb_usage, sampleable, supported) = if sampled_formats.is_empty() {
+            let formats =
+                query_supported_video_formats(&self.common.context, &profile_info, base_usage)?;
+            (base_usage, false, formats)
+        } else {
+            (sampled_usage, true, sampled_formats)
+        };
         let preferred = get_video_format(pixel_format, bit_depth);
         let picture_format = if supported.contains(&preferred) {
             preferred
@@ -346,6 +366,7 @@ impl H264Decoder {
             spare_slots,
             max_active_references,
             coincide,
+            sampleable,
             use_layered_dpb,
             dpb_usage,
         };
@@ -363,7 +384,8 @@ impl H264Decoder {
 
         debug!(
             "H.264 decode session: {}x{} {:?}, {} DPB slots ({} spare), \
-             layered={}, coincide={}, bitstream alignment {}/{} (offset/size)",
+             layered={}, coincide={}, sampleable={}, \
+             bitstream alignment {}/{} (offset/size)",
             coded_width,
             coded_height,
             picture_format,
@@ -371,6 +393,7 @@ impl H264Decoder {
             spare_slots,
             use_layered_dpb,
             coincide,
+            sampleable,
             self.common.bitstream_offset_alignment,
             self.common.bitstream_size_alignment
         );

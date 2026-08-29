@@ -93,6 +93,8 @@ pub(crate) struct SessionPlan {
     pub max_active_references: u32,
     /// Driver decodes straight into the DPB image (`DPB_AND_OUTPUT_COINCIDE`).
     pub coincide: bool,
+    /// `dpb_usage` includes `SAMPLED`, so handed-out frames can be sampled.
+    pub sampleable: bool,
     /// One layered DPB image rather than one image per slot.
     pub use_layered_dpb: bool,
     pub dpb_usage: vk::ImageUsageFlags,
@@ -129,6 +131,8 @@ pub(crate) struct DecodeSession {
     pub coincide: bool,
     /// Spare DPB slots available for pinning pictures past their decode.
     pub spare_slots: usize,
+    /// Whether decoded pictures can be sampled without being copied first.
+    pub sampleable: bool,
     /// Distinct decode output image, only when `!coincide`.
     pub output_image: Option<(vk::Image, vk::DeviceMemory, vk::ImageView)>,
 }
@@ -187,6 +191,11 @@ pub(crate) struct DecoderCommon {
     /// DPB slots reserved by frames the caller still holds. Shared with those
     /// frames, which release their slot when dropped.
     pub slot_pins: Arc<SlotPins>,
+
+    /// Queue family that reads decoded frames, when it is neither the decode
+    /// nor the transfer family. Added to every picture image's sharing set so
+    /// a consumer can use frames without a queue family ownership transfer.
+    pub consumer_queue_family: Option<u32>,
 }
 
 // `bitstream_ptr` is a persistently mapped host-visible allocation owned by
@@ -194,7 +203,7 @@ pub(crate) struct DecoderCommon {
 unsafe impl Send for DecoderCommon {}
 
 impl DecoderCommon {
-    pub fn new(context: VideoContext) -> Result<Self> {
+    pub fn new(context: VideoContext, consumer_queue_family: Option<u32>) -> Result<Self> {
         let decode_queue_family = context.video_decode_queue_family().ok_or_else(|| {
             PixelForgeError::NoSuitableDevice("Device has no video decode queue family".to_string())
         })?;
@@ -229,7 +238,26 @@ impl DecoderCommon {
             readback: None,
             session: None,
             slot_pins: Arc::new(SlotPins::default()),
+            consumer_queue_family,
         })
+    }
+
+    /// Every queue family that may touch a decoded picture.
+    ///
+    /// The decode family writes it, the transfer family copies from it, and a
+    /// consumer named by
+    /// [`DecodeConfig::with_consumer_queue_family`](crate::decoder::DecodeConfig::with_consumer_queue_family)
+    /// reads it. `create_video_image` reduces this to `EXCLUSIVE` when the
+    /// families turn out to be the same one.
+    pub fn picture_sharing_families(&self) -> Vec<u32> {
+        let mut families = vec![
+            self.decode_queue_family,
+            self.context.transfer_queue_family(),
+        ];
+        if let Some(consumer) = self.consumer_queue_family {
+            families.push(consumer);
+        }
+        families
     }
 
     /// The active session, or an error if no parameter sets have been seen yet.
@@ -276,11 +304,9 @@ impl DecoderCommon {
         let session_memory = allocate_session_memory(&self.context, session, &self.video_queue_fn)?;
 
         // When the DPB doubles as the decode output it may also be copied from,
-        // so the transfer queue needs access too.
-        let families = [
-            self.decode_queue_family,
-            self.context.transfer_queue_family(),
-        ];
+        // so the transfer queue needs access too, and a consumer reading frames
+        // from a third family has to be named or its reads are undefined.
+        let families = self.picture_sharing_families();
 
         let dpb_params = VideoImageParams {
             width: plan.coded_width,
@@ -289,6 +315,7 @@ impl DecoderCommon {
             usage: plan.dpb_usage,
             sharing_families: &families,
         };
+
         let (dpb_images, dpb_memories, dpb_views) = create_dpb_images(
             &self.context,
             &dpb_params,
@@ -330,6 +357,7 @@ impl DecoderCommon {
             use_layered_dpb: plan.use_layered_dpb,
             coincide: plan.coincide,
             spare_slots: plan.spare_slots,
+            sampleable: plan.sampleable,
             output_image,
         });
         Ok(())
