@@ -303,6 +303,75 @@ fn parses_level_and_ref_frames() {
     }
 }
 
+/// Reassemble the coded pictures of a whole stream from their start offsets,
+/// which is what `picture_starts` exists to provide.
+fn split_stream(stream: &[u8]) -> Vec<&[u8]> {
+    let starts = super::picture_starts(stream);
+    let ends = starts
+        .iter()
+        .skip(1)
+        .copied()
+        .chain(std::iter::once(stream.len()));
+    starts
+        .iter()
+        .copied()
+        .zip(ends)
+        .map(|(start, end)| &stream[start..end])
+        .collect()
+}
+
+/// Feeding a stream in fixed-size chunks, the way a socket delivers it, must
+/// find exactly the same picture boundaries as having the whole buffer at once.
+///
+/// This drives the same carry-over rule `decode_byte_stream` uses: append the
+/// chunk, decode everything up to `complete_prefix`, hold the rest. Chunk sizes
+/// are chosen to cut inside start codes, inside slice headers and across whole
+/// pictures.
+#[test]
+fn byte_stream_framing_finds_the_same_pictures() {
+    for (name, data) in [
+        ("baseline", BASELINE),
+        ("zerolatency", ZEROLATENCY),
+        ("bframes", BFRAMES),
+        ("multislice", MULTISLICE),
+    ] {
+        let expected: Vec<&[u8]> = split_stream(data);
+
+        for chunk_size in [1usize, 2, 3, 7, 64, 1024, 100_000] {
+            let mut carry: Vec<u8> = Vec::new();
+            let mut emitted: Vec<u8> = Vec::new();
+            let mut units = 0usize;
+
+            for chunk in data.chunks(chunk_size) {
+                carry.extend_from_slice(chunk);
+                let split = super::complete_prefix(&carry);
+                if split > 0 {
+                    units += super::picture_starts(&carry[..split]).len();
+                    emitted.extend_from_slice(&carry[..split]);
+                    carry.drain(..split);
+                }
+            }
+            // End of stream ends the final picture, which is what `flush` does.
+            if !carry.is_empty() {
+                units += super::picture_starts(&carry).len();
+                emitted.extend_from_slice(&carry);
+            }
+
+            assert_eq!(
+                units,
+                expected.len(),
+                "{name}: chunk size {chunk_size} found {units} pictures, expected {}",
+                expected.len()
+            );
+            // Nothing may be dropped or duplicated on the way through.
+            assert_eq!(
+                emitted, data,
+                "{name}: chunk size {chunk_size} did not reproduce the stream"
+            );
+        }
+    }
+}
+
 /// `split_stream` must split a stream into exactly one unit per coded picture,
 /// losing no bytes and keeping parameter sets with the picture they configure.
 #[test]
@@ -313,7 +382,7 @@ fn splits_stream_into_coded_frames() {
         ("bframes", BFRAMES),
         ("multislice", MULTISLICE),
     ] {
-        let units = super::split_stream(data);
+        let units = split_stream(data);
 
         // Each fixture is 30 coded pictures.
         assert_eq!(units.len(), 30, "{name}: one access unit per picture");
@@ -367,7 +436,7 @@ fn multislice_pictures_form_one_access_unit() {
     let slice_nals = iter_nal_units(MULTISLICE)
         .filter(|n| n.nal_type.is_slice())
         .count();
-    let units = super::split_stream(MULTISLICE);
+    let units = split_stream(MULTISLICE);
 
     // The fixture really is multi-slice: 4 slices per picture, 30 pictures.
     assert_eq!(slice_nals, 120, "fixture should hold 120 slice NALs");

@@ -14,7 +14,7 @@ use crate::decoder::h264::parser::{
     self, NalType, NalUnit, Pps, SliceHeader, SliceType, Sps, iter_nal_units,
 };
 use crate::decoder::pipeline::DecodeFuture;
-use crate::decoder::{DecodeConfig, DecodedFrame, DecodedFrameData};
+use crate::decoder::{DecodeConfig, DecodedFrame, DecodedFrameData, Framing};
 use crate::encoder::{BitDepth, PixelFormat};
 use crate::error::{PixelForgeError, Result};
 use crate::video::{align_up, get_video_format, query_supported_video_formats};
@@ -51,6 +51,18 @@ pub(crate) struct H264Decoder {
     /// the DPB so that many pictures can be pinned rather than copied.
     reorder_depth: usize,
 
+    /// How input is framed, which decides whether the end of a `decode` call is
+    /// also the end of a coded picture.
+    framing: Framing,
+    /// Bytes of a coded picture that has not been seen to end yet, held over
+    /// from earlier `decode` calls. Only ever non-empty in
+    /// [`Framing::ByteStream`].
+    carry: Vec<u8>,
+    /// The `pts` of the call that delivered the first byte of `carry`, so a
+    /// picture is timestamped by when it started arriving rather than by which
+    /// call happened to complete it.
+    carry_pts: u64,
+
     /// Whether decoding is waiting for a keyframe (IDR) before it can produce
     /// output. True until the first IDR is decoded: non-IDR pictures reference
     /// state that does not exist yet, so they are skipped and the caller is told
@@ -79,6 +91,9 @@ impl H264Decoder {
             dpb: None,
             reorder: ReorderBuffer::new(),
             reorder_depth: 0,
+            framing: config.framing,
+            carry: Vec::new(),
+            carry_pts: 0,
             awaiting_keyframe: true,
         })
     }
@@ -104,6 +119,23 @@ impl H264Decoder {
     /// GPU work; the future still resolves in call order behind whatever is
     /// already in flight.
     pub(crate) fn flush(&mut self) -> Result<DecodeFuture> {
+        // In byte-stream framing the tail is a picture that was never seen to
+        // end because nothing followed it. End of stream is what ends it.
+        if !self.carry.is_empty() {
+            let tail = std::mem::take(&mut self.carry);
+            let pts = self.carry_pts;
+            // Deliberately not `decode_frames`: that would close a batch of its
+            // own, and this call's future has to carry the tail's frames too.
+            // The completion thread accumulates them until the batch closed
+            // below, so they arrive ahead of the reordered ones, in order.
+            match self.decode_units(&tail, pts) {
+                Ok(_) => {}
+                // A tail that cannot be decoded is not worth failing the flush
+                // over: the frames already decoded still have to come out.
+                Err(PixelForgeError::NeedsKeyframe(_)) => {}
+                Err(e) => return Err(e),
+            }
+        }
         let frames = self.reorder.flush();
         Ok(self.common.finish_batch(frames))
     }
@@ -564,7 +596,57 @@ impl H264Decoder {
         Ok((pictures, awaiting))
     }
 
+    /// Decode a chunk of input, doing the framing the configuration calls for.
     pub(crate) fn decode(&mut self, data: &[u8], pts: u64) -> Result<DecodeFuture> {
+        match self.framing {
+            // The caller guarantees the chunk ends on a picture boundary, so it
+            // can go straight to the decoder with no buffering and no copy.
+            Framing::FrameAligned => self.decode_frames(data, pts),
+            Framing::ByteStream => self.decode_byte_stream(data, pts),
+        }
+    }
+
+    /// Framing for input that may cut anywhere.
+    ///
+    /// A coded picture is only known to have ended once the next one starts, so
+    /// everything up to the last picture start is complete and decodable, and
+    /// everything from it onward is held over for the next call. `flush` ends
+    /// the final picture.
+    fn decode_byte_stream(&mut self, data: &[u8], pts: u64) -> Result<DecodeFuture> {
+        let carried = self.carry.len();
+        let mut buffer = std::mem::take(&mut self.carry);
+        buffer.extend_from_slice(data);
+
+        // Nothing before the last picture start can still be waiting for more
+        // slices. With no picture start at all, nothing is complete yet.
+        let split = super::complete_prefix(&buffer);
+
+        let result = if split > 0 {
+            self.decode_frames(&buffer[..split], self.carry_pts)
+        } else {
+            Ok(self.common.finish_batch(Vec::new()))
+        };
+
+        // The held-over picture is timestamped by the call its first byte came
+        // in on, which is this one only if the split consumed everything the
+        // previous calls had left.
+        if split >= carried {
+            self.carry_pts = pts;
+        }
+        buffer.drain(..split);
+        self.carry = buffer;
+        result
+    }
+
+    /// Decode input already known to end on a picture boundary, as one batch.
+    fn decode_frames(&mut self, data: &[u8], pts: u64) -> Result<DecodeFuture> {
+        self.decode_units(data, pts)?;
+        Ok(self.common.finish_batch(Vec::new()))
+    }
+
+    /// Decode input already known to end on a picture boundary, without closing
+    /// a batch, so the caller decides which future the frames arrive through.
+    fn decode_units(&mut self, data: &[u8], pts: u64) -> Result<()> {
         // What is missing when a picture cannot be decoded yet; set only while
         // no frame has been produced, so a keyframe later in the same buffer
         // still yields output. Seeded with slices skipped during splitting for
@@ -633,7 +715,7 @@ impl H264Decoder {
             )));
         }
 
-        Ok(self.common.finish_batch(Vec::new()))
+        Ok(())
     }
 
     /// Record and submit the decode of a single picture, and wait for it.

@@ -1,10 +1,11 @@
 //! Hardware-accelerated video decoding using Vulkan Video.
 //!
 //! The decoder consumes a coded byte stream and produces decoded frames as GPU
-//! images (`vk::Image`), optionally with CPU readback. Each [`Decoder::decode`]
-//! call takes the bytes of one coded frame, which [`Decoder::split`] carves out
-//! of a larger buffer using whatever framing the codec uses (Annex B start
-//! codes for H.264/H.265, OBU temporal units for AV1).
+//! images (`vk::Image`), optionally with CPU readback. [`Decoder::decode`]
+//! takes whatever the caller has: whole coded frames, if they arrive already
+//! framed by a container or transport, or an arbitrary slice of a byte stream,
+//! which the decoder frames itself using the codec's own rules (Annex B start
+//! codes for H.264/H.265, OBU temporal units for AV1). See [`Framing`].
 //!
 //! # Design
 //!
@@ -51,12 +52,41 @@ use crate::error::{PixelForgeError, Result};
 use crate::vulkan::VideoContext;
 use ash::vk;
 
-/// How many decoded frames the caller may hold at once, by default.
+/// How the bytes handed to [`Decoder::decode`] are framed.
 ///
-/// Matches the encoder's pipeline depth: enough to overlap consuming one frame
-/// with decoding the next, without growing the decoded picture buffer further
-/// than the hardware is comfortable with.
-pub const DEFAULT_OUTPUT_DEPTH: usize = 2;
+/// The decoder has to know where one coded frame ends and the next begins.
+/// Which of these applies is a property of where the bytes come from, not of
+/// the codec, so it cannot be detected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Framing {
+    /// Every call carries whole coded frames: the end of the data is the end of
+    /// a frame (the default).
+    ///
+    /// This is what a container or a transport gives you, where framing has
+    /// already been done: an RTP access unit, an MP4 sample, a WebRTC frame.
+    /// Nothing is buffered, so a frame is decoded by the call that delivers it
+    /// and this is the lower-latency option.
+    FrameAligned,
+    /// A continuous byte stream that may cut anywhere, including mid-frame.
+    ///
+    /// This is what a raw `.264` file or a socket carrying one gives you. The
+    /// decoder buffers a trailing partial frame until later bytes complete it,
+    /// which costs one frame of latency: a coded frame cannot be known to be
+    /// complete until the start of the next one is seen. [`Decoder::flush`]
+    /// decodes whatever is still buffered, so the last frame is not lost.
+    ByteStream,
+}
+
+/// How many decoded frames may be outstanding at once, by default.
+///
+/// Two for the caller to hold while consuming them, matching the encoder's
+/// pipeline depth, plus two for the frames the decode pipeline itself has in
+/// flight between submitting a picture and delivering it.
+///
+/// A caller feeding several coded frames per [`Decoder::decode`] call needs
+/// more, since every frame that call emits is outstanding at once. See
+/// [`DecodeConfig::with_output_depth`].
+pub const DEFAULT_OUTPUT_DEPTH: usize = 4;
 
 /// Configuration for creating a [`Decoder`].
 #[derive(Debug, Clone)]
@@ -69,6 +99,9 @@ pub struct DecodeConfig {
     /// Queue family that will read decoded frames, if it is not the decoder's
     /// own. See [`DecodeConfig::with_consumer_queue_family`].
     pub consumer_queue_family: Option<u32>,
+    /// How input handed to [`Decoder::decode`] is framed. Defaults to
+    /// [`Framing::FrameAligned`].
+    pub framing: Framing,
 }
 
 impl DecodeConfig {
@@ -78,20 +111,27 @@ impl DecodeConfig {
             codec: Codec::H264,
             output_depth: DEFAULT_OUTPUT_DEPTH,
             consumer_queue_family: None,
+            framing: Framing::FrameAligned,
         }
     }
 
     /// How many decoded frames the caller may hold at once.
     ///
-    /// A frame is the decoder's own DPB image, so holding one keeps a DPB slot
-    /// reserved. The decoder allocates this many slots beyond what the stream's
-    /// references and reorder depth need, and [`Decoder::decode`] blocks once
-    /// every one of them is held, until a frame is dropped. Raise it to let a
-    /// consumer fall further behind, at the cost of one decoded picture's worth
-    /// of memory per slot.
+    /// A frame is the decoder's own DPB image, so an outstanding frame keeps a
+    /// DPB slot reserved. The decoder allocates this many slots beyond what the
+    /// stream's references and reorder depth need.
     ///
-    /// Clamped to what the device's DPB slot limit allows for the stream. If
-    /// nothing is left over, frames fall back to a copy rather than failing.
+    /// Exceeding it costs a copy, not an error: pictures past the budget are
+    /// copied into private images so decoding can continue. So this is a
+    /// performance setting, and the number to match is how many frames are
+    /// outstanding at once, which is everything a [`Decoder::decode`] call
+    /// emits plus whatever the caller is still holding. Feeding one coded frame
+    /// per call keeps that small; feeding 64 KB of byte stream at a time does
+    /// not.
+    ///
+    /// Clamped to what the device's DPB slot limit allows for the stream, so a
+    /// device too small for the request degrades to copying rather than
+    /// failing. Each slot costs one decoded picture's worth of memory.
     ///
     /// This also bounds how many [`DecodeFuture`]s can usefully be kept in
     /// flight: an unresolved future holds the frames it will deliver, and each
@@ -124,6 +164,13 @@ impl DecodeConfig {
         self.consumer_queue_family = Some(family);
         self
     }
+
+    /// Feed a continuous byte stream that may cut mid-frame, rather than whole
+    /// coded frames per call. See [`Framing::ByteStream`].
+    pub fn with_byte_stream(mut self) -> Self {
+        self.framing = Framing::ByteStream;
+        self
+    }
 }
 
 /// A decoded frame residing in GPU memory.
@@ -138,9 +185,9 @@ impl DecodeConfig {
 ///
 /// - Holding frames costs the decoder something. The image *is* a DPB slot (no
 ///   copy), so a held frame reserves one of the
-///   [`DecodeConfig::with_output_depth`] spare slots, and [`Decoder::decode`]
-///   blocks once they are all held. Drop frames promptly: that is what keeps
-///   the decoder running, and it is the pipeline's back-pressure.
+///   [`DecodeConfig::with_output_depth`] spare slots. Once they are all
+///   reserved the decoder falls back to copying pictures out, which still
+///   works but gives up the zero-copy path. Drop frames promptly.
 /// - Drop every frame before the [`Decoder`], and before feeding a stream that
 ///   changes resolution (which rebuilds the session and its images). The
 ///   decoder warns rather than leaving handles silently dangling.
@@ -229,7 +276,6 @@ pub struct DecodedFrameData {
 
 /// The codec-erased operations every codec decoder exposes.
 trait DecoderApi: Send {
-    fn split_stream<'a>(&self, stream: &'a [u8]) -> Vec<&'a [u8]>;
     fn decode(&mut self, data: &[u8], pts: u64) -> Result<DecodeFuture>;
     fn flush(&mut self) -> Result<DecodeFuture>;
     fn download(&mut self, frame: &DecodedFrame) -> Result<DecodedFrameData>;
@@ -275,46 +321,18 @@ impl Decoder {
         Ok(Decoder(inner))
     }
 
-    /// Split a coded byte stream into one slice per coded frame.
-    ///
-    /// [`decode`](Self::decode) treats the end of its input as a frame
-    /// boundary, so a caller holding a whole file or a large buffer must split
-    /// it first. Framing is the codec's own: Annex B start codes and slice
-    /// headers for H.264/H.265, OBU temporal units for AV1. Non-picture data
-    /// (parameter sets, SEI, sequence headers) is attached to the coded frame
-    /// that follows it, so feeding the pieces back in order is lossless.
-    ///
-    /// The returned slices borrow `stream`. Feeding one per [`decode`](Self::decode)
-    /// call is also the lowest-latency usage.
-    ///
-    /// ```no_run
-    /// # use pixelforge::decoder::Decoder;
-    /// # fn run(decoder: &mut Decoder, stream: &[u8]) -> pixelforge::error::Result<()> {
-    /// for (i, unit) in decoder.split(stream).enumerate() {
-    ///     let batch = decoder.decode(unit, i as u64)?;
-    ///     for frame in pollster::block_on(batch)? {
-    ///         // ... use the frame, then drop it to release its storage ...
-    ///     }
-    /// }
-    /// # Ok(())
-    /// # }
-    /// ```
-    //
-    // `use<'a>` keeps the iterator from capturing the borrow of `self`, so the
-    // caller can call `decode` while iterating the split units.
-    pub fn split<'a>(&self, stream: &'a [u8]) -> impl Iterator<Item = &'a [u8]> + use<'a> {
-        self.0.split_stream(stream).into_iter()
-    }
-
     /// Decode a chunk of the coded byte stream.
     ///
-    /// `data` may hold any number of *complete* coded frames, plus whatever
-    /// non-picture data the codec carries alongside them (H.26x parameter sets
-    /// and SEI, AV1 sequence headers). The end of `data` is treated as a frame
-    /// boundary, so a picture must not be split across calls: use
-    /// [`split`](Self::split) to carve a buffer into decodable pieces. For
-    /// lowest latency feed exactly one coded frame per call; the picture is
-    /// decoded immediately and returned from the same call.
+    /// What `data` may contain depends on the configured [`Framing`]. By
+    /// default ([`Framing::FrameAligned`]) it must hold whole coded frames:
+    /// any number of them, plus whatever non-picture data the codec carries
+    /// alongside (H.26x parameter sets and SEI, AV1 sequence headers), ending
+    /// on a frame boundary. Feed exactly one coded frame per call for the
+    /// lowest latency; it is decoded by this call.
+    ///
+    /// With [`Framing::ByteStream`] the data may cut anywhere and the decoder
+    /// does the framing itself, holding back a trailing partial frame until
+    /// later calls complete it.
     ///
     /// `pts` is attached to every frame produced by this call.
     ///
@@ -329,14 +347,15 @@ impl Decoder {
     /// remainder with [`flush`](Self::flush) at end of stream. A stream without
     /// B-frames holds nothing back and yields one frame per coded frame fed.
     ///
-    /// This call blocks in one case: when every output slot is held by a frame
-    /// the caller has not dropped. See
-    /// [`DecodeConfig::with_output_depth`].
+    /// Drop frames promptly. A frame the caller holds keeps a DPB slot, and
+    /// once the slots run out the decoder copies pictures out instead of
+    /// handing over its own images. See [`DecodeConfig::with_output_depth`].
     pub fn decode(&mut self, data: &[u8], pts: u64) -> Result<DecodeFuture> {
         self.0.decode(data, pts)
     }
 
-    /// Return any frames still held for display-order reordering.
+    /// Return any frames still held back: the reorder buffer's contents, and in
+    /// [`Framing::ByteStream`] the trailing frame no later data will complete.
     ///
     /// Call once after the last [`decode`](Self::decode) to emit the tail of
     /// the stream. Frames come back in presentation order, through a future that

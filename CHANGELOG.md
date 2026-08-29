@@ -9,8 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- H.264 hardware decoding via Vulkan Video: `Decoder`, `DecodeConfig`, and
-  `Decoder::split` for carving a stream into coded frames. Stream-driven, so the
+- H.264 hardware decoding via Vulkan Video: `Decoder` and `DecodeConfig`.
+  Stream-driven, so the
   Vulkan session is created from the stream's own parameter sets and a mid-stream
   resolution change is handled transparently. Verified byte-identical to
   `ffmpeg -pix_fmt nv12` on AMD (RADV), NVIDIA and Intel (ANV).
@@ -30,6 +30,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `DecodeConfig::with_consumer_queue_family` names the queue family that will
   read decoded frames, adding it to each picture's sharing set so frames can be
   used from a graphics queue with no ownership transfer.
+- `Framing` says how input is framed, so the decoder can do the framing itself.
+  `Framing::FrameAligned` (the default) takes whole coded frames per call, as a
+  container or transport delivers them. `Framing::ByteStream`, selected with
+  `DecodeConfig::with_byte_stream`, takes a stream that may cut anywhere and
+  buffers a partial trailing frame until later bytes complete it. This replaces
+  the `Decoder::split` free-standing splitter, which needed the whole stream in
+  memory and so could not be used for live decoding.
 - Validation layer messages are now routed into `tracing` through a
   `VK_EXT_debug_utils` messenger. Previously the layer was loaded with nowhere to
   report, so enabling validation verified nothing.

@@ -9,6 +9,9 @@ use ash::vk::TaggedStructure;
 use pixelforge::decoder::{DecodeConfig, Decoder};
 use pixelforge::vulkan::VideoContextBuilder;
 
+/// Bytes handed to the decoder per call, standing in for a network read.
+const CHUNK_SIZE: usize = 64 * 1024;
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let input = std::env::args()
         .nth(1)
@@ -86,7 +89,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         pdevice,
         device.clone(),
     )?;
-    let mut decoder = Decoder::new(context, DecodeConfig::h264())?;
+    let mut decoder = Decoder::new(context, DecodeConfig::h264().with_byte_stream())?;
 
     let stream = std::fs::read(&input)?;
     let mut out = std::fs::File::create(&out_path)?;
@@ -124,8 +127,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Ok(())
     };
 
-    for (i, au) in decoder.split(&stream).enumerate() {
-        for f in pollster::block_on(decoder.decode(au, i as u64)?)? {
+    // A file is a raw byte stream that can cut anywhere, so let the decoder do
+    // the framing and feed it in fixed-size chunks, the way a socket delivers
+    // one. `flush` ends the final picture, which nothing follows.
+    for (i, chunk) in stream.chunks(CHUNK_SIZE).enumerate() {
+        for f in pollster::block_on(decoder.decode(chunk, i as u64)?)? {
             handle(&mut decoder, &f, &mut out)?;
             count += 1;
         }

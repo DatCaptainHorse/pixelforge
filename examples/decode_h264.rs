@@ -16,6 +16,9 @@ use pixelforge::decoder::{DecodeConfig, Decoder};
 use pixelforge::encoder::Codec;
 use pixelforge::vulkan::VideoContextBuilder;
 
+/// Bytes handed to the decoder per call, standing in for a network read.
+const CHUNK_SIZE: usize = 64 * 1024;
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
 
@@ -44,7 +47,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Frames arrive in presentation order, ready to show without sorting, and
     // without ever being copied: a picture waiting its turn stays pinned in the
     // DPB slot it was decoded into.
-    let mut decoder = Decoder::new(context, DecodeConfig::h264())?;
+    // 64 KB of byte stream can hold several coded frames, and every frame a
+    // `decode` call emits is outstanding at once. The default budget of 4 is
+    // sized for one frame per call, so raise it: past the budget the decoder
+    // copies pictures out instead of handing over its own images, which still
+    // decodes correctly but costs throughput.
+    let config = DecodeConfig::h264().with_byte_stream().with_output_depth(8);
+    let mut decoder = Decoder::new(context, config)?;
     let stream = std::fs::read(&input_path)?;
     let mut output = output_path.as_ref().map(File::create).transpose()?;
 
@@ -88,8 +97,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut pending: std::collections::VecDeque<pixelforge::decoder::DecodeFuture> =
         std::collections::VecDeque::new();
 
-    for au in decoder.split(&stream) {
-        match decoder.decode(au, frame_count as u64) {
+    // A file is a raw byte stream that can cut anywhere, so let the decoder do
+    // the framing and feed it in fixed-size chunks, the way a socket delivers
+    // one. `flush` ends the final picture, which nothing follows.
+    for (i, chunk) in stream.chunks(CHUNK_SIZE).enumerate() {
+        match decoder.decode(chunk, i as u64) {
             Ok(batch) => pending.push_back(batch),
             // Joining mid-stream (or after loss): skip until a keyframe. A live
             // client would ask the sender for an IDR here.

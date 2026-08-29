@@ -68,6 +68,13 @@ impl SlotPins {
         *self.pinned.lock().unwrap() != 0
     }
 
+    /// How many slots are pinned right now, across everything holding one:
+    /// pictures awaiting their turn in display order, frames on their way to
+    /// the caller, and frames the caller has not dropped.
+    pub fn count(&self) -> usize {
+        self.pinned.lock().unwrap().count_ones() as usize
+    }
+
     pub fn pin(&self, slot: u8) {
         *self.pinned.lock().unwrap() |= 1 << slot;
     }
@@ -411,7 +418,13 @@ impl ReorderBuffer {
         let session = common.session()?;
         // A distinct decode output image is overwritten by the next picture, so
         // only a coincident DPB image can be pinned in place.
-        if session.coincide && self.pinned_slots() < session.spare_slots {
+        //
+        // The budget counts every pin that exists, not just this buffer's:
+        // frames already emitted hold theirs until the caller drops them, and a
+        // single decode call can emit many. Staying within `spare_slots` is what
+        // guarantees the codec always has a slot to decode into, so a caller who
+        // holds frames gets copies rather than a decoder that cannot proceed.
+        if session.coincide && common.slot_pins.count() < session.spare_slots {
             common.slot_pins.pin(picture.slot);
             return Ok(Retained::Slot {
                 pin: FramePin::DpbSlot {
@@ -430,19 +443,6 @@ impl ReorderBuffer {
         common.submit_copy()?;
         self.pool.images[index].state = PoolState::Buffered;
         Ok(Retained::Pool { index })
-    }
-
-    /// How many DPB slots this buffer currently pins.
-    ///
-    /// Only slots held by *buffered* pictures count: once a picture is emitted
-    /// its pin belongs to the caller, and that is what
-    /// [`DecodeConfig::with_output_depth`](crate::decoder::DecodeConfig::with_output_depth)
-    /// budgets for.
-    fn pinned_slots(&self) -> usize {
-        self.buffered
-            .iter()
-            .filter(|e| matches!(e.retained, Retained::Slot { .. }))
-            .count()
     }
 
     /// Emit every buffered picture in display order. Call at end of stream.

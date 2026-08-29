@@ -20,12 +20,16 @@ use ash::vk;
 
 pub(crate) use session::H264Decoder;
 
-/// Split an Annex B stream into one slice per coded picture.
+/// Byte offsets at which each coded picture begins in an Annex B stream.
 ///
 /// A new picture begins at each VCL NAL whose `first_mb_in_slice` is 0.
 /// Parameter sets, SEI and access unit delimiters are attached to the picture
-/// that follows them, so the units can be fed back in order without loss.
-pub(crate) fn split_stream(stream: &[u8]) -> Vec<&[u8]> {
+/// that follows them, so the offsets carve the stream up without loss.
+///
+/// This is what tells a byte-stream feed where it may cut: everything before
+/// the last offset is complete, everything from it onward may still be waiting
+/// for slices that have not arrived.
+pub(crate) fn picture_starts(stream: &[u8]) -> Vec<usize> {
     let mut starts: Vec<usize> = Vec::new();
     let mut pending_start: Option<usize> = None;
 
@@ -43,26 +47,19 @@ pub(crate) fn split_stream(stream: &[u8]) -> Vec<&[u8]> {
             pending_start = Some(offset);
         }
     }
-
-    let ends = starts
-        .iter()
-        .skip(1)
-        .copied()
-        .chain(std::iter::once(stream.len()));
-
     starts
-        .iter()
-        .copied()
-        .zip(ends)
-        .map(|(start, end)| &stream[start..end])
-        .collect()
+}
+
+/// How many leading bytes of `buffer` hold pictures known to be complete.
+///
+/// A coded picture is only known to have ended once the next one starts, so
+/// everything from the last picture start onward may still be waiting for
+/// slices. Zero means nothing in `buffer` can be decoded yet.
+pub(crate) fn complete_prefix(buffer: &[u8]) -> usize {
+    picture_starts(buffer).last().copied().unwrap_or(0)
 }
 
 impl crate::decoder::DecoderApi for H264Decoder {
-    fn split_stream<'a>(&self, stream: &'a [u8]) -> Vec<&'a [u8]> {
-        split_stream(stream)
-    }
-
     fn decode(&mut self, data: &[u8], pts: u64) -> Result<DecodeFuture> {
         H264Decoder::decode(self, data, pts)
     }

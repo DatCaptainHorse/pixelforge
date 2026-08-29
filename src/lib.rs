@@ -141,18 +141,20 @@
 //!         .require_decode(Codec::H264)
 //!         .build()?;
 //!
-//!     let mut decoder = Decoder::new(context, DecodeConfig::h264())?;
+//!     // A file can cut anywhere, so let the decoder frame it. Input that
+//!     // arrives already framed (RTP, a container) skips `with_byte_stream`.
+//!     let config = DecodeConfig::h264().with_byte_stream();
+//!     let mut decoder = Decoder::new(context, config)?;
 //!     let stream: Vec<u8> = std::fs::read("input.264")?;
 //!
-//!     // `split` carves the stream into one chunk per coded frame.
-//!     for (i, unit) in decoder.split(&stream).enumerate() {
-//!         for frame in pollster::block_on(decoder.decode(unit, i as u64)?)? {
+//!     for (i, chunk) in stream.chunks(64 * 1024).enumerate() {
+//!         for frame in pollster::block_on(decoder.decode(chunk, i as u64)?)? {
 //!             // `frame.image` is a decoder-owned GPU image, valid until dropped.
 //!             let data = decoder.download(&frame)?;
 //!             let _ = (data.y, data.uv);
 //!         }
 //!     }
-//!     // Drain whatever the reorder buffer still holds.
+//!     // Drain the last frame and whatever the reorder buffer still holds.
 //!     for frame in pollster::block_on(decoder.flush()?)? {
 //!         let _ = decoder.download(&frame)?;
 //!     }

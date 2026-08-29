@@ -24,6 +24,9 @@ use pixelforge::{
     VideoContextBuilder,
 };
 
+/// Bytes handed to the decoder per call, standing in for a network read.
+const CHUNK_SIZE: usize = 64 * 1024;
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
 
@@ -99,7 +102,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // --- Decode it back ---
     // Display order by default, so frames come out ready to write; `flush`
     // drains whatever the reorder buffer still holds at end of stream.
-    let mut decoder = Decoder::new(context, DecodeConfig::h264())?;
+    let mut decoder = Decoder::new(context, DecodeConfig::h264().with_byte_stream())?;
     let mut out = yuv_path.map(File::create).transpose()?;
     let mut decoded_count = 0usize;
 
@@ -117,8 +120,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Ok(())
     };
 
-    for au in decoder.split(&bitstream) {
-        for frame in pollster::block_on(decoder.decode(au, decoded_count as u64)?)? {
+    // A file is a raw byte stream that can cut anywhere, so let the decoder do
+    // the framing and feed it in fixed-size chunks, the way a socket delivers
+    // one. `flush` ends the final picture, which nothing follows.
+    for (i, chunk) in bitstream.chunks(CHUNK_SIZE).enumerate() {
+        for frame in pollster::block_on(decoder.decode(chunk, i as u64)?)? {
             write(&mut decoder, &frame, &mut out, &mut decoded_count)?;
         }
     }
