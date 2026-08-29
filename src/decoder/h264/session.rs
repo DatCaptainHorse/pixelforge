@@ -671,11 +671,15 @@ impl H264Decoder {
             self.common.slot_pins.wait_for_release();
         };
 
-        // --- Pack the slice data into the staging buffer ---
-        let (buffer_range, slice_offsets) = self.stage_slices(picture, sps)?;
-
         // --- Record and submit ---
+        //
+        // Claim the pipeline slot first. Staging writes into that slot's
+        // buffer, and `ensure_bitstream_capacity` may replace it outright, so
+        // both have to happen after the slot's previous submission has
+        // completed. Staging before this waits overwrote coded data the GPU was
+        // still reading.
         self.common.begin_decode_commands()?;
+        let (buffer_range, slice_offsets) = self.stage_slices(picture, sps)?;
         self.common.record_barriers(slot);
         self.record_decode(picture, &state, slot, buffer_range, &slice_offsets)?;
         self.common.submit_decode()?;
