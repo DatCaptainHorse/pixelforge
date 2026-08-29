@@ -127,8 +127,9 @@
 //! [`Decoder::decode`](decoder::Decoder::decode) submits without waiting and
 //! returns a [`DecodeFuture`], mirroring [`Encoder::encode`]. Keep a couple in
 //! flight to overlap parsing with GPU decode. Frames come out in presentation
-//! order by default; drop each frame when done, which returns its storage to the
-//! decoder.
+//! order without ever being copied: a picture waiting its turn stays pinned in
+//! the DPB slot it was decoded into. Drop each frame when done, which returns
+//! its storage to the decoder and is what keeps decoding running.
 //!
 //! ```rust,no_run
 //! use pixelforge::{Codec, VideoContextBuilder};
@@ -159,10 +160,11 @@
 //! }
 //! ```
 //!
-//! For the lowest latency, [`OutputOrder::Decode`]
-//! returns each frame as soon as its GPU work completes, with no copy: the frame
-//! *is* the decoder's DPB image, pinned until dropped. With B-frames the caller
-//! then has to sort by [`DecodedFrame::display_order`](decoder::DecodedFrame).
+//! A held frame reserves a DPB slot, so
+//! [`DecodeConfig::with_output_depth`](decoder::DecodeConfig::with_output_depth)
+//! bounds how many the caller may hold before `decode` blocks waiting for one
+//! back. On a device with too few slots for the stream, frames fall back to a
+//! copy rather than failing.
 //!
 //! ## Color Conversion (RGB → YUV)
 //!
@@ -263,9 +265,7 @@ pub(crate) const fn align4(size: usize) -> usize {
 }
 
 pub use converter::{ColorConverter, ColorConverterConfig, ColorSpace, InputFormat, OutputFormat};
-pub use decoder::{
-    DecodeConfig, DecodeFuture, DecodedFrame, DecodedFrameData, Decoder, OutputOrder,
-};
+pub use decoder::{DecodeConfig, DecodeFuture, DecodedFrame, DecodedFrameData, Decoder};
 pub use encoder::{
     BitDepth as EncodeBitDepth, Codec, ColorDescription, DEFAULT_FRAME_RATE, DEFAULT_GOP_SIZE,
     DEFAULT_H264_QP, DEFAULT_H265_QP, DEFAULT_MAX_BITRATE, DEFAULT_MAX_REFERENCE_FRAMES,

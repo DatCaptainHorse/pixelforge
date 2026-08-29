@@ -41,14 +41,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .to_string_lossy()
     );
 
-    // Display order by default: frames arrive ready to present, no sorting.
-    // Set PIXELFORGE_DECODE_ORDER=1 for the low-latency decode-order path.
-    let config = if std::env::var("PIXELFORGE_DECODE_ORDER").is_ok() {
-        DecodeConfig::h264().with_decode_order()
-    } else {
-        DecodeConfig::h264()
-    };
-    let mut decoder = Decoder::new(context, config)?;
+    // Frames arrive in presentation order, ready to show without sorting, and
+    // without ever being copied: a picture waiting its turn stays pinned in the
+    // DPB slot it was decoded into.
+    let mut decoder = Decoder::new(context, DecodeConfig::h264())?;
     let stream = std::fs::read(&input_path)?;
     let mut output = output_path.as_ref().map(File::create).transpose()?;
 
@@ -85,10 +81,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // a couple in flight so parsing and submission overlap the GPU decode, and
     // drain the oldest once the pipeline is full, which preserves output order.
     //
-    // The depth is bounded by `DecodeConfig::output_depth` (2 by default): in
-    // decode-order mode every un-dropped frame holds a DPB slot, so holding
-    // more batches than there are output slots would make `decode` wait for a
-    // frame that only this loop can release.
+    // The depth is bounded by `DecodeConfig::output_depth` (2 by default):
+    // every un-dropped frame holds a DPB slot, so holding more batches than
+    // there are output slots would make `decode` wait for a frame that only
+    // this loop can release.
     let mut pending: std::collections::VecDeque<pixelforge::decoder::DecodeFuture> =
         std::collections::VecDeque::new();
 

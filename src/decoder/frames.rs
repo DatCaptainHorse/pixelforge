@@ -2,10 +2,12 @@
 //! and how display order is restored.
 //!
 //! The decoder hands out [`DecodedFrame`]s whose storage stays reserved until
-//! the caller drops them. Two kinds of storage exist: a pinned DPB slot (no
-//! copy, decode-order output) and a pool image (a copy, which is what lets a
-//! picture outlive the slot it was decoded into, and so what makes display-order
-//! reordering possible).
+//! the caller drops them. Normally that storage is the DPB slot the picture was
+//! decoded into, pinned so the codec allocates around it: no copy happens
+//! between the decoder and the caller, and reordering into display order works
+//! by holding pins rather than by copying pictures out. A pool image (a copy) is
+//! the fallback for devices with no slots to spare, and for drivers that decode
+//! into a distinct output image the next picture overwrites.
 
 use std::sync::{Arc, Condvar, Mutex};
 
@@ -176,6 +178,10 @@ struct PoolImage {
 
 /// Images that decoded pictures are copied into so they outlive their DPB slot.
 ///
+/// The fallback path only: most pictures are pinned in place instead. Used when
+/// the session has no spare DPB slot to pin, or when the driver decodes into a
+/// distinct output image rather than into the DPB.
+///
 /// The pool grows on demand and shrinks never: an image is reused as soon as the
 /// frame holding it is dropped, so steady-state size is "what the caller holds
 /// at once, plus the reorder depth". Nothing here blocks, because pool images
@@ -284,9 +290,30 @@ impl FramePool {
     }
 }
 
-/// A buffered picture, referencing its pool image by index.
+/// Where a buffered picture's pixels live until it is emitted.
+///
+/// Pinning is the normal case: the picture stays in the DPB slot it was decoded
+/// into and the codec is told not to reuse that slot, so no copy happens
+/// anywhere between the decoder and the caller. Copying is the fallback for the
+/// two cases where the pixels cannot survive in place: the device gave the
+/// session no spare slots to pin, or the driver decodes into a single distinct
+/// output image that the next picture overwrites.
+enum Retained {
+    /// The DPB slot the picture was decoded into, pinned until the frame dies.
+    Slot {
+        pin: FramePin,
+        image: vk::Image,
+        image_view: vk::ImageView,
+        layout: vk::ImageLayout,
+        array_layer: u32,
+    },
+    /// A private copy in the frame pool.
+    Pool { index: usize },
+}
+
+/// A buffered picture, awaiting its turn in display order.
 struct ReorderEntry {
-    pool_index: usize,
+    retained: Retained,
     display_order: i32,
     pts: u64,
     is_keyframe: bool,
@@ -294,34 +321,36 @@ struct ReorderEntry {
     height: u32,
     coded_width: u32,
     coded_height: u32,
-    array_layer: u32,
     pixel_format: PixelFormat,
 }
 
 /// Reorders decoded pictures from decode order into display order.
 ///
-/// Decoded pictures are returned in the order the hardware produces them, which
-/// for streams with B-frames is not display order. This buffer copies each
-/// decoded picture into a pool image, so it survives while later pictures are
-/// decoded ahead of it, and emits them in display order.
+/// The hardware produces pictures in decode order, which for streams with
+/// B-frames is not display order. A picture therefore has to survive while
+/// later pictures are decoded ahead of it. It survives *in place*: the DPB slot
+/// holding it is pinned, so the codec allocates around it, and the picture is
+/// handed to the caller without ever being copied. The pin then belongs to the
+/// caller's [`DecodedFrame`] and is released when they drop it.
 ///
 /// Emission follows the DPB bumping model: a picture is held until at most
 /// `reorder_depth` pictures precede it in the buffer, a keyframe drains the
 /// previous coded video sequence (display order restarts there), and
-/// [`Self::flush`] drains the rest at end of stream.
+/// [`Self::flush`] drains the rest at end of stream. A stream without B-frames
+/// has a reorder depth of zero, so each picture is emitted by the same call
+/// that decoded it and nothing is buffered at all.
 ///
-/// When disabled (decode-order mode) it is a pass-through: no copy, no latency,
-/// and the returned frame points straight at the decoder's DPB image.
+/// Slots are finite, so pinning is bounded by what the session reserved. Past
+/// that bound a picture is copied into a pool image instead, which costs a copy
+/// but keeps decoding correct on devices too small for the stream.
 pub(crate) struct ReorderBuffer {
-    enabled: bool,
     pool: FramePool,
     buffered: Vec<ReorderEntry>,
 }
 
 impl ReorderBuffer {
-    pub fn new(enabled: bool) -> Self {
+    pub fn new() -> Self {
         Self {
-            enabled,
             pool: FramePool::new(),
             buffered: Vec::new(),
         }
@@ -337,10 +366,6 @@ impl ReorderBuffer {
         picture: &DecodedPicture,
         reorder_depth: usize,
     ) -> Result<Vec<DecodedFrame>> {
-        if !self.enabled {
-            return Ok(vec![self.emit_immediately(common, picture)?]);
-        }
-
         let mut out = Vec::new();
         // Display order restarts at a keyframe, so the previous sequence must be
         // fully drained before this picture, which belongs to the new one.
@@ -348,12 +373,9 @@ impl ReorderBuffer {
             out.extend(self.drain_all());
         }
 
-        let pool_index = self.pool.acquire(common, picture)?;
-        common.record_picture_copy(picture, self.pool.images[pool_index].image)?;
-        common.submit_copy()?;
-        self.pool.images[pool_index].state = PoolState::Buffered;
+        let retained = self.retain(common, picture)?;
         self.buffered.push(ReorderEntry {
-            pool_index,
+            retained,
             display_order: picture.display_order,
             pts: picture.pts,
             is_keyframe: picture.is_keyframe,
@@ -361,7 +383,6 @@ impl ReorderBuffer {
             height: picture.height,
             coded_width: picture.coded_width,
             coded_height: picture.coded_height,
-            array_layer: picture.array_layer,
             pixel_format: picture.pixel_format,
         });
 
@@ -371,79 +392,50 @@ impl ReorderBuffer {
         Ok(out)
     }
 
-    /// Hand a picture straight to the caller (decode-order mode).
+    /// Make a decoded picture outlive the decode that produced it.
     ///
-    /// Zero-copy when the driver decoded into the DPB image and the session
-    /// reserved a spare slot for it: the slot is pinned, so the codec will not
-    /// decode over it until the frame is dropped. Otherwise the picture lives
-    /// somewhere that the next decode overwrites (the session's single output
-    /// image, or a DPB slot the stream needs back), so it is copied into a pool
-    /// image instead.
-    fn emit_immediately(
-        &mut self,
-        common: &mut DecoderCommon,
-        picture: &DecodedPicture,
-    ) -> Result<DecodedFrame> {
+    /// Pins its DPB slot when the session has room to spare, and copies it out
+    /// otherwise. See [`Retained`].
+    fn retain(&mut self, common: &mut DecoderCommon, picture: &DecodedPicture) -> Result<Retained> {
         let session = common.session()?;
-        if session.coincide && session.output_slots > 0 {
+        // A distinct decode output image is overwritten by the next picture, so
+        // only a coincident DPB image can be pinned in place.
+        if session.coincide && self.pinned_slots() < session.spare_slots {
             common.slot_pins.pin(picture.slot);
-            return Ok(DecodedFrame {
+            return Ok(Retained::Slot {
+                pin: FramePin::DpbSlot {
+                    slot: picture.slot,
+                    pins: common.slot_pins.clone(),
+                },
                 image: picture.image,
                 image_view: picture.image_view,
                 layout: picture.layout,
                 array_layer: picture.array_layer,
-                pixel_format: picture.pixel_format,
-                width: picture.width,
-                height: picture.height,
-                coded_width: picture.coded_width,
-                coded_height: picture.coded_height,
-                pts: picture.pts,
-                display_order: picture.display_order,
-                is_keyframe: picture.is_keyframe,
-                pin: Some(FramePin::DpbSlot {
-                    slot: picture.slot,
-                    pins: common.slot_pins.clone(),
-                }),
             });
         }
-        self.emit_copy(common, picture)
-    }
 
-    /// Copy a picture into a pool image and hand out the copy.
-    fn emit_copy(
-        &mut self,
-        common: &mut DecoderCommon,
-        picture: &DecodedPicture,
-    ) -> Result<DecodedFrame> {
         let index = self.pool.acquire(common, picture)?;
         common.record_picture_copy(picture, self.pool.images[index].image)?;
         common.submit_copy()?;
-        let pin = self.pool.hand_out(index);
-        Ok(DecodedFrame {
-            image: self.pool.images[index].image,
-            // Pool images carry no view (see PoolImage); a caller needing one
-            // for GPU work creates it over `image` with the usage it wants.
-            image_view: vk::ImageView::null(),
-            // copy_picture_to_image leaves the pool image in TRANSFER_DST layout.
-            layout: vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-            array_layer: 0,
-            pixel_format: picture.pixel_format,
-            width: picture.width,
-            height: picture.height,
-            coded_width: picture.coded_width,
-            coded_height: picture.coded_height,
-            pts: picture.pts,
-            display_order: picture.display_order,
-            is_keyframe: picture.is_keyframe,
-            pin: Some(pin),
-        })
+        self.pool.images[index].state = PoolState::Buffered;
+        Ok(Retained::Pool { index })
+    }
+
+    /// How many DPB slots this buffer currently pins.
+    ///
+    /// Only slots held by *buffered* pictures count: once a picture is emitted
+    /// its pin belongs to the caller, and that is what
+    /// [`DecodeConfig::with_output_depth`](crate::decoder::DecodeConfig::with_output_depth)
+    /// budgets for.
+    fn pinned_slots(&self) -> usize {
+        self.buffered
+            .iter()
+            .filter(|e| matches!(e.retained, Retained::Slot { .. }))
+            .count()
     }
 
     /// Emit every buffered picture in display order. Call at end of stream.
     pub fn flush(&mut self) -> Vec<DecodedFrame> {
-        if !self.enabled {
-            return Vec::new();
-        }
         self.drain_all()
     }
 
@@ -466,15 +458,35 @@ impl ReorderBuffer {
             .map(|(i, _)| i)
             .expect("buffer is non-empty");
         let entry = self.buffered.remove(i);
-        let pin = self.pool.hand_out(entry.pool_index);
+
+        // Hand the storage over: the pin moves into the frame, so the slot or
+        // pool image stays reserved until the caller drops it.
+        let (image, image_view, layout, array_layer, pin) = match entry.retained {
+            Retained::Slot {
+                pin,
+                image,
+                image_view,
+                layout,
+                array_layer,
+            } => (image, image_view, layout, array_layer, pin),
+            Retained::Pool { index } => (
+                self.pool.images[index].image,
+                // Pool images carry no view (see PoolImage); a caller needing
+                // one for GPU work creates it over `image` with the usage it
+                // wants.
+                vk::ImageView::null(),
+                // copy_picture_to_image leaves the pool image in TRANSFER_DST.
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                0,
+                self.pool.hand_out(index),
+            ),
+        };
+
         DecodedFrame {
-            image: self.pool.images[entry.pool_index].image,
-            // Pool images carry no view (see PoolImage); a caller needing one
-            // for GPU work creates it over `image` with the usage it wants.
-            image_view: vk::ImageView::null(),
-            // copy_picture_to_image leaves the pool image in TRANSFER_DST layout.
-            layout: vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-            array_layer: entry.array_layer,
+            image,
+            image_view,
+            layout,
+            array_layer,
             pixel_format: entry.pixel_format,
             width: entry.width,
             height: entry.height,
@@ -487,11 +499,14 @@ impl ReorderBuffer {
         }
     }
 
-    /// Free every pool image.
+    /// Release everything this buffer holds.
     ///
-    /// Frames the caller still holds point at these images, so this warns rather
-    /// than silently leaving dangling handles behind.
+    /// Drops the buffered pictures first, which releases the DPB slots they
+    /// pinned, then frees the pool images. Frames the caller still holds point
+    /// at these images, so this warns rather than silently leaving dangling
+    /// handles behind.
     pub fn destroy(&mut self, common: &DecoderCommon) {
+        self.buffered.clear();
         if self.pool.has_live_frames() {
             tracing::warn!(
                 "decoder dropped while decoded frames are still alive; their images \
@@ -499,7 +514,6 @@ impl ReorderBuffer {
             );
         }
         self.pool.destroy(common);
-        self.buffered.clear();
     }
 }
 

@@ -133,8 +133,9 @@ mid-stream resolution change is handled transparently.
 [`Decoder::decode`](decoder::Decoder::decode) submits without waiting and
 returns a [`DecodeFuture`], mirroring [`Encoder::encode`]. Keep a couple in
 flight to overlap parsing with GPU decode. Frames come out in presentation
-order by default; drop each frame when done, which returns its storage to the
-decoder.
+order without ever being copied: a picture waiting its turn stays pinned in
+the DPB slot it was decoded into. Drop each frame when done, which returns
+its storage to the decoder and is what keeps decoding running.
 
 ```rust
 use pixelforge::{Codec, VideoContextBuilder};
@@ -165,10 +166,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-For the lowest latency, [`OutputOrder::Decode`]
-returns each frame as soon as its GPU work completes, with no copy: the frame
-*is* the decoder's DPB image, pinned until dropped. With B-frames the caller
-then has to sort by [`DecodedFrame::display_order`](decoder::DecodedFrame).
+A held frame reserves a DPB slot, so
+[`DecodeConfig::with_output_depth`](decoder::DecodeConfig::with_output_depth)
+bounds how many the caller may hold before `decode` blocks waiting for one
+back. On a device with too few slots for the stream, frames fall back to a
+copy rather than failing.
 
 ### Color Conversion (RGB → YUV)
 

@@ -17,9 +17,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Asynchronous decoding: `Decoder::decode` and `Decoder::flush` submit without
   waiting and return a `DecodeFuture`, mirroring `Encoder::encode`. Measured
   10-21% higher decode throughput depending on GPU and resolution.
-- `OutputOrder` selects presentation-order output (default) or decode-order
-  output, which is zero-copy: the frame is the decoder's own DPB image, pinned
-  until dropped.
+- Zero-copy output in presentation order: a decoded picture is never copied on
+  its way to the caller. A picture waiting its turn in display order stays
+  pinned in the DPB slot it was decoded into, and that pin passes to the
+  `DecodedFrame` the caller receives. Devices with too few DPB slots for the
+  stream fall back to copying rather than failing.
 - `DecodeConfig::with_output_depth` reserves DPB slots so decoded frames can be
   held while decoding continues.
 - Validation layer messages are now routed into `tracing` through a

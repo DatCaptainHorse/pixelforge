@@ -14,7 +14,7 @@ use crate::decoder::h264::parser::{
     self, NalType, NalUnit, Pps, SliceHeader, SliceType, Sps, iter_nal_units,
 };
 use crate::decoder::pipeline::DecodeFuture;
-use crate::decoder::{DecodeConfig, DecodedFrame, DecodedFrameData, OutputOrder};
+use crate::decoder::{DecodeConfig, DecodedFrame, DecodedFrameData};
 use crate::encoder::{BitDepth, PixelFormat};
 use crate::error::{PixelForgeError, Result};
 use crate::video::{align_up, get_video_format, query_supported_video_formats};
@@ -43,10 +43,12 @@ pub(crate) struct H264Decoder {
     /// POC and reference state, recreated alongside the session.
     dpb: Option<DecodeDpb>,
 
-    /// Display-order reordering (a pass-through in decode-order mode).
+    /// Display-order reordering, which holds pictures by pinning their DPB
+    /// slots rather than by copying them out.
     reorder: ReorderBuffer,
     /// `max_num_reorder_frames` for the active SPS: how deep the reorder buffer
-    /// may hold pictures before emitting.
+    /// may hold pictures before emitting. Set by `activate`, which also sizes
+    /// the DPB so that many pictures can be pinned rather than copied.
     reorder_depth: usize,
 
     /// Whether decoding is waiting for a keyframe (IDR) before it can produce
@@ -75,7 +77,7 @@ impl H264Decoder {
             active_sps_id: 0,
             active_pps_id: 0,
             dpb: None,
-            reorder: ReorderBuffer::new(config.output_order == OutputOrder::Display),
+            reorder: ReorderBuffer::new(),
             reorder_depth: 0,
             awaiting_keyframe: true,
         })
@@ -262,9 +264,11 @@ impl H264Decoder {
             !cap_flags.contains(vk::VideoCapabilityFlagsKHR::SEPARATE_REFERENCE_IMAGES);
 
         // The stream needs max_num_ref_frames references plus the current
-        // picture. On top of that we reserve `output_depth` slots so decoded
-        // frames can be handed out without a copy while decoding continues; the
-        // device caps bound the total.
+        // picture. On top of that come the spare slots, which is what lets a
+        // picture stay pinned in place past the decode that produced it instead
+        // of being copied out: `reorder_depth` of them for pictures waiting
+        // their turn in display order, and `output_depth` for frames the caller
+        // is holding. The device caps bound the total.
         let required = (sps.max_num_ref_frames as u32 + 1).max(2);
         let slot_limit = max_dpb_slots.min(crate::decoder::h264::dpb::MAX_DPB_SLOTS as u32);
         if required > slot_limit {
@@ -273,14 +277,27 @@ impl H264Decoder {
                 required, max_dpb_slots
             )));
         }
-        let slot_count = (required + self.output_depth as u32).min(slot_limit) as usize;
-        let output_slots = slot_count - required as usize;
-        if output_slots < self.output_depth {
+        // Reorder depth comes from the stream (VUI); without it, bound by the
+        // reference count, which is never smaller than the reorder depth in
+        // practice.
+        let reorder_depth = sps
+            .max_num_reorder_frames
+            .map(|v| v as usize)
+            .unwrap_or(sps.max_num_ref_frames as usize);
+        let wanted_spare = reorder_depth + self.output_depth;
+        let slot_count = (required + wanted_spare as u32).min(slot_limit) as usize;
+        let spare_slots = slot_count - required as usize;
+        if spare_slots < wanted_spare {
             debug!(
-                "H.264 decode: {} of {} requested output slots available \
-                 (stream needs {} of the device's {} DPB slots); \
-                 decode-order frames beyond that are copied",
-                output_slots, self.output_depth, required, max_dpb_slots
+                "H.264 decode: {} of {} spare DPB slots available \
+                 (reorder depth {} plus {} output slots; the stream's references \
+                 need {} of the device's {}); pictures beyond that are copied",
+                spare_slots,
+                wanted_spare,
+                reorder_depth,
+                self.output_depth,
+                required,
+                max_dpb_slots
             );
         }
 
@@ -326,7 +343,7 @@ impl H264Decoder {
             bit_depth,
             pixel_format,
             slot_count,
-            output_slots,
+            spare_slots,
             max_active_references,
             coincide,
             use_layered_dpb,
@@ -341,16 +358,17 @@ impl H264Decoder {
 
         self.active_sps_id = sps.sps_id;
         self.active_pps_id = pps.pps_id;
+        self.reorder_depth = reorder_depth;
         self.dpb = Some(DecodeDpb::new(slot_count, self.common.slot_pins.clone()));
 
         debug!(
-            "H.264 decode session: {}x{} {:?}, {} DPB slots ({} for output), \
+            "H.264 decode session: {}x{} {:?}, {} DPB slots ({} spare), \
              layered={}, coincide={}, bitstream alignment {}/{} (offset/size)",
             coded_width,
             coded_height,
             picture_format,
             slot_count,
-            output_slots,
+            spare_slots,
             use_layered_dpb,
             coincide,
             self.common.bitstream_offset_alignment,
@@ -567,13 +585,6 @@ impl H264Decoder {
 
             // (Re)build the session if the stream's geometry or ids changed.
             self.activate(&sps, &pps)?;
-            // Reorder depth comes from the stream (VUI); without it, bound by
-            // the reference count, which is never smaller than the reorder
-            // depth in practice.
-            self.reorder_depth = sps
-                .max_num_reorder_frames
-                .map(|v| v as usize)
-                .unwrap_or(sps.max_num_ref_frames as usize);
 
             if let Some(frame) = self.decode_picture(&picture, &sps, pts)? {
                 // A decoded IDR re-establishes a valid decode point.

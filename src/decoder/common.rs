@@ -81,11 +81,13 @@ pub(crate) struct SessionPlan {
     pub picture_format: vk::Format,
     pub bit_depth: BitDepth,
     pub pixel_format: PixelFormat,
-    /// DPB slots: references, the picture being decoded, and `output_slots`.
+    /// DPB slots: references, the picture being decoded, and `spare_slots`.
     pub slot_count: usize,
-    /// How many of `slot_count` are spare capacity for pinned output frames.
-    /// Zero means decode-order output has to be copied instead of pinned.
-    pub output_slots: usize,
+    /// How many of `slot_count` are spare capacity for pictures pinned past the
+    /// decode that produced them: those held for display-order reordering, and
+    /// those handed to the caller. Zero means every emitted picture has to be
+    /// copied out instead of pinned in place.
+    pub spare_slots: usize,
     /// References the driver may use for a single picture, which is
     /// `slot_count` minus the current picture and the output reservation.
     pub max_active_references: u32,
@@ -125,8 +127,8 @@ pub(crate) struct DecodeSession {
     /// True when the driver decodes into the DPB image directly; false when a
     /// distinct output image is required.
     pub coincide: bool,
-    /// Spare DPB slots available for pinning handed-out frames.
-    pub output_slots: usize,
+    /// Spare DPB slots available for pinning pictures past their decode.
+    pub spare_slots: usize,
     /// Distinct decode output image, only when `!coincide`.
     pub output_image: Option<(vk::Image, vk::DeviceMemory, vk::ImageView)>,
 }
@@ -327,7 +329,7 @@ impl DecoderCommon {
             dpb_slot_active: vec![false; plan.slot_count],
             use_layered_dpb: plan.use_layered_dpb,
             coincide: plan.coincide,
-            output_slots: plan.output_slots,
+            spare_slots: plan.spare_slots,
             output_image,
         });
         Ok(())

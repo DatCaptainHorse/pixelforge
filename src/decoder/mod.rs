@@ -16,12 +16,12 @@
 //!   stream's own parameter sets, so no dimensions or profile need to be
 //!   configured up front. Mid-stream resolution changes recreate the session
 //!   transparently.
-//! - **Display order by default**: frames come out in presentation order (see
-//!   [`OutputOrder`]); drain the reorder buffer with [`Decoder::flush`] at end
-//!   of stream. Streams without B-frames add no latency. Switch to
-//!   [`OutputOrder::Decode`] for the lowest-latency decode-order output.
-//! - **Zero-copy output**: in [`OutputOrder::Decode`] a [`DecodedFrame`] is the
-//!   decoder's own DPB image, pinned until the frame is dropped. See
+//! - **Display order**: frames come out in presentation order; drain the
+//!   reorder buffer with [`Decoder::flush`] at end of stream. Streams without
+//!   B-frames buffer nothing and add no latency.
+//! - **Zero-copy output**: a [`DecodedFrame`] is the decoder's own DPB image,
+//!   pinned until the frame is dropped. Reordering holds pins rather than
+//!   copying pictures out, so display order costs no copy either. See
 //!   [`DecodedFrame`] for validity rules and what holding one costs.
 //!
 //! # Limitations (H.264)
@@ -51,23 +51,6 @@ use crate::error::{PixelForgeError, Result};
 use crate::vulkan::VideoContext;
 use ash::vk;
 
-/// The order in which [`Decoder::decode`] returns frames.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum OutputOrder {
-    /// Presentation order (default). Frames come out sorted by
-    /// [`display_order`](DecodedFrame::display_order), matching how a player
-    /// would show them. The decoder buffers a bounded number of frames (the
-    /// stream's own reorder depth), so call [`Decoder::flush`] at end of stream
-    /// to drain the rest. For streams without B-frames this adds no latency and
-    /// behaves like [`Self::Decode`].
-    Display,
-    /// Decode order: frames are returned the moment their GPU work completes,
-    /// the lowest-latency option, and without copying the picture out of the
-    /// DPB. With B-frames the caller must reorder by
-    /// [`DecodedFrame::display_order`] if presentation order matters.
-    Decode,
-}
-
 /// How many decoded frames the caller may hold at once, by default.
 ///
 /// Matches the encoder's pipeline depth: enough to overlap consuming one frame
@@ -80,50 +63,39 @@ pub const DEFAULT_OUTPUT_DEPTH: usize = 2;
 pub struct DecodeConfig {
     /// The codec to decode.
     pub codec: Codec,
-    /// The order frames are returned in. Defaults to [`OutputOrder::Display`].
-    pub output_order: OutputOrder,
     /// How many decoded frames the caller may hold at once. Defaults to
     /// [`DEFAULT_OUTPUT_DEPTH`]. See [`DecodeConfig::with_output_depth`].
     pub output_depth: usize,
 }
 
 impl DecodeConfig {
-    /// Create an H.264 decode configuration (display-order output).
+    /// Create an H.264 decode configuration.
     pub fn h264() -> Self {
         Self {
             codec: Codec::H264,
-            output_order: OutputOrder::Display,
             output_depth: DEFAULT_OUTPUT_DEPTH,
         }
     }
 
     /// How many decoded frames the caller may hold at once.
     ///
-    /// In [`OutputOrder::Decode`] a frame is the decoder's own DPB image, so
-    /// holding one keeps a DPB slot reserved. The decoder allocates this many
-    /// slots beyond what the stream's reference count needs, and
-    /// [`Decoder::decode`] blocks once every one of them is held, until a frame
-    /// is dropped. Raise it to let a consumer fall further behind, at the cost
-    /// of one decoded picture's worth of memory per slot.
+    /// A frame is the decoder's own DPB image, so holding one keeps a DPB slot
+    /// reserved. The decoder allocates this many slots beyond what the stream's
+    /// references and reorder depth need, and [`Decoder::decode`] blocks once
+    /// every one of them is held, until a frame is dropped. Raise it to let a
+    /// consumer fall further behind, at the cost of one decoded picture's worth
+    /// of memory per slot.
     ///
     /// Clamped to what the device's DPB slot limit allows for the stream. If
-    /// nothing is left over, decode-order frames fall back to a copy rather
-    /// than failing, exactly like [`OutputOrder::Display`] always does.
+    /// nothing is left over, frames fall back to a copy rather than failing.
     ///
-    /// This also bounds how many [`DecodeFuture`]s a decode-order caller can
-    /// usefully keep in flight: an unresolved future holds the frames it will
-    /// deliver, and each of those holds a slot. Keeping more batches pending
-    /// than there are output slots makes [`Decoder::decode`] wait for a frame
-    /// only the caller can release, so keep the two numbers in step.
+    /// This also bounds how many [`DecodeFuture`]s can usefully be kept in
+    /// flight: an unresolved future holds the frames it will deliver, and each
+    /// of those holds a slot. Keeping more batches pending than there are
+    /// output slots makes [`Decoder::decode`] wait for a frame only the caller
+    /// can release, so keep the two numbers in step.
     pub fn with_output_depth(mut self, depth: usize) -> Self {
         self.output_depth = depth;
-        self
-    }
-
-    /// Return frames in decode order for lowest latency, rather than sorting
-    /// them into presentation order. See [`OutputOrder`].
-    pub fn with_decode_order(mut self) -> Self {
-        self.output_order = OutputOrder::Decode;
         self
     }
 }
@@ -138,11 +110,11 @@ impl DecodeConfig {
 ///
 /// Two consequences worth planning for:
 ///
-/// - Holding frames costs the decoder something. In [`OutputOrder::Decode`] the
-///   image *is* a DPB slot (no copy), so a held frame reserves one of the
+/// - Holding frames costs the decoder something. The image *is* a DPB slot (no
+///   copy), so a held frame reserves one of the
 ///   [`DecodeConfig::with_output_depth`] spare slots, and [`Decoder::decode`]
-///   blocks once they are all held. In [`OutputOrder::Display`] frames are pool
-///   copies, so holding them grows the pool instead of blocking.
+///   blocks once they are all held. Drop frames promptly: that is what keeps
+///   the decoder running, and it is the pipeline's back-pressure.
 /// - Drop every frame before the [`Decoder`], and before feeding a stream that
 ///   changes resolution (which rebuilds the session and its images). The
 ///   decoder warns rather than leaving handles silently dangling.
@@ -180,8 +152,7 @@ pub struct DecodedFrame {
     /// Position of this frame in presentation order within the current coded
     /// video sequence: the codec's own ordering value (H.26x picture order
     /// count, AV1 order hint). Only the relative ordering carries meaning, and
-    /// it restarts at every keyframe. In [`OutputOrder::Decode`] mode, sort by
-    /// this for presentation order.
+    /// it restarts at every keyframe. Frames are already emitted sorted by it.
     pub display_order: i32,
     /// Whether this frame is a keyframe: a random-access point starting a new
     /// coded video sequence (H.264 IDR, H.265 IRAP, AV1 key frame).
@@ -311,11 +282,10 @@ impl Decoder {
     /// futures in flight to overlap parsing and submission with GPU decode, the
     /// same way [`Encoder::encode`](crate::encoder::Encoder::encode) is used.
     ///
-    /// Frames come back in the configured [`OutputOrder`] (display order by
-    /// default). In display order the count per call varies, since a picture may
-    /// be held back until later ones are decoded, so drain the remainder with
-    /// [`flush`](Self::flush) at end of stream. In decode order it is usually
-    /// zero or one frame per coded frame fed.
+    /// Frames come back in presentation order. The count per call varies, since
+    /// a picture may be held back until later ones are decoded, so drain the
+    /// remainder with [`flush`](Self::flush) at end of stream. A stream without
+    /// B-frames holds nothing back and yields one frame per coded frame fed.
     ///
     /// This call blocks in one case: when every output slot is held by a frame
     /// the caller has not dropped. See
@@ -329,7 +299,7 @@ impl Decoder {
     /// Call once after the last [`decode`](Self::decode) to emit the tail of
     /// the stream. Frames come back in presentation order, through a future that
     /// resolves behind every decode already in flight. Harmless (resolves empty)
-    /// in decode-order mode.
+    /// for a stream that held nothing back.
     pub fn flush(&mut self) -> Result<DecodeFuture> {
         self.0.flush()
     }
