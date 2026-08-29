@@ -13,6 +13,10 @@
 //! in decode order on the GPU. A timeline semaphore enforces that: each decode
 //! waits on the previous decode's value and signals its own.
 //!
+//! A decode also waits on the previous copy, because the two share the DPB in
+//! the other direction: a copy reads a slot, and that slot can be reallocated
+//! to the next picture as soon as the picture in it stops being a reference.
+//!
 //! The reorder copy runs on the *transfer* queue, because a dedicated video
 //! decode queue need not support transfer operations (it does not on RADV), so
 //! it cannot be recorded into the decode command buffer. It gets a timeline of
@@ -270,10 +274,22 @@ impl DecodePipeline {
 
         // A timeline wait on value 0 is satisfied immediately, so the first
         // submission needs no special case.
-        let waits = [vk::SemaphoreSubmitInfo::default()
-            .semaphore(semaphore)
-            .value(self.decodes.last_value())
-            .stage_mask(vk::PipelineStageFlags2::VIDEO_DECODE_KHR)];
+        let waits = [
+            // The previous decode, which shares the DPB.
+            vk::SemaphoreSubmitInfo::default()
+                .semaphore(semaphore)
+                .value(self.decodes.last_value())
+                .stage_mask(vk::PipelineStageFlags2::VIDEO_DECODE_KHR),
+            // The previous copy. A copy reads a DPB slot, and a slot holding a
+            // non-reference picture is free the moment that picture is done, so
+            // the next decode may be handed the very slot a copy is still
+            // reading. Without this the decode overwrites it mid-copy and the
+            // caller gets a frame with a later picture's contents.
+            vk::SemaphoreSubmitInfo::default()
+                .semaphore(self.copies.semaphore())
+                .value(self.copies.last_value())
+                .stage_mask(vk::PipelineStageFlags2::VIDEO_DECODE_KHR),
+        ];
         let signals = [vk::SemaphoreSubmitInfo::default()
             .semaphore(semaphore)
             .value(signal_value)
