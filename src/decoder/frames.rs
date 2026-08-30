@@ -164,9 +164,9 @@ enum PoolState {
 
 /// One pooled image, sized to the picture it currently holds.
 ///
-/// No image view: the pool image is only ever a copy target and a `download`
-/// source, neither of which needs one, and a valid multi-planar view would
-/// require video-decode usage that some drivers do not allow here.
+/// No image view: pixelforge only ever writes to a pool image, and a consumer
+/// reading one needs a view built for how they intend to read it (a sampled
+/// multi-planar view needs a ycbcr conversion, a copy needs no view at all).
 struct PoolImage {
     image: vk::Image,
     memory: vk::DeviceMemory,

@@ -2,8 +2,8 @@
 //!
 //! Everything that is identical across H.264, H.265 and AV1 lives here: the
 //! shared per-decoder state ([`DecoderCommon`]), the Vulkan video session and
-//! its DPB images ([`DecodeSession`]), coded-data staging, and the readback
-//! path that copies a decoded picture back to the host.
+//! its DPB images ([`DecodeSession`]), coded-data staging, and the copy that
+//! gets a picture out of the DPB where it cannot be handed over in place.
 //!
 //! A codec supplies only its differences: parsing its bitstream into pictures,
 //! reconstructing the reference state the encoder implied, and building the
@@ -164,8 +164,8 @@ impl DecodeSession {
 
 /// Per-decoder state shared by every codec.
 ///
-/// Holds the Vulkan video session, the DPB images, the coded-data staging
-/// buffer and the readback path — none of which differ between codecs.
+/// Holds the Vulkan video session, the DPB images and the coded-data staging
+/// buffer — none of which differ between codecs.
 /// Codec-specific state (parameter sets, POC, reference marking) lives in the
 /// codec instead.
 pub(crate) struct DecoderCommon {
@@ -190,9 +190,6 @@ pub(crate) struct DecoderCommon {
     /// Required alignment of bitstream buffer offsets/ranges.
     pub bitstream_offset_alignment: u64,
     pub bitstream_size_alignment: u64,
-
-    /// Readback buffer for `download`, allocated on first use.
-    pub readback: Option<(vk::Buffer, vk::DeviceMemory, usize)>,
 
     /// The active session, created lazily from the stream's parameter sets.
     pub session: Option<DecodeSession>,
@@ -245,7 +242,6 @@ impl DecoderCommon {
             pipeline,
             bitstream_offset_alignment: 1,
             bitstream_size_alignment: 1,
-            readback: None,
             session: None,
             slot_pins: Arc::new(SlotPins::default()),
             frames_rx: Some(frames_rx),
@@ -597,10 +593,6 @@ impl Drop for DecoderCommon {
         self.destroy_session();
         unsafe {
             self.context.device().device_wait_idle().ok();
-            if let Some((buffer, memory, _)) = self.readback.take() {
-                self.context.device().destroy_buffer(buffer, None);
-                self.context.device().free_memory(memory, None);
-            }
             let device = self.context.device().clone();
             self.pipeline.destroy(&device);
             self.context

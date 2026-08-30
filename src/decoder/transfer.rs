@@ -29,8 +29,9 @@ impl DecoderCommon {
     /// transfer is needed.
     ///
     /// The source's layout is restored afterward so a DPB image stays usable as
-    /// a reference; the destination is left in `TRANSFER_DST_OPTIMAL` (reported
-    /// as the pooled frame's layout, which `download` then transitions from).
+    /// a reference. The destination is left in `TRANSFER_DST_OPTIMAL`, which is
+    /// what the frame reports as its layout, so a consumer knows to transition
+    /// it before reading.
     pub fn record_picture_copy(&self, frame: &DecodedPicture, dst_image: vk::Image) -> Result<()> {
         let command_buffer = self.pipeline.current().transfer_command_buffer;
         let base_layer = frame.array_layer;
