@@ -13,7 +13,7 @@ use crate::decoder::h264::dpb::{DecodeDpb, PictureState};
 use crate::decoder::h264::parser::{
     self, NalType, NalUnit, Pps, SliceHeader, SliceType, Sps, iter_nal_units,
 };
-use crate::decoder::{DecodeConfig, Framing};
+use crate::decoder::{DecodeConfig, DecodeStatus, Framing};
 use crate::encoder::{BitDepth, PixelFormat};
 use crate::error::{PixelForgeError, Result};
 use crate::video::{align_up, get_video_format, query_supported_video_formats};
@@ -69,6 +69,15 @@ pub(crate) struct H264Decoder {
     awaiting_keyframe: bool,
 }
 
+/// What `group_slices` did with a slice.
+enum Grouped {
+    /// Attached to a picture, new or existing.
+    Added,
+    /// Skipped: the parameter sets it needs have not been seen, so the stream
+    /// was joined after they were sent. The reason names which.
+    NeedsParameterSets(String),
+}
+
 /// The slices making up one picture, gathered from the input.
 struct Picture<'a> {
     header: SliceHeader,
@@ -108,13 +117,9 @@ impl H264Decoder {
         if !self.carry.is_empty() {
             let tail = std::mem::take(&mut self.carry);
             let pts = self.carry_pts;
-            match self.decode_frames(&tail, pts) {
-                Ok(()) => {}
-                // A tail that cannot be decoded is not worth failing over: the
-                // frames already decoded still have to come out.
-                Err(PixelForgeError::NeedsKeyframe(_)) => {}
-                Err(e) => return Err(e),
-            }
+            // A tail that cannot be decoded is not worth failing over: the
+            // frames already decoded still have to come out.
+            self.decode_frames(&tail, pts)?;
         }
         let frames = self.reorder.flush();
         self.common.finish_stream(frames);
@@ -575,13 +580,12 @@ impl H264Decoder {
                     self.pps_map.insert(pps.pps_id, pps);
                 }
                 t if t.is_slice() => {
-                    match group_slices(&mut pictures, &nal, &self.sps_map, &self.pps_map) {
-                        Ok(()) => {}
+                    match group_slices(&mut pictures, &nal, &self.sps_map, &self.pps_map)? {
+                        Grouped::Added => {}
                         // Missing parameter sets: skip the slice, remember why.
-                        Err(PixelForgeError::NeedsKeyframe(reason)) => {
+                        Grouped::NeedsParameterSets(reason) => {
                             awaiting.get_or_insert(reason);
                         }
-                        Err(e) => return Err(e),
                     }
                 }
                 // SEI, AUD, and everything else is not needed by the driver.
@@ -593,7 +597,7 @@ impl H264Decoder {
     }
 
     /// Decode a chunk of input, doing the framing the configuration calls for.
-    pub(crate) fn decode(&mut self, data: &[u8], pts: u64) -> Result<()> {
+    pub(crate) fn decode(&mut self, data: &[u8], pts: u64) -> Result<DecodeStatus> {
         match self.framing {
             // The caller guarantees the chunk ends on a picture boundary, so it
             // can go straight to the decoder with no buffering and no copy.
@@ -608,7 +612,7 @@ impl H264Decoder {
     /// everything up to the last picture start is complete and decodable, and
     /// everything from it onward is held over for the next call. `flush` ends
     /// the final picture.
-    fn decode_byte_stream(&mut self, data: &[u8], pts: u64) -> Result<()> {
+    fn decode_byte_stream(&mut self, data: &[u8], pts: u64) -> Result<DecodeStatus> {
         let carried = self.carry.len();
         let mut buffer = std::mem::take(&mut self.carry);
         buffer.extend_from_slice(data);
@@ -620,7 +624,8 @@ impl H264Decoder {
         let result = if split > 0 {
             self.decode_frames(&buffer[..split], self.carry_pts)
         } else {
-            Ok(())
+            // Not enough bytes to complete a picture yet.
+            Ok(DecodeStatus::Buffered)
         };
 
         // The held-over picture is timestamped by the call its first byte came
@@ -639,7 +644,7 @@ impl H264Decoder {
     /// Frames go to the consumer as each picture's work is handed to the
     /// completion thread, so a call decoding many pictures does not hold their
     /// frames until it returns.
-    fn decode_frames(&mut self, data: &[u8], pts: u64) -> Result<()> {
+    fn decode_frames(&mut self, data: &[u8], pts: u64) -> Result<DecodeStatus> {
         // What is missing when a picture cannot be decoded yet; set only while
         // no frame has been produced, so a keyframe later in the same buffer
         // still yields output. Seeded with slices skipped during splitting for
@@ -699,16 +704,16 @@ impl H264Decoder {
             }
         }
 
-        // Only surface the keyframe request when nothing was decoded: if a
-        // keyframe arrived later in the same buffer, its pictures take priority.
-        if !decoded_any && let Some(reason) = awaiting {
-            return Err(PixelForgeError::NeedsKeyframe(format!(
-                "H.264 decode: {}",
-                reason
-            )));
+        if decoded_any {
+            return Ok(DecodeStatus::Decoded);
         }
-
-        Ok(())
+        // Only ask for a keyframe when nothing was decoded: if one arrived
+        // later in the same buffer, its pictures take priority.
+        if let Some(reason) = awaiting {
+            debug!("H.264 decode: awaiting keyframe: {}", reason);
+            return Ok(DecodeStatus::NeedsKeyframe);
+        }
+        Ok(DecodeStatus::Buffered)
     }
 
     /// Record and submit the decode of a single picture, and wait for it.
@@ -1066,7 +1071,7 @@ fn group_slices<'a>(
     nal: &NalUnit<'a>,
     sps_map: &HashMap<u8, Sps>,
     pps_map: &HashMap<u8, Pps>,
-) -> Result<()> {
+) -> Result<Grouped> {
     // Peek the header to find the picture this slice belongs to.
     // Peek just far enough to find which PPS (and hence SPS) applies.
     let mut probe = crate::decoder::bitreader::BitReader::new(nal.payload());
@@ -1076,12 +1081,18 @@ fn group_slices<'a>(
 
     // Missing parameter sets: we joined the stream before they were sent. Not a
     // fault — signal that a keyframe (which carries fresh sets) is needed.
-    let pps = pps_map.get(&pps_id).ok_or_else(|| {
-        PixelForgeError::NeedsKeyframe(format!("PPS {} not yet received", pps_id))
-    })?;
-    let sps = sps_map.get(&pps.sps_id).ok_or_else(|| {
-        PixelForgeError::NeedsKeyframe(format!("SPS {} not yet received", pps.sps_id))
-    })?;
+    let Some(pps) = pps_map.get(&pps_id) else {
+        return Ok(Grouped::NeedsParameterSets(format!(
+            "PPS {} not yet received",
+            pps_id
+        )));
+    };
+    let Some(sps) = sps_map.get(&pps.sps_id) else {
+        return Ok(Grouped::NeedsParameterSets(format!(
+            "SPS {} not yet received",
+            pps.sps_id
+        )));
+    };
 
     let header = parser::parse_slice_header(nal, sps, pps)?;
     let is_intra = matches!(header.slice_type, SliceType::I | SliceType::Si);
@@ -1118,7 +1129,7 @@ fn group_slices<'a>(
         picture.is_intra &= is_intra;
         picture.slices.push(nal.data);
     }
-    Ok(())
+    Ok(Grouped::Added)
 }
 
 fn std_profile_idc(profile_idc: u8) -> Result<ash::vk::native::StdVideoH264ProfileIdc> {
@@ -1184,6 +1195,44 @@ fn std_level_idc(level_idc: u8) -> ash::vk::native::StdVideoH264LevelIdc {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Joining a stream after its parameter sets were sent must be reported as
+    /// needing a keyframe, not as a failure and not by silently decoding
+    /// garbage. This is the ordinary case for a client that connects to a live
+    /// stream partway through, and it is what `DecodeStatus::NeedsKeyframe`
+    /// exists to say.
+    #[test]
+    fn slices_without_parameter_sets_ask_for_a_keyframe() {
+        let data: &[u8] = include_bytes!("../../../tests/data/bframes.264");
+
+        // Deliberately empty: the SPS and PPS went past before we tuned in.
+        let sps_map = HashMap::new();
+        let pps_map = HashMap::new();
+        let mut pictures: Vec<Picture> = Vec::new();
+
+        let mut slices = 0usize;
+        for nal in parser::iter_nal_units(data) {
+            if !nal.nal_type.is_slice() {
+                continue;
+            }
+            slices += 1;
+            match group_slices(&mut pictures, &nal, &sps_map, &pps_map).unwrap() {
+                Grouped::NeedsParameterSets(reason) => {
+                    assert!(
+                        reason.contains("PPS"),
+                        "should name the missing parameter set, got {reason:?}"
+                    );
+                }
+                Grouped::Added => panic!("a slice was grouped with no parameter sets to group it"),
+            }
+        }
+
+        assert!(slices > 0, "fixture should contain slices");
+        assert!(
+            pictures.is_empty(),
+            "no picture can be formed without parameter sets"
+        );
+    }
 
     /// Group the slices of a real multi-slice stream (4 slices per picture,
     /// generated by `x264 --slices 4`). Exercises `group_slices` without a GPU.

@@ -151,7 +151,9 @@
 //!     let stream: Vec<u8> = std::fs::read("input.264")?;
 //!
 //!     for (i, chunk) in stream.chunks(64 * 1024).enumerate() {
-//!         decoder.decode(chunk, i as u64)?;
+//!         // The status says what happened; an `Err` means something is
+//!         // actually wrong. Joining a stream partway through is not.
+//!         let _status = decoder.decode(chunk, i as u64)?;
 //!         // Take what the GPU has finished with; `Pending` just means "not yet".
 //!         while let FramePoll::Frame(frame) = decoder.try_next_frame()? {
 //!             // `frame.image` is a decoder-owned GPU image, valid until dropped.
@@ -275,7 +277,7 @@ pub(crate) const fn align4(size: usize) -> usize {
 
 pub use converter::{ColorConverter, ColorConverterConfig, ColorSpace, InputFormat, OutputFormat};
 pub use decoder::{
-    DecodeConfig, DecodeSink, DecodeSource, DecodedFrame, Decoder, FramePoll, Framing,
+    DecodeConfig, DecodeSink, DecodeSource, DecodeStatus, DecodedFrame, Decoder, FramePoll, Framing,
 };
 pub use encoder::{
     BitDepth as EncodeBitDepth, Codec, ColorDescription, DEFAULT_FRAME_RATE, DEFAULT_GOP_SIZE,

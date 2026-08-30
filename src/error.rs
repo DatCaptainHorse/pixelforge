@@ -41,17 +41,6 @@ pub enum PixelForgeError {
     #[error("Invalid input: {0}")]
     InvalidInput(String),
 
-    /// The decoder cannot proceed until it sees a keyframe (IDR).
-    ///
-    /// Returned by `decode` for pictures that reference decode state not yet
-    /// established — parameter sets or reference pictures that have not been
-    /// seen, which is the normal situation when joining a stream mid-flight or
-    /// recovering from loss. It is a routine control-flow signal, not a fault:
-    /// the caller should request an IDR from the sender and keep going, not log
-    /// it as an error. `{0}` describes what was missing.
-    #[error("Awaiting keyframe: {0}")]
-    NeedsKeyframe(String),
-
     /// Codec not supported.
     #[error("Codec not supported: {0}")]
     CodecNotSupported(String),

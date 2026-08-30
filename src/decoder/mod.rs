@@ -260,12 +260,37 @@ pub struct DecodedFrame {
     pub(crate) pin: Option<frames::FramePin>,
 }
 
+/// What a [`DecodeSink::decode`] call did with the data it was given.
+///
+/// None of these is a failure. Joining a stream mid-flight, or losing packets,
+/// routinely produces data that cannot be decoded yet, and a caller has to keep
+/// going rather than treat it as an error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DecodeStatus {
+    /// At least one picture was decoded. Its frames will appear on the
+    /// [`DecodeSource`] once the GPU has finished with them.
+    Decoded,
+    /// Nothing to decode yet. The data held no complete coded frame, which is
+    /// the normal state of affairs in [`Framing::ByteStream`] when a chunk ends
+    /// mid-picture, and of a chunk carrying only parameter sets.
+    Buffered,
+    /// Nothing can be decoded until a keyframe arrives.
+    ///
+    /// Pictures were present but reference decode state that does not exist:
+    /// parameter sets or reference pictures that were never seen, which is what
+    /// joining a stream mid-flight or losing packets looks like. A live client
+    /// should ask the sender for a keyframe (an RTP receiver would send a PLI)
+    /// and keep feeding; the decoder recovers on its own once one arrives. The
+    /// reason is logged at debug level.
+    NeedsKeyframe,
+}
+
 /// Receiving half of the decoder's frame channel.
 pub(crate) type FrameReceiver = futures_channel::mpsc::UnboundedReceiver<Result<DecodedFrame>>;
 
 /// The codec-erased operations every codec decoder exposes.
 trait DecoderApi: Send {
-    fn decode(&mut self, data: &[u8], pts: u64) -> Result<()>;
+    fn decode(&mut self, data: &[u8], pts: u64) -> Result<DecodeStatus>;
     fn finish(&mut self) -> Result<()>;
     fn take_frame_receiver(&mut self) -> Option<FrameReceiver>;
     fn picture_format(&self) -> Option<vk::Format>;
@@ -365,7 +390,7 @@ impl Decoder {
     }
 
     /// Feed coded bytes. See [`DecodeSink::decode`].
-    pub fn decode(&mut self, data: &[u8], pts: u64) -> Result<()> {
+    pub fn decode(&mut self, data: &[u8], pts: u64) -> Result<DecodeStatus> {
         self.sink.decode(data, pts)
     }
 
@@ -410,10 +435,11 @@ impl DecodeSink {
     /// Frames appear on the [`DecodeSource`] as they complete, so this call
     /// yields no frames of its own and the two halves can run independently.
     ///
-    /// A picture that cannot be decoded because the stream was joined
-    /// mid-sequence returns [`PixelForgeError::NeedsKeyframe`], which a live
-    /// client can turn into a keyframe request.
-    pub fn decode(&mut self, data: &[u8], pts: u64) -> Result<()> {
+    /// The [`DecodeStatus`] says what happened to the data. An `Err` means
+    /// something actually went wrong; data that merely cannot be decoded yet,
+    /// which is the normal case when joining a stream or recovering from loss,
+    /// comes back as [`DecodeStatus::NeedsKeyframe`] instead.
+    pub fn decode(&mut self, data: &[u8], pts: u64) -> Result<DecodeStatus> {
         self.inner.decode(data, pts)
     }
 

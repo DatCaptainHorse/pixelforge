@@ -13,7 +13,7 @@ mod parser_tests;
 mod dpb;
 mod session;
 
-use crate::decoder::FrameReceiver;
+use crate::decoder::{DecodeStatus, FrameReceiver};
 use crate::error::Result;
 use ash::vk;
 
@@ -59,7 +59,7 @@ pub(crate) fn complete_prefix(buffer: &[u8]) -> usize {
 }
 
 impl crate::decoder::DecoderApi for H264Decoder {
-    fn decode(&mut self, data: &[u8], pts: u64) -> Result<()> {
+    fn decode(&mut self, data: &[u8], pts: u64) -> Result<DecodeStatus> {
         H264Decoder::decode(self, data, pts)
     }
 

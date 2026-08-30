@@ -21,6 +21,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   consumer can run on their own threads. `DecodeSource::next_frame` awaits the
   next frame and `try_next_frame` takes one only if it is ready. Measured
   10-21% higher decode throughput than the previous synchronous decoder.
+- `DecodeSink::decode` returns a `DecodeStatus` (`Decoded`, `Buffered` or
+  `NeedsKeyframe`) rather than reporting a missing keyframe as an error. Data
+  that cannot be decoded yet is the normal state of affairs when joining a live
+  stream or recovering from loss, so it is no longer something a caller has to
+  filter out of their error handling. `PixelForgeError::NeedsKeyframe` is gone.
 - `DecodeSink::finish` ends a stream: it decodes whatever framing still holds
   back, emits the frames reordering held back, and closes the source.
 - Zero-copy output in presentation order: a decoded picture is never copied on

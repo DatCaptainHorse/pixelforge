@@ -127,7 +127,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Feed a chunk, then take whatever has become ready; `Pending` means the
     // GPU is still working, so those frames are collected on a later pass.
     for (i, chunk) in bitstream.chunks(CHUNK_SIZE).enumerate() {
-        decoder.decode(chunk, i as u64)?;
+        let _ = decoder.decode(chunk, i as u64)?;
         while let FramePoll::Frame(frame) = decoder.try_next_frame()? {
             write(&frame, &mut readback, &mut out, &mut decoded_count)?;
         }

@@ -26,7 +26,7 @@ use std::fs::File;
 use std::io::Write;
 
 use ash::vk::{self, TaggedStructure as _};
-use pixelforge::decoder::{DecodeConfig, DecodedFrame, Decoder, FramePoll};
+use pixelforge::decoder::{DecodeConfig, DecodeStatus, DecodedFrame, Decoder, FramePoll};
 use pixelforge::encoder::Codec;
 use pixelforge::vulkan::{VideoContext, VideoContextBuilder};
 
@@ -95,10 +95,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     for (i, chunk) in stream.chunks(CHUNK_SIZE).enumerate() {
-        match decoder.decode(chunk, i as u64) {
-            Ok(()) => {}
-            Err(pixelforge::error::PixelForgeError::NeedsKeyframe(_)) => continue,
-            Err(e) => return Err(e.into()),
+        match decoder.decode(chunk, i as u64)? {
+            DecodeStatus::Decoded | DecodeStatus::Buffered => {}
+            // Joining mid-stream, or recovering from loss. A live client would
+            // ask the sender for an IDR here and carry on; the decoder picks up
+            // by itself once one arrives.
+            DecodeStatus::NeedsKeyframe => continue,
         }
         while let FramePoll::Frame(frame) = decoder.try_next_frame()? {
             consume(&frame, &mut sampler, &mut output, &mut count)?;
