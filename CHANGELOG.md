@@ -14,9 +14,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Vulkan session is created from the stream's own parameter sets and a mid-stream
   resolution change is handled transparently. Verified byte-identical to
   `ffmpeg -pix_fmt nv12` on AMD (RADV), NVIDIA and Intel (ANV).
-- Asynchronous decoding: `Decoder::decode` and `Decoder::flush` submit without
-  waiting and return a `DecodeFuture`, mirroring `Encoder::encode`. Measured
-  10-21% higher decode throughput depending on GPU and resolution.
+- Asynchronous decoding, split into a sink and a source. `DecodeSink::decode`
+  submits without waiting; frames arrive on a `DecodeSource` as the GPU
+  finishes with them, in presentation order. `Decoder` holds both halves for
+  single-threaded use, and `Decoder::split` separates them so a producer and a
+  consumer can run on their own threads. `DecodeSource::next_frame` awaits the
+  next frame and `try_next_frame` takes one only if it is ready. Measured
+  10-21% higher decode throughput than the previous synchronous decoder.
+- `DecodeSink::finish` ends a stream: it decodes whatever framing still holds
+  back, emits the frames reordering held back, and closes the source.
 - Zero-copy output in presentation order: a decoded picture is never copied on
   its way to the caller. A picture waiting its turn in display order stays
   pinned in the DPB slot it was decoded into, and that pin passes to the
@@ -24,6 +30,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stream fall back to copying rather than failing.
 - `DecodeConfig::with_output_depth` reserves DPB slots so decoded frames can be
   held while decoding continues.
+- Host readback and `copy_frame_to_planes` are gone. A `DecodedFrame` is a GPU
+  image the consumer owns until they drop it, and what to do with it is theirs
+  to decide; `examples/common` shows one way to read one back.
 - Decoded pictures are created with `SAMPLED` usage where the device allows it,
   so a renderer can read a `DecodedFrame` in a shader instead of copying it out
   first. `DecodedFrame::sampleable` reports whether it worked.

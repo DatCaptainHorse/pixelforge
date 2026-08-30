@@ -13,8 +13,7 @@ mod parser_tests;
 mod dpb;
 mod session;
 
-use crate::decoder::pipeline::DecodeFuture;
-use crate::decoder::{DecodedFrame, DecodedFrameData};
+use crate::decoder::FrameReceiver;
 use crate::error::Result;
 use ash::vk;
 
@@ -60,25 +59,16 @@ pub(crate) fn complete_prefix(buffer: &[u8]) -> usize {
 }
 
 impl crate::decoder::DecoderApi for H264Decoder {
-    fn decode(&mut self, data: &[u8], pts: u64) -> Result<DecodeFuture> {
+    fn decode(&mut self, data: &[u8], pts: u64) -> Result<()> {
         H264Decoder::decode(self, data, pts)
     }
 
-    fn flush(&mut self) -> Result<DecodeFuture> {
-        H264Decoder::flush(self)
+    fn finish(&mut self) -> Result<()> {
+        H264Decoder::finish(self)
     }
 
-    fn download(&mut self, frame: &DecodedFrame) -> Result<DecodedFrameData> {
-        H264Decoder::download(self, frame)
-    }
-
-    fn copy_frame_to_planes(
-        &mut self,
-        frame: &DecodedFrame,
-        y_image: vk::Image,
-        uv_image: vk::Image,
-    ) -> Result<()> {
-        H264Decoder::copy_frame_to_planes(self, frame, y_image, uv_image)
+    fn take_frame_receiver(&mut self) -> Option<FrameReceiver> {
+        H264Decoder::take_frame_receiver(self)
     }
 
     fn picture_format(&self) -> Option<vk::Format> {

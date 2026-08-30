@@ -15,7 +15,10 @@ use std::io::Write;
 
 use ash::vk;
 use ash::vk::TaggedStructure;
-use pixelforge::decoder::{DecodeConfig, Decoder};
+mod common;
+use common::Readback;
+
+use pixelforge::decoder::{DecodeConfig, Decoder, FramePoll};
 use pixelforge::encoder::Codec;
 use pixelforge::vulkan::VideoContextBuilder;
 
@@ -86,14 +89,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // The decoder orders its pipelined submissions with timeline semaphores.
     let mut timeline =
         vk::PhysicalDeviceTimelineSemaphoreFeatures::default().timeline_semaphore(true);
-    let device_info = vk::DeviceCreateInfo::default()
+    // Unified image layouts are what let decoded frames be used in place, with
+    // no copy and no layout transition. `reqs` says whether this device can,
+    // and puts the extension in `reqs.extensions` when it can; both feature
+    // bits have to be enabled here, and pixelforge told with
+    // `declare_unified_image_layouts` below, because Vulkan cannot be asked
+    // afterwards which features a device was created with.
+    let mut unified = vk::PhysicalDeviceUnifiedImageLayoutsFeaturesKHR::default()
+        .unified_image_layouts(true)
+        .unified_image_layouts_video(true);
+    let mut device_info = vk::DeviceCreateInfo::default()
         .queue_create_infos(&queue_infos)
         .enabled_extension_names(&ext_ptrs)
         .push(&mut sync2)
         .push(&mut timeline);
+    if reqs.unified_image_layouts {
+        device_info = device_info.push(&mut unified);
+    }
     let device = unsafe { instance.create_device(physical_device, &device_info, None)? };
 
     // --- Hand the app's device to pixelforge ---
+    let builder = if reqs.unified_image_layouts {
+        builder.declare_unified_image_layouts()
+    } else {
+        println!("device has no unified image layouts; frames will be copied out");
+        builder
+    };
     let context = builder.build_from_existing_decode(
         entry.clone(),
         instance.clone(),
@@ -101,18 +122,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         device.clone(),
     )?;
 
-    let mut decoder = Decoder::new(context, DecodeConfig::h264().with_byte_stream())?;
     let stream = std::fs::read(&input_path)?;
     let mut output = output_path.as_ref().map(File::create).transpose()?;
+    let mut readback = output
+        .is_some()
+        .then(|| Readback::new(&context))
+        .transpose()?;
+    let mut decoder = Decoder::new(context, DecodeConfig::h264().with_byte_stream())?;
     let mut count = 0usize;
 
-    let write = |decoder: &mut Decoder,
-                 frame: &pixelforge::decoder::DecodedFrame,
+    let write = |frame: &pixelforge::decoder::DecodedFrame,
+                 readback: &mut Option<Readback>,
                  output: &mut Option<File>,
                  count: &mut usize|
      -> Result<(), Box<dyn std::error::Error>> {
-        if let Some(file) = output.as_mut() {
-            let data = decoder.download(frame)?;
+        if let (Some(file), Some(readback)) = (output.as_mut(), readback.as_mut()) {
+            let data = readback.read(frame)?;
             file.write_all(&data.y)?;
             file.write_all(&data.uv)?;
         }
@@ -120,21 +145,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Ok(())
     };
 
-    // A file is a raw byte stream that can cut anywhere, so let the decoder do
-    // the framing and feed it in fixed-size chunks, the way a socket delivers
-    // one. `flush` ends the final picture, which nothing follows.
+    // Feed a chunk, then take whatever has become ready; `Pending` means the
+    // GPU is still working, so those frames are collected on a later pass.
     for (i, chunk) in stream.chunks(CHUNK_SIZE).enumerate() {
-        for frame in pollster::block_on(decoder.decode(chunk, i as u64)?)? {
-            write(&mut decoder, &frame, &mut output, &mut count)?;
+        decoder.decode(chunk, i as u64)?;
+        while let FramePoll::Frame(frame) = decoder.try_next_frame()? {
+            write(&frame, &mut readback, &mut output, &mut count)?;
         }
     }
-    for frame in pollster::block_on(decoder.flush()?)? {
-        write(&mut decoder, &frame, &mut output, &mut count)?;
+    // End of stream: decodes the trailing picture, emits what reordering held
+    // back, and closes the source.
+    decoder.finish()?;
+    while let Some(frame) = pollster::block_on(decoder.next_frame())? {
+        write(&frame, &mut readback, &mut output, &mut count)?;
     }
     println!("Decoded {} frames on the adopted device", count);
 
-    // The context borrowed the device; drop it before we destroy the device.
+    // The context borrowed the device, so everything holding Vulkan objects has
+    // to go before the device does. That includes the readback helper, which
+    // owns a command pool, a fence and a staging buffer of its own.
     drop(decoder);
+    drop(readback);
     unsafe {
         device.destroy_device(None);
         instance.destroy_instance(None);

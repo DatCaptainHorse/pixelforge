@@ -27,20 +27,24 @@
 //!
 //! # Completion
 //!
-//! A single background *completion thread* waits on each batch's fence and
-//! resolves that batch's [`DecodeFuture`]. Only the calling thread ever touches
-//! a queue or a timeline; the completion thread only waits on fences and hands
-//! frames onward, so the two never race on the same Vulkan object.
+//! A single background *completion thread* waits on each picture's fence and
+//! then sends its frames onward, so they reach the consumer in decode order
+//! with the GPU work behind them already finished. Only the calling thread ever
+//! touches a queue or a timeline; the completion thread only waits on fences
+//! and forwards frames, so the two never race on the same Vulkan object.
+//!
+//! The frame channel is unbounded on purpose. Blocking the completion thread
+//! would stop it freeing pipeline slots, which would stall the very
+//! `decode` call that is producing the frames, and a single call can emit more
+//! frames than any fixed bound. Back-pressure lives in the DPB slot budget
+//! instead: past it, pictures are copied out rather than pinned.
 
-use std::future::Future;
-use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender};
-use std::task::{Context, Poll};
 use std::thread::JoinHandle;
 
 use ash::vk::{self, Handle};
-use futures_channel::oneshot;
+use futures_channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded};
 
 use crate::decoder::DecodedFrame;
 use crate::error::{PixelForgeError, Result};
@@ -59,36 +63,6 @@ pub(crate) const DECODE_PIPELINE_DEPTH: usize = 2;
 
 /// Initial size of a slot's coded-data staging buffer; grown on demand.
 const INITIAL_BITSTREAM_BUFFER_SIZE: usize = 1024 * 1024;
-
-/// A handle to the frames one batch of decode submissions will produce.
-///
-/// Returned by `Decoder::decode` and `Decoder::flush`, one per call. Awaiting it
-/// yields the frames that call emitted, once the GPU work it submitted has
-/// completed. Futures resolve in call order, so awaiting them in the order they
-/// were returned yields frames in the decoder's output order.
-///
-/// Dropping the future before it resolves is harmless, but it also drops the
-/// frames it was carrying, which releases their DPB slots and pool images.
-pub struct DecodeFuture {
-    rx: oneshot::Receiver<Result<Vec<DecodedFrame>>>,
-}
-
-impl Future for DecodeFuture {
-    type Output = Result<Vec<DecodedFrame>>;
-
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        match Pin::new(&mut self.rx).poll(cx) {
-            Poll::Ready(Ok(result)) => Poll::Ready(result),
-            // The sender is only dropped without sending during teardown.
-            Poll::Ready(Err(oneshot::Canceled)) => {
-                Poll::Ready(Err(PixelForgeError::Synchronization(
-                    "decode cancelled: decoder shut down before the frames were ready".to_string(),
-                )))
-            }
-            Poll::Pending => Poll::Pending,
-        }
-    }
-}
 
 /// All per-picture resources that must be private to a single in-flight decode.
 pub(crate) struct DecodeSlot {
@@ -109,21 +83,19 @@ pub(crate) struct DecodeSlot {
 
 /// One unit of work handed from the calling thread to the completion thread.
 ///
-/// A `decode` call submits one item per picture, then a final item carrying the
-/// sender. The completion thread accumulates frames across the items and
-/// resolves the future when it reaches the one holding the sender, so a call
-/// that decoded several pictures still yields a single batch of frames in
-/// order.
+/// A `decode` call submits one item per picture it decoded. Items are processed
+/// in order, so the frames they carry reach the consumer in the order the
+/// decoder emitted them.
 struct WorkItem {
     /// Slot to release once this item's work is finished. `None` for an item
-    /// that submitted nothing (the closing item of a batch).
+    /// that submitted nothing.
     slot_index: Option<usize>,
     /// Fence signalling this item's GPU work, if it submitted any.
     fence: Option<vk::Fence>,
-    /// Frames this item contributes to the batch.
+    /// Frames this item hands to the consumer.
     frames: Vec<DecodedFrame>,
-    /// Present on the last item of a batch: resolves that call's future.
-    result_tx: Option<oneshot::Sender<Result<Vec<DecodedFrame>>>>,
+    /// End of stream: after this item's frames, the consumer sees `None`.
+    end_of_stream: bool,
 }
 
 /// Rotating set of [`DecodeSlot`]s, the timelines that order their submissions,
@@ -141,7 +113,7 @@ pub(crate) struct DecodePipeline {
     last_fence: Option<vk::Fence>,
 
     slot_sync: Arc<SlotSync>,
-    /// Sends submitted batches to the completion thread. Dropped on shutdown.
+    /// Sends submitted work to the completion thread. Dropped on shutdown.
     work_tx: Option<Sender<WorkItem>>,
     completion_thread: Option<JoinHandle<()>>,
 }
@@ -149,11 +121,13 @@ pub(crate) struct DecodePipeline {
 impl DecodePipeline {
     /// Allocate the timelines, `DECODE_PIPELINE_DEPTH` slots and the completion
     /// thread. Staging buffers start empty and are sized on first use.
+    /// Also returns the receiving half of the frame channel, which is what a
+    /// [`DecodeSource`](crate::decoder::DecodeSource) reads from.
     pub(crate) fn new(
         context: &VideoContext,
         decode_pool: vk::CommandPool,
         transfer_pool: vk::CommandPool,
-    ) -> Result<Self> {
+    ) -> Result<(Self, UnboundedReceiver<Result<DecodedFrame>>)> {
         let device = context.device();
 
         let depth = DECODE_PIPELINE_DEPTH as u32;
@@ -180,23 +154,27 @@ impl DecodePipeline {
 
         let slot_sync = Arc::new(SlotSync::new(slots.len()));
         let (work_tx, work_rx) = std::sync::mpsc::channel::<WorkItem>();
+        let (frames_tx, frames_rx) = unbounded();
         let thread_device = device.clone();
         let thread_sync = slot_sync.clone();
         let completion_thread = std::thread::Builder::new()
             .name("pixelforge-decode-completion".to_string())
-            .spawn(move || run_completion_thread(thread_device, work_rx, thread_sync))
+            .spawn(move || run_completion_thread(thread_device, work_rx, thread_sync, frames_tx))
             .map_err(|e| PixelForgeError::CommandBuffer(format!("spawn completion thread: {e}")))?;
 
-        Ok(Self {
-            slots,
-            current_slot: 0,
-            decodes: TimelineChain::new(context)?,
-            copies: TimelineChain::new(context)?,
-            last_fence: None,
-            slot_sync,
-            work_tx: Some(work_tx),
-            completion_thread: Some(completion_thread),
-        })
+        Ok((
+            Self {
+                slots,
+                current_slot: 0,
+                decodes: TimelineChain::new(context)?,
+                copies: TimelineChain::new(context)?,
+                last_fence: None,
+                slot_sync,
+                work_tx: Some(work_tx),
+                completion_thread: Some(completion_thread),
+            },
+            frames_rx,
+        ))
     }
 
     pub(crate) fn current(&self) -> &DecodeSlot {
@@ -383,26 +361,20 @@ impl DecodePipeline {
             slot_index: Some(slot_index),
             fence,
             frames,
-            result_tx: None,
+            end_of_stream: false,
         });
         self.current_slot = (self.current_slot + 1) % self.slots.len();
     }
 
-    /// Close off a `decode`/`flush` call and take the future for its frames.
-    ///
-    /// `frames` are the ones emitted without any new submission of their own,
-    /// which is everything a flush produces. Frames already handed over by
-    /// [`Self::end_picture`] are accumulated by the completion thread and
-    /// delivered through the same future.
-    pub(crate) fn finish_batch(&mut self, frames: Vec<DecodedFrame>) -> DecodeFuture {
-        let (result_tx, rx) = oneshot::channel();
+    /// End the stream: deliver `frames`, then close the channel so the consumer
+    /// sees the end after everything already in flight.
+    pub(crate) fn finish_stream(&mut self, frames: Vec<DecodedFrame>) {
         self.send(WorkItem {
             slot_index: None,
             fence: None,
             frames,
-            result_tx: Some(result_tx),
+            end_of_stream: true,
         });
-        DecodeFuture { rx }
     }
 
     fn send(&self, work: WorkItem) {
@@ -451,37 +423,39 @@ impl DecodePipeline {
     }
 }
 
-/// Completion-thread body: wait for each item's fence, accumulate its frames,
-/// and resolve a call's future when its closing item arrives.
+/// Completion-thread body: wait for each item's fence, then send its frames on.
+///
+/// Sending happens *before* the slot is freed, so once every slot is free every
+/// frame has already been handed over. A dropped receiver makes the send a
+/// no-op, which drops the frames and releases their storage.
 fn run_completion_thread(
     device: ash::Device,
     work_rx: Receiver<WorkItem>,
     slot_sync: Arc<SlotSync>,
+    frames_tx: UnboundedSender<Result<DecodedFrame>>,
 ) {
-    let mut batch: Vec<DecodedFrame> = Vec::new();
-    let mut failure: Option<PixelForgeError> = None;
+    let mut frames_tx = Some(frames_tx);
 
     for work in work_rx {
         if let Some(fence) = work.fence
             && !fence.is_null()
         {
             let wait = unsafe { device.wait_for_fences(&[fence], true, u64::MAX) };
-            if let Err(e) = wait {
-                failure.get_or_insert(PixelForgeError::Synchronization(e.to_string()));
+            if let Err(e) = wait
+                && let Some(tx) = &frames_tx
+            {
+                let _ = tx.unbounded_send(Err(PixelForgeError::Synchronization(e.to_string())));
             }
         }
-        batch.extend(work.frames);
 
-        // Resolve *before* freeing the slot, so that once every slot is free
-        // every future has already been resolved. A dropped receiver makes the
-        // send a no-op, which also drops the frames and releases their storage.
-        if let Some(tx) = work.result_tx {
-            let frames = std::mem::take(&mut batch);
-            let result = match failure.take() {
-                Some(e) => Err(e),
-                None => Ok(frames),
-            };
-            let _ = tx.send(result);
+        if let Some(tx) = &frames_tx {
+            for frame in work.frames {
+                let _ = tx.unbounded_send(Ok(frame));
+            }
+        }
+        // Dropping the sender is what ends the consumer's stream.
+        if work.end_of_stream {
+            frames_tx = None;
         }
         if let Some(index) = work.slot_index {
             slot_sync.set_free(index);

@@ -15,7 +15,7 @@ use ash::vk;
 
 use crate::decoder::DecodedFrame;
 use crate::decoder::common::DecoderCommon;
-use crate::encoder::PixelFormat;
+use crate::encoder::{BitDepth, PixelFormat};
 use crate::error::{PixelForgeError, Result};
 use crate::video::find_memory_type;
 use crate::vulkan::VideoContext;
@@ -33,6 +33,7 @@ pub(crate) struct DecodedPicture {
     pub layout: vk::ImageLayout,
     pub array_layer: u32,
     pub pixel_format: PixelFormat,
+    pub bit_depth: BitDepth,
     pub width: u32,
     pub height: u32,
     pub coded_width: u32,
@@ -325,6 +326,7 @@ struct ReorderEntry {
     coded_width: u32,
     coded_height: u32,
     pixel_format: PixelFormat,
+    bit_depth: BitDepth,
 }
 
 /// Reorders decoded pictures from decode order into display order.
@@ -394,6 +396,7 @@ impl ReorderBuffer {
             coded_width: picture.coded_width,
             coded_height: picture.coded_height,
             pixel_format: picture.pixel_format,
+            bit_depth: picture.bit_depth,
         });
 
         while self.buffered.len() > reorder_depth {
@@ -489,6 +492,7 @@ impl ReorderBuffer {
             layout,
             array_layer,
             pixel_format: entry.pixel_format,
+            bit_depth: entry.bit_depth,
             width: entry.width,
             height: entry.height,
             coded_width: entry.coded_width,

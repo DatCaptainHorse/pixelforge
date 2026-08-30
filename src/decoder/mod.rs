@@ -9,20 +9,23 @@
 //!
 //! # Design
 //!
-//! - **Asynchronous**: [`Decoder::decode`] records and submits, then returns a
-//!   [`DecodeFuture`] rather than waiting for the GPU, so the CPU can parse and
-//!   submit the next picture while the current one decodes. Mirrors
+//! - **Asynchronous**: [`DecodeSink::decode`] records and submits without
+//!   waiting for the GPU, so the CPU can parse and submit the next picture
+//!   while the current one decodes. Frames arrive on the
+//!   [`DecodeSource`] as they complete, and the two halves can be driven from
+//!   separate threads. Mirrors
 //!   [`Encoder::encode`](crate::encoder::Encoder::encode).
 //! - **Stream-driven**: the Vulkan video session is created lazily from the
 //!   stream's own parameter sets, so no dimensions or profile need to be
 //!   configured up front. Mid-stream resolution changes recreate the session
 //!   transparently.
-//! - **Display order**: frames come out in presentation order; drain the
-//!   reorder buffer with [`Decoder::flush`] at end of stream. Streams without
-//!   B-frames buffer nothing and add no latency.
-//! - **Zero-copy output**: a [`DecodedFrame`] is the decoder's own DPB image,
-//!   pinned until the frame is dropped. Reordering holds pins rather than
-//!   copying pictures out, so display order costs no copy either. See
+//! - **Display order**: frames come out in presentation order; call
+//!   [`DecodeSink::finish`] at end of stream to emit what reordering held back.
+//!   Streams without B-frames buffer nothing and add no latency.
+//! - **Zero-copy output**: where the device supports unified image layouts, a
+//!   [`DecodedFrame`] is the decoder's own DPB image, pinned until the frame is
+//!   dropped, and reordering holds pins rather than copying pictures out.
+//!   Elsewhere pictures are copied into private images instead. See
 //!   [`DecodedFrame`] for validity rules and what holding one costs.
 //!
 //! # Limitations (H.264)
@@ -45,12 +48,16 @@ pub(crate) mod pipeline;
 /// Readback and copies, all of which run on the transfer queue.
 pub(crate) mod transfer;
 
-pub use pipeline::DecodeFuture;
+use std::future::Future;
+use std::pin::Pin;
+use std::task::{Context, Poll};
+
+use ash::vk;
+use futures_core::Stream;
 
 use crate::encoder::{BitDepth, Codec, PixelFormat};
 use crate::error::{PixelForgeError, Result};
 use crate::vulkan::VideoContext;
-use ash::vk;
 
 /// How the bytes handed to [`Decoder::decode`] are framed.
 ///
@@ -72,7 +79,7 @@ pub enum Framing {
     /// This is what a raw `.264` file or a socket carrying one gives you. The
     /// decoder buffers a trailing partial frame until later bytes complete it,
     /// which costs one frame of latency: a coded frame cannot be known to be
-    /// complete until the start of the next one is seen. [`Decoder::flush`]
+    /// complete until the start of the next one is seen. [`DecodeSink::finish`]
     /// decodes whatever is still buffered, so the last frame is not lost.
     ByteStream,
 }
@@ -133,11 +140,9 @@ impl DecodeConfig {
     /// device too small for the request degrades to copying rather than
     /// failing. Each slot costs one decoded picture's worth of memory.
     ///
-    /// This also bounds how many [`DecodeFuture`]s can usefully be kept in
-    /// flight: an unresolved future holds the frames it will deliver, and each
-    /// of those holds a slot. Keeping more batches pending than there are
-    /// output slots makes [`Decoder::decode`] wait for a frame only the caller
-    /// can release, so keep the two numbers in step.
+    /// The number to match is how many frames are outstanding at once: every
+    /// frame a [`DecodeSink::decode`] call emits, plus whatever has been pulled
+    /// from the [`DecodeSource`] and not yet dropped.
     pub fn with_output_depth(mut self, depth: usize) -> Self {
         self.output_depth = depth;
         self
@@ -147,16 +152,16 @@ impl DecodeConfig {
     ///
     /// A [`DecodedFrame`] is a decoder-owned image, and images are shared
     /// between queue families explicitly. By default the decoder shares its
-    /// pictures with its own decode and transfer families only, which is all
-    /// [`Decoder::download`] needs. A renderer sampling frames from a graphics
-    /// queue is a *third* family, and reading an image from a family it was not
-    /// shared with is undefined behaviour unless the caller performs a queue
-    /// family ownership transfer themselves.
+    /// pictures with its own decode and transfer families only. A renderer
+    /// sampling frames from a graphics queue is a *third* family, and reading
+    /// an image from a family it was not shared with is undefined behaviour
+    /// unless the caller performs a queue family ownership transfer
+    /// themselves.
     ///
     /// Passing that family here adds it to the sharing set, so frames can be
     /// sampled directly with no ownership transfer and no copy. Set it whenever
-    /// frames are consumed by anything other than
-    /// [`Decoder::download`]; for a context adopted from an existing device
+    /// frames are consumed by anything outside the decoder; for a context
+    /// adopted from an existing device
     /// (see
     /// [`build_from_existing_decode`](crate::vulkan::VideoContextBuilder::build_from_existing_decode))
     /// this is the family the caller already renders on.
@@ -217,6 +222,8 @@ pub struct DecodedFrame {
     pub array_layer: u32,
     /// The pixel format of this frame.
     pub pixel_format: PixelFormat,
+    /// Bit depth of the samples: eight for NV12, ten for P010.
+    pub bit_depth: BitDepth,
     /// Visible (cropped) width in pixels.
     pub width: u32,
     /// Visible (cropped) height in pixels.
@@ -253,47 +260,49 @@ pub struct DecodedFrame {
     pub(crate) pin: Option<frames::FramePin>,
 }
 
-/// Decoded frame data downloaded to the CPU.
-#[derive(Debug, Clone)]
-pub struct DecodedFrameData {
-    /// Luma plane, `y_stride * height` bytes.
-    pub y: Vec<u8>,
-    /// Interleaved chroma plane (semi-planar: UV for NV12/P010).
-    pub uv: Vec<u8>,
-    /// Row stride of the luma plane in bytes.
-    pub y_stride: usize,
-    /// Row stride of the chroma plane in bytes.
-    pub uv_stride: usize,
-    /// Visible width in pixels.
-    pub width: u32,
-    /// Visible height in pixels.
-    pub height: u32,
-    /// Bit depth of the samples (8 => NV12, 10 => P010).
-    pub bit_depth: BitDepth,
-    /// Chroma subsampling.
-    pub pixel_format: PixelFormat,
-}
+/// Receiving half of the decoder's frame channel.
+pub(crate) type FrameReceiver = futures_channel::mpsc::UnboundedReceiver<Result<DecodedFrame>>;
 
 /// The codec-erased operations every codec decoder exposes.
 trait DecoderApi: Send {
-    fn decode(&mut self, data: &[u8], pts: u64) -> Result<DecodeFuture>;
-    fn flush(&mut self) -> Result<DecodeFuture>;
-    fn download(&mut self, frame: &DecodedFrame) -> Result<DecodedFrameData>;
-    fn copy_frame_to_planes(
-        &mut self,
-        frame: &DecodedFrame,
-        y_image: vk::Image,
-        uv_image: vk::Image,
-    ) -> Result<()>;
+    fn decode(&mut self, data: &[u8], pts: u64) -> Result<()>;
+    fn finish(&mut self) -> Result<()>;
+    fn take_frame_receiver(&mut self) -> Option<FrameReceiver>;
     fn picture_format(&self) -> Option<vk::Format>;
 }
 
 /// Video decoder supporting multiple codecs.
 ///
+/// Two halves that can be used together or apart: bytes go in through the sink,
+/// frames come out through the source. Held together here for single-threaded
+/// use; [`split`](Self::split) separates them so a producer and a consumer can
+/// run on their own threads.
+///
 /// Constructed via [`Decoder::new`], which selects the codec from the config.
 /// Mirrors [`Encoder`](crate::encoder::Encoder): all codec decoders share the
 /// same generic driving flow and are held behind a single boxed pointer.
-pub struct Decoder(Box<dyn DecoderApi>);
+pub struct Decoder {
+    sink: DecodeSink,
+    source: DecodeSource,
+}
+
+/// The input half of a [`Decoder`]: coded bytes go in.
+///
+/// Owns the Vulkan session and everything that submits work, so this is the
+/// half that costs something to use. `Send`, so it can be moved onto a producer
+/// thread.
+pub struct DecodeSink {
+    inner: Box<dyn DecoderApi>,
+}
+
+/// The output half of a [`Decoder`]: decoded frames come out.
+///
+/// Just the receiving end of a channel, so it is cheap to move onto whichever
+/// thread renders. Frames arrive in presentation order, each one already
+/// decoded: the GPU work behind a frame is complete before it is handed over.
+pub struct DecodeSource {
+    rx: FrameReceiver,
+}
 
 impl Decoder {
     /// Create a new decoder for the codec named in `config`.
@@ -309,7 +318,7 @@ impl Decoder {
                 config.codec
             )));
         }
-        let inner: Box<dyn DecoderApi> = match config.codec {
+        let mut inner: Box<dyn DecoderApi> = match config.codec {
             Codec::H264 => Box::new(h264::H264Decoder::create(context, &config)?),
             other => {
                 return Err(PixelForgeError::CodecNotSupported(format!(
@@ -318,74 +327,104 @@ impl Decoder {
                 )));
             }
         };
-        Ok(Decoder(inner))
+        let rx = inner
+            .take_frame_receiver()
+            .expect("a fresh decoder still owns its frame channel");
+        Ok(Decoder {
+            sink: DecodeSink { inner },
+            source: DecodeSource { rx },
+        })
     }
 
-    /// Decode a chunk of the coded byte stream.
+    /// Separate the two halves so they can be driven from different threads.
+    ///
+    /// The sink feeds coded bytes and never waits for output; the source pulls
+    /// frames and never touches the codec. Splitting is what lets a decode run
+    /// ahead of a renderer, or a network reader run ahead of a decode.
+    ///
+    /// ```no_run
+    /// # use pixelforge::decoder::{DecodeConfig, Decoder};
+    /// # fn run(decoder: Decoder, chunks: Vec<Vec<u8>>) -> pixelforge::error::Result<()> {
+    /// let (mut sink, mut source) = decoder.split();
+    ///
+    /// std::thread::spawn(move || -> pixelforge::error::Result<()> {
+    ///     for (i, chunk) in chunks.iter().enumerate() {
+    ///         sink.decode(chunk, i as u64)?;
+    ///     }
+    ///     sink.finish()
+    /// });
+    ///
+    /// while let Some(frame) = pollster::block_on(source.next_frame())? {
+    ///     // ... render, then drop the frame to release its storage ...
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn split(self) -> (DecodeSink, DecodeSource) {
+        (self.sink, self.source)
+    }
+
+    /// Feed coded bytes. See [`DecodeSink::decode`].
+    pub fn decode(&mut self, data: &[u8], pts: u64) -> Result<()> {
+        self.sink.decode(data, pts)
+    }
+
+    /// End the stream. See [`DecodeSink::finish`].
+    pub fn finish(&mut self) -> Result<()> {
+        self.sink.finish()
+    }
+
+    /// Take the next decoded frame. See [`DecodeSource::next_frame`].
+    pub fn next_frame(&mut self) -> NextFrame<'_> {
+        self.source.next_frame()
+    }
+
+    /// Take a frame if one is ready. See [`DecodeSource::try_next_frame`].
+    pub fn try_next_frame(&mut self) -> Result<FramePoll> {
+        self.source.try_next_frame()
+    }
+
+    /// The Vulkan format of decoded picture images, once known.
+    pub fn picture_format(&self) -> Option<vk::Format> {
+        self.sink.picture_format()
+    }
+}
+
+impl DecodeSink {
+    /// Feed coded bytes.
     ///
     /// What `data` may contain depends on the configured [`Framing`]. By
     /// default ([`Framing::FrameAligned`]) it must hold whole coded frames:
     /// any number of them, plus whatever non-picture data the codec carries
     /// alongside (H.26x parameter sets and SEI, AV1 sequence headers), ending
     /// on a frame boundary. Feed exactly one coded frame per call for the
-    /// lowest latency; it is decoded by this call.
+    /// lowest latency.
     ///
     /// With [`Framing::ByteStream`] the data may cut anywhere and the decoder
     /// does the framing itself, holding back a trailing partial frame until
     /// later calls complete it.
     ///
-    /// `pts` is attached to every frame produced by this call.
+    /// `pts` is attached to every frame this data produces.
     ///
-    /// Returns immediately with a [`DecodeFuture`], without waiting for the GPU:
-    /// the picture is recorded and submitted, and awaiting the future yields the
-    /// frames that call emits once their decode has completed. Keep a couple of
-    /// futures in flight to overlap parsing and submission with GPU decode, the
-    /// same way [`Encoder::encode`](crate::encoder::Encoder::encode) is used.
+    /// Returns as soon as the work is submitted, without waiting for the GPU.
+    /// Frames appear on the [`DecodeSource`] as they complete, so this call
+    /// yields no frames of its own and the two halves can run independently.
     ///
-    /// Frames come back in presentation order. The count per call varies, since
-    /// a picture may be held back until later ones are decoded, so drain the
-    /// remainder with [`flush`](Self::flush) at end of stream. A stream without
-    /// B-frames holds nothing back and yields one frame per coded frame fed.
-    ///
-    /// Drop frames promptly. A frame the caller holds keeps a DPB slot, and
-    /// once the slots run out the decoder copies pictures out instead of
-    /// handing over its own images. See [`DecodeConfig::with_output_depth`].
-    pub fn decode(&mut self, data: &[u8], pts: u64) -> Result<DecodeFuture> {
-        self.0.decode(data, pts)
+    /// A picture that cannot be decoded because the stream was joined
+    /// mid-sequence returns [`PixelForgeError::NeedsKeyframe`], which a live
+    /// client can turn into a keyframe request.
+    pub fn decode(&mut self, data: &[u8], pts: u64) -> Result<()> {
+        self.inner.decode(data, pts)
     }
 
-    /// Return any frames still held back: the reorder buffer's contents, and in
-    /// [`Framing::ByteStream`] the trailing frame no later data will complete.
+    /// End the stream: decode whatever is still buffered, emit the frames held
+    /// back for reordering, and close the source.
     ///
-    /// Call once after the last [`decode`](Self::decode) to emit the tail of
-    /// the stream. Frames come back in presentation order, through a future that
-    /// resolves behind every decode already in flight. Harmless (resolves empty)
-    /// for a stream that held nothing back.
-    pub fn flush(&mut self) -> Result<DecodeFuture> {
-        self.0.flush()
-    }
-
-    /// Download a decoded frame to the CPU as semi-planar YUV (NV12 / P010).
-    pub fn download(&mut self, frame: &DecodedFrame) -> Result<DecodedFrameData> {
-        self.0.download(frame)
-    }
-
-    /// Copy a decoded frame's planes into two caller-owned GPU images: luma into
-    /// `y_image`, interleaved chroma into `uv_image`.
-    ///
-    /// Zero-copy handoff for a renderer sharing this decoder's device: the
-    /// images survive past the next [`decode`](Self::decode) (unlike
-    /// [`DecodedFrame::image`]), and are ready to sample as two separate
-    /// textures. Both must live on the decoder's device and be sized to the
-    /// frame's coded dimensions (`uv_image` at half size for 4:2:0). After the
-    /// call both are in `TRANSFER_DST_OPTIMAL`.
-    pub fn copy_frame_to_planes(
-        &mut self,
-        frame: &DecodedFrame,
-        y_image: vk::Image,
-        uv_image: vk::Image,
-    ) -> Result<()> {
-        self.0.copy_frame_to_planes(frame, y_image, uv_image)
+    /// Call once, after the last [`decode`](Self::decode). Until it is called
+    /// [`DecodeSource::next_frame`] never reports the end, since more frames
+    /// could always follow.
+    pub fn finish(&mut self) -> Result<()> {
+        self.inner.finish()
     }
 
     /// The Vulkan format of decoded picture images, once known.
@@ -393,6 +432,71 @@ impl Decoder {
     /// `None` until the first parameter set has been consumed (the format is
     /// negotiated from the stream's profile).
     pub fn picture_format(&self) -> Option<vk::Format> {
-        self.0.picture_format()
+        self.inner.picture_format()
+    }
+}
+
+/// The result of asking a [`DecodeSource`] for a frame without waiting.
+#[derive(Debug)]
+pub enum FramePoll {
+    /// A decoded frame.
+    Frame(DecodedFrame),
+    /// Nothing ready yet. More is still coming.
+    Pending,
+    /// The stream ended and every frame has been delivered.
+    Finished,
+}
+
+impl DecodeSource {
+    /// Take a frame if one is ready, without waiting.
+    ///
+    /// For driving both halves from one thread: feed a chunk, drain whatever
+    /// has become ready, repeat. [`FramePoll::Pending`] means the GPU has not
+    /// finished with the frames in flight yet, not that there are none, so a
+    /// caller that keeps feeding will collect them on a later pass.
+    ///
+    /// Use [`next_frame`](Self::next_frame) instead when a thread has nothing
+    /// better to do than wait.
+    pub fn try_next_frame(&mut self) -> Result<FramePoll> {
+        use futures_channel::mpsc::TryRecvError;
+        match self.rx.try_recv() {
+            Ok(Ok(frame)) => Ok(FramePoll::Frame(frame)),
+            Ok(Err(e)) => Err(e),
+            Err(TryRecvError::Empty) => Ok(FramePoll::Pending),
+            Err(TryRecvError::Closed) => Ok(FramePoll::Finished),
+        }
+    }
+
+    /// Wait for the next decoded frame.
+    ///
+    /// Resolves to `Ok(None)` once the stream has ended, which is after
+    /// [`DecodeSink::finish`] and every frame before it. Frames arrive in
+    /// presentation order.
+    ///
+    /// Drop each frame as soon as you are done with it: a live frame holds a
+    /// DPB slot, and once the slots run out the decoder copies pictures out
+    /// instead of handing over its own images.
+    pub fn next_frame(&mut self) -> NextFrame<'_> {
+        NextFrame { rx: &mut self.rx }
+    }
+}
+
+/// The future returned by [`DecodeSource::next_frame`].
+pub struct NextFrame<'a> {
+    rx: &'a mut FrameReceiver,
+}
+
+impl Future for NextFrame<'_> {
+    type Output = Result<Option<DecodedFrame>>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        match Pin::new(&mut *self.rx).poll_next(cx) {
+            Poll::Ready(Some(Ok(frame))) => Poll::Ready(Ok(Some(frame))),
+            Poll::Ready(Some(Err(e))) => Poll::Ready(Err(e)),
+            // The sender is dropped at end of stream, and also if the decoder
+            // is torn down; either way there is nothing more to come.
+            Poll::Ready(None) => Poll::Ready(Ok(None)),
+            Poll::Pending => Poll::Pending,
+        }
     }
 }

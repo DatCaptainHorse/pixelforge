@@ -12,7 +12,10 @@
 use std::fs::File;
 use std::io::Write;
 
-use pixelforge::decoder::{DecodeConfig, Decoder};
+mod common;
+use common::Readback;
+
+use pixelforge::decoder::{DecodeConfig, DecodedFrame, Decoder, FramePoll};
 use pixelforge::encoder::Codec;
 use pixelforge::vulkan::VideoContextBuilder;
 
@@ -49,91 +52,91 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .to_string_lossy()
     );
 
-    // Frames arrive in presentation order, ready to show without sorting, and
-    // without ever being copied: a picture waiting its turn stays pinned in the
-    // DPB slot it was decoded into.
-    // 64 KB of byte stream can hold several coded frames, and every frame a
+    // Frames come out in presentation order, ready to show without sorting,
+    // and on hardware with unified image layouts without ever being copied: a
+    // picture waiting its turn stays pinned in the DPB slot it was decoded
+    // into, and so does the one handed to this loop.
+    //
+    // 64 KB of byte stream holds several coded frames, and every frame a
     // `decode` call emits is outstanding at once. The default budget of 4 is
     // sized for one frame per call, so raise it: past the budget the decoder
-    // copies pictures out instead of handing over its own images, which still
-    // decodes correctly but costs throughput.
+    // copies pictures out instead of handing over its own images, which is
+    // still correct but gives up the zero-copy path.
     let config = DecodeConfig::h264().with_byte_stream().with_output_depth(8);
+    let mut output = output_path.as_ref().map(File::create).transpose()?;
+    // Readback lives in the consumer, not in pixelforge: the decoder hands over
+    // a GPU image and a renderer would sample it in place. See examples/common.
+    // `VideoContext` is an `Arc` handle, so cloning it shares the device.
+    let mut readback = output
+        .is_some()
+        .then(|| Readback::new(&context))
+        .transpose()?;
     let mut decoder = Decoder::new(context, config)?;
     let stream = std::fs::read(&input_path)?;
-    let mut output = output_path.as_ref().map(File::create).transpose()?;
 
     let start = std::time::Instant::now();
     let mut frame_count = 0usize;
-    let mut last_info = None;
+    let mut last_info: Option<(u32, u32, i32, bool)> = None;
 
-    // Write out one resolved batch. Dropping each frame at the end of the loop
-    // hands its storage back to the decoder.
-    let write_batch = |decoder: &mut Decoder,
-                       frames: Vec<pixelforge::decoder::DecodedFrame>,
-                       output: &mut Option<File>,
-                       frame_count: &mut usize,
-                       last_info: &mut Option<(u32, u32, i32, bool)>|
+    let consume = |frame: DecodedFrame,
+                   output: &mut Option<File>,
+                   readback: &mut Option<Readback>,
+                   frame_count: &mut usize,
+                   last_info: &mut Option<(u32, u32, i32, bool)>|
      -> Result<(), Box<dyn std::error::Error>> {
-        for frame in frames {
-            if let Some(file) = output.as_mut() {
-                let data = decoder.download(&frame)?;
-                file.write_all(&data.y)?;
-                file.write_all(&data.uv)?;
-            }
-            *last_info = Some((
-                frame.width,
-                frame.height,
-                frame.display_order,
-                frame.is_keyframe,
-            ));
-            *frame_count += 1;
+        if let (Some(file), Some(readback)) = (output.as_mut(), readback.as_mut()) {
+            let data = readback.read(&frame)?;
+            file.write_all(&data.y)?;
+            file.write_all(&data.uv)?;
         }
+        *last_info = Some((
+            frame.width,
+            frame.height,
+            frame.display_order,
+            frame.is_keyframe,
+        ));
+        *frame_count += 1;
+        // Dropping the frame here is what hands its DPB slot back. Holding on
+        // to frames is what pushes the decoder onto the copying path.
         Ok(())
     };
 
-    // Each `decode()` returns a future for the frames that call produces. Keep
-    // a couple in flight so parsing and submission overlap the GPU decode, and
-    // drain the oldest once the pipeline is full, which preserves output order.
+    // One thread drives both halves: feed a chunk, then take whatever has
+    // become ready. `Pending` means the GPU is still working on frames in
+    // flight, not that there are none, so they are collected on a later pass.
+    // A renderer would instead `split()` the decoder and await `next_frame` on
+    // its own thread, which is what the `Decoder::split` docs show.
     //
-    // The depth is bounded by `DecodeConfig::output_depth` (2 by default):
-    // every un-dropped frame holds a DPB slot, so holding more batches than
-    // there are output slots would make `decode` wait for a frame that only
-    // this loop can release.
-    let mut pending: std::collections::VecDeque<pixelforge::decoder::DecodeFuture> =
-        std::collections::VecDeque::new();
-
     // A file is a raw byte stream that can cut anywhere, so let the decoder do
     // the framing and feed it in fixed-size chunks, the way a socket delivers
-    // one. `flush` ends the final picture, which nothing follows.
+    // one.
     for (i, chunk) in stream.chunks(CHUNK_SIZE).enumerate() {
         match decoder.decode(chunk, i as u64) {
-            Ok(batch) => pending.push_back(batch),
+            Ok(()) => {}
             // Joining mid-stream (or after loss): skip until a keyframe. A live
             // client would ask the sender for an IDR here.
             Err(pixelforge::error::PixelForgeError::NeedsKeyframe(_)) => continue,
             Err(e) => return Err(e.into()),
         }
-        while pending.len() >= 2 {
-            let frames = pollster::block_on(pending.pop_front().unwrap())?;
-            write_batch(
-                &mut decoder,
-                frames,
+        while let FramePoll::Frame(frame) = decoder.try_next_frame()? {
+            consume(
+                frame,
                 &mut output,
+                &mut readback,
                 &mut frame_count,
                 &mut last_info,
             )?;
         }
     }
 
-    // `flush` emits whatever the reorder buffer still holds; its future resolves
-    // behind everything already in flight.
-    pending.push_back(decoder.flush()?);
-    while let Some(batch) = pending.pop_front() {
-        let frames = pollster::block_on(batch)?;
-        write_batch(
-            &mut decoder,
-            frames,
+    // End of stream: decodes the trailing picture nothing followed, emits the
+    // frames held back for reordering, and closes the source.
+    decoder.finish()?;
+    while let Some(frame) = pollster::block_on(decoder.next_frame())? {
+        consume(
+            frame,
             &mut output,
+            &mut readback,
             &mut frame_count,
             &mut last_info,
         )?;

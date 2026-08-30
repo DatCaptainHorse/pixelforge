@@ -44,6 +44,19 @@ cargo run --example decode_h264 -- tests/data/bframes.264 out.yuv \
     && cmp ref.yuv out.yuv && echo "decode matches ffmpeg"
 ```
 
+Decoding has two paths and both need checking. Where the device supports
+`VK_KHR_unified_image_layouts`, frames are the decoder's own images, handed over
+with no copy. Where it does not, they are copied into private images. Force the
+copying path to exercise it on hardware that would otherwise never take it:
+
+```bash
+PIXELFORGE_NO_UNIFIED_LAYOUTS=1 cargo run --example decode_h264 -- \
+    tests/data/bframes.264 out.yuv && cmp ref.yuv out.yuv
+```
+
+Which path a run took is in the debug log (`RUST_LOG=debug`), on the
+`H.264 decode session:` line as `pinnable=`.
+
 Make sure there are no Vulkan validation layer errors during execution. Enable
 them with `PIXELFORGE_VALIDATION=1`; the layer's messages are routed through
 `tracing`, so pair it with `RUST_LOG=warn` (or `debug` for the layer's own

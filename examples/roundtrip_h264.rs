@@ -18,7 +18,10 @@ use std::collections::VecDeque;
 use std::fs::File;
 use std::io::{Read, Write};
 
-use pixelforge::decoder::{DecodeConfig, Decoder};
+mod common;
+use common::Readback;
+
+use pixelforge::decoder::{DecodeConfig, Decoder, FramePoll};
 use pixelforge::{
     Codec, EncodeBitDepth, EncodeConfig, Encoder, InputImage, PixelFormat, RateControlMode,
     VideoContextBuilder,
@@ -102,17 +105,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // --- Decode it back ---
     // Display order by default, so frames come out ready to write; `flush`
     // drains whatever the reorder buffer still holds at end of stream.
-    let mut decoder = Decoder::new(context, DecodeConfig::h264().with_byte_stream())?;
     let mut out = yuv_path.map(File::create).transpose()?;
+    let mut readback = out.is_some().then(|| Readback::new(&context)).transpose()?;
+    let mut decoder = Decoder::new(context, DecodeConfig::h264().with_byte_stream())?;
     let mut decoded_count = 0usize;
 
-    let write = |decoder: &mut Decoder,
-                 frame: &pixelforge::decoder::DecodedFrame,
+    let write = |frame: &pixelforge::decoder::DecodedFrame,
+                 readback: &mut Option<Readback>,
                  out: &mut Option<File>,
                  count: &mut usize|
      -> Result<(), Box<dyn std::error::Error>> {
-        if let Some(file) = out.as_mut() {
-            let data = decoder.download(frame)?;
+        if let (Some(file), Some(readback)) = (out.as_mut(), readback.as_mut()) {
+            let data = readback.read(frame)?;
             file.write_all(&data.y)?;
             file.write_all(&data.uv)?;
         }
@@ -120,16 +124,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Ok(())
     };
 
-    // A file is a raw byte stream that can cut anywhere, so let the decoder do
-    // the framing and feed it in fixed-size chunks, the way a socket delivers
-    // one. `flush` ends the final picture, which nothing follows.
+    // Feed a chunk, then take whatever has become ready; `Pending` means the
+    // GPU is still working, so those frames are collected on a later pass.
     for (i, chunk) in bitstream.chunks(CHUNK_SIZE).enumerate() {
-        for frame in pollster::block_on(decoder.decode(chunk, i as u64)?)? {
-            write(&mut decoder, &frame, &mut out, &mut decoded_count)?;
+        decoder.decode(chunk, i as u64)?;
+        while let FramePoll::Frame(frame) = decoder.try_next_frame()? {
+            write(&frame, &mut readback, &mut out, &mut decoded_count)?;
         }
     }
-    for frame in pollster::block_on(decoder.flush()?)? {
-        write(&mut decoder, &frame, &mut out, &mut decoded_count)?;
+    // End of stream: decodes the trailing picture, emits what reordering held
+    // back, and closes the source.
+    decoder.finish()?;
+    while let Some(frame) = pollster::block_on(decoder.next_frame())? {
+        write(&frame, &mut readback, &mut out, &mut decoded_count)?;
     }
     println!("Decoded {} frames", decoded_count);
 

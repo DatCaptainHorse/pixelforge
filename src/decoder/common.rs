@@ -23,12 +23,12 @@ use ash::vk;
 
 use crate::decoder::DecodedFrame;
 use crate::decoder::frames::SlotPins;
-use crate::decoder::pipeline::{DecodeFuture, DecodePipeline};
+use crate::decoder::pipeline::DecodePipeline;
 use crate::encoder::{BitDepth, PixelFormat};
 use crate::error::{PixelForgeError, Result};
 use crate::video::{
-    VideoImageParams, allocate_command_buffers, allocate_session_memory, create_command_pool,
-    create_dpb_images, create_fence, create_video_image,
+    VideoImageParams, allocate_session_memory, create_command_pool, create_dpb_images,
+    create_video_image,
 };
 use crate::vulkan::VideoContext;
 
@@ -182,10 +182,6 @@ pub(crate) struct DecoderCommon {
     /// copies must be recorded and submitted on the transfer queue instead.
     pub transfer_queue: vk::Queue,
     pub transfer_pool: vk::CommandPool,
-    /// Command buffer for the synchronous, caller-driven copies (`download`,
-    /// `copy_frame_to_planes`). Pipelined reorder copies use the slot's own.
-    pub transfer_command_buffer: vk::CommandBuffer,
-    pub transfer_fence: vk::Fence,
 
     /// In-flight decode submissions, their per-picture resources and the
     /// completion thread that resolves their futures.
@@ -204,6 +200,9 @@ pub(crate) struct DecoderCommon {
     /// DPB slots reserved by frames the caller still holds. Shared with those
     /// frames, which release their slot when dropped.
     pub slot_pins: Arc<SlotPins>,
+
+    /// Receiving half of the frame channel, until a `DecodeSource` takes it.
+    pub frames_rx: Option<futures_channel::mpsc::UnboundedReceiver<Result<DecodedFrame>>>,
 
     /// Queue family that reads decoded frames, when it is neither the decode
     /// nor the transfer family. Added to every picture image's sharing set so
@@ -230,9 +229,9 @@ impl DecoderCommon {
             ash::khr::video_decode_queue::Device::load(context.instance(), context.device());
 
         let command_pool = create_command_pool(&context, decode_queue_family, "decode")?;
-        let (transfer_pool, transfer_command_buffer, transfer_fence) =
-            create_command_resources(&context, context.transfer_queue_family(), "decode transfer")?;
-        let pipeline = DecodePipeline::new(&context, command_pool, transfer_pool)?;
+        let transfer_pool =
+            create_command_pool(&context, context.transfer_queue_family(), "decode transfer")?;
+        let (pipeline, frames_rx) = DecodePipeline::new(&context, command_pool, transfer_pool)?;
 
         Ok(Self {
             transfer_queue: context.transfer_queue(),
@@ -243,14 +242,13 @@ impl DecoderCommon {
             decode_queue_family,
             command_pool,
             transfer_pool,
-            transfer_command_buffer,
-            transfer_fence,
             pipeline,
             bitstream_offset_alignment: 1,
             bitstream_size_alignment: 1,
             readback: None,
             session: None,
             slot_pins: Arc::new(SlotPins::default()),
+            frames_rx: Some(frames_rx),
             consumer_queue_family,
         })
     }
@@ -586,9 +584,9 @@ impl DecoderCommon {
         self.pipeline.end_picture(frames);
     }
 
-    /// Close off a `decode`/`flush` call, returning the future for its frames.
-    pub fn finish_batch(&mut self, frames: Vec<DecodedFrame>) -> DecodeFuture {
-        self.pipeline.finish_batch(frames)
+    /// Deliver the last frames and close the stream.
+    pub fn finish_stream(&mut self, frames: Vec<DecodedFrame>) {
+        self.pipeline.finish_stream(frames);
     }
 }
 
@@ -610,25 +608,7 @@ impl Drop for DecoderCommon {
                 .destroy_command_pool(self.command_pool, None);
             self.context
                 .device()
-                .destroy_fence(self.transfer_fence, None);
-            self.context
-                .device()
                 .destroy_command_pool(self.transfer_pool, None);
         }
     }
-}
-
-/// A command pool, one primary command buffer, and a fence for `family`.
-///
-/// The pipelined paths allocate their own per-slot buffers from the pool; this
-/// covers the single-buffer synchronous paths (`download` and friends).
-fn create_command_resources(
-    context: &VideoContext,
-    family: u32,
-    label: &str,
-) -> Result<(vk::CommandPool, vk::CommandBuffer, vk::Fence)> {
-    let pool = create_command_pool(context, family, label)?;
-    let buffer = allocate_command_buffers(context, pool, 1)?[0];
-    let fence = create_fence(context, false)?;
-    Ok((pool, buffer, fence))
 }

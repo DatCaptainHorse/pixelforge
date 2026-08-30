@@ -11,8 +11,9 @@ H.265 and AV1 encode, and H.264 decode.
 
 - **Hardware-accelerated** video encoding and decoding using Vulkan Video extensions.
 - **Multiple codec support**: H.264/AVC, H.265/HEVC, AV1 encode; H.264 decode.
-- **Asynchronous pipelines**: both directions submit without waiting and hand
-  back a future ([`EncodeFuture`], [`DecodeFuture`]).
+- **Asynchronous pipelines**: both directions submit without waiting.
+  Encoding hands back an [`EncodeFuture`]; decoding delivers frames through a
+  [`DecodeSource`] as the GPU finishes with them.
 - **GPU color conversion**: RGB/BGR → YUV via Vulkan compute shaders (BT.709, BT.2020, sRGB→BT.2020+PQ, scRGB-linear→BT.2020+PQ).
 - **HDR support**: 10-bit encoding (P010, YUV444P10), PQ transfer function, BT.2020 color space.
 - **GPU-native API**: Encode directly from Vulkan images (`vk::Image`).
@@ -130,16 +131,18 @@ The decoder is stream-driven: it creates its Vulkan session from the
 stream's own parameter sets, so nothing has to be configured up front, and a
 mid-stream resolution change is handled transparently.
 
-[`Decoder::decode`](decoder::Decoder::decode) submits without waiting and
-returns a [`DecodeFuture`], mirroring [`Encoder::encode`]. Keep a couple in
-flight to overlap parsing with GPU decode. Frames come out in presentation
-order without ever being copied: a picture waiting its turn stays pinned in
-the DPB slot it was decoded into. Drop each frame when done, which returns
-its storage to the decoder and is what keeps decoding running.
+Bytes go in through a [`DecodeSink`], frames come out
+of a [`DecodeSource`]. A [`Decoder`] holds both, so
+one thread can drive the whole thing; [`Decoder::split`](decoder::Decoder::split)
+separates them for a producer and a consumer on their own threads.
+
+Frames come out in presentation order and, where the device supports unified
+image layouts, without ever being copied: the frame *is* the decoder's own
+image. Drop each one when done, which returns its storage.
 
 ```rust
 use pixelforge::{Codec, VideoContextBuilder};
-use pixelforge::decoder::{DecodeConfig, Decoder};
+use pixelforge::decoder::{DecodeConfig, Decoder, FramePoll};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let context = VideoContextBuilder::new()
@@ -154,25 +157,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let stream: Vec<u8> = std::fs::read("input.264")?;
 
     for (i, chunk) in stream.chunks(64 * 1024).enumerate() {
-        for frame in pollster::block_on(decoder.decode(chunk, i as u64)?)? {
+        decoder.decode(chunk, i as u64)?;
+        // Take what the GPU has finished with; `Pending` just means "not yet".
+        while let FramePoll::Frame(frame) = decoder.try_next_frame()? {
             // `frame.image` is a decoder-owned GPU image, valid until dropped.
-            let data = decoder.download(&frame)?;
-            let _ = (data.y, data.uv);
+            let _ = frame.image;
         }
     }
-    // Drain the last frame and whatever the reorder buffer still holds.
-    for frame in pollster::block_on(decoder.flush()?)? {
-        let _ = decoder.download(&frame)?;
+
+    // End of stream: decodes the trailing picture, emits what reordering
+    // held back, and closes the source.
+    decoder.finish()?;
+    while let Some(frame) = pollster::block_on(decoder.next_frame())? {
+        let _ = frame.image;
     }
     Ok(())
 }
 ```
 
-A held frame reserves a DPB slot, so
+A live frame reserves a DPB slot, so
 [`DecodeConfig::with_output_depth`](decoder::DecodeConfig::with_output_depth)
-bounds how many the caller may hold before `decode` blocks waiting for one
-back. On a device with too few slots for the stream, frames fall back to a
-copy rather than failing.
+bounds how many can be outstanding before the decoder starts copying
+pictures out instead of handing over its own. Reading a frame back to the
+CPU is the consumer's job; `examples/common` shows one way.
 
 ### Color Conversion (RGB → YUV)
 
