@@ -93,6 +93,9 @@ pub(crate) struct SessionPlan {
     pub max_active_references: u32,
     /// Driver decodes straight into the DPB image (`DPB_AND_OUTPUT_COINCIDE`).
     pub coincide: bool,
+    /// A decoded picture may be handed to the caller in place, pinned in its
+    /// DPB slot, rather than copied out. See [`DecodeSession::pinnable`].
+    pub pinnable: bool,
     /// `dpb_usage` includes `SAMPLED`, so handed-out frames can be sampled.
     pub sampleable: bool,
     /// One layered DPB image rather than one image per slot.
@@ -131,6 +134,16 @@ pub(crate) struct DecodeSession {
     pub coincide: bool,
     /// Spare DPB slots available for pinning pictures past their decode.
     pub spare_slots: usize,
+    /// Whether a picture may be handed out in place instead of being copied.
+    ///
+    /// Needs two things at once. The driver must decode into the DPB image
+    /// (`coincide`), or the picture lives in an output image the next decode
+    /// overwrites. And the device must support unified image layouts, or the
+    /// picture stays in `VIDEO_DECODE_DPB_KHR` and a consumer would have to
+    /// transition it to read it, which is not safe while later pictures are
+    /// still using it as a reference. Without both, every picture is copied
+    /// into a private image on its way out.
+    pub pinnable: bool,
     /// Whether decoded pictures can be sampled without being copied first.
     pub sampleable: bool,
     /// Distinct decode output image, only when `!coincide`.
@@ -260,6 +273,31 @@ impl DecoderCommon {
         families
     }
 
+    /// The layout DPB pictures live in.
+    ///
+    /// `GENERAL` when the device supports unified image layouts, which is what
+    /// lets a handed-out picture be sampled or copied from while the decoder is
+    /// still reading it as a reference: nothing ever has to transition it, so
+    /// there is no layout for a consumer and the decode queue to disagree
+    /// about. Otherwise the layout video decode requires.
+    pub fn picture_layout(&self) -> vk::ImageLayout {
+        if self.context.has_unified_image_layouts() {
+            vk::ImageLayout::GENERAL
+        } else {
+            vk::ImageLayout::VIDEO_DECODE_DPB_KHR
+        }
+    }
+
+    /// The layout a distinct decode output image lives in. See
+    /// [`Self::picture_layout`].
+    pub fn output_layout(&self) -> vk::ImageLayout {
+        if self.context.has_unified_image_layouts() {
+            vk::ImageLayout::GENERAL
+        } else {
+            vk::ImageLayout::VIDEO_DECODE_DST_KHR
+        }
+    }
+
     /// The active session, or an error if no parameter sets have been seen yet.
     pub fn session(&self) -> Result<&DecodeSession> {
         self.session
@@ -357,6 +395,7 @@ impl DecoderCommon {
             use_layered_dpb: plan.use_layered_dpb,
             coincide: plan.coincide,
             spare_slots: plan.spare_slots,
+            pinnable: plan.pinnable,
             sampleable: plan.sampleable,
             output_image,
         });
@@ -457,10 +496,12 @@ impl DecoderCommon {
             layer_count: 1,
         };
 
-        // The slot being written: UNDEFINED on first use, DPB afterwards.
+        // The slot being written: UNDEFINED on first use, its picture layout
+        // afterwards.
+        let picture_layout = self.picture_layout();
         let (dst_image, dst_layer) = session.dpb_image_for_slot(slot);
         let old_layout = if session.dpb_slot_active[slot as usize] {
-            vk::ImageLayout::VIDEO_DECODE_DPB_KHR
+            picture_layout
         } else {
             vk::ImageLayout::UNDEFINED
         };
@@ -471,7 +512,7 @@ impl DecoderCommon {
                 .dst_stage_mask(vk::PipelineStageFlags2::VIDEO_DECODE_KHR)
                 .dst_access_mask(vk::AccessFlags2::VIDEO_DECODE_WRITE_KHR)
                 .old_layout(old_layout)
-                .new_layout(vk::ImageLayout::VIDEO_DECODE_DPB_KHR)
+                .new_layout(picture_layout)
                 .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .image(dst_image)
@@ -487,7 +528,7 @@ impl DecoderCommon {
                     .dst_stage_mask(vk::PipelineStageFlags2::VIDEO_DECODE_KHR)
                     .dst_access_mask(vk::AccessFlags2::VIDEO_DECODE_WRITE_KHR)
                     .old_layout(vk::ImageLayout::UNDEFINED)
-                    .new_layout(vk::ImageLayout::VIDEO_DECODE_DST_KHR)
+                    .new_layout(self.output_layout())
                     .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                     .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                     .image(image)

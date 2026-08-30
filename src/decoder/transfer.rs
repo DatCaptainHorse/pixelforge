@@ -62,26 +62,6 @@ impl DecoderCommon {
         Ok(())
     }
 
-    /// Wait for in-flight decodes when a caller-driven copy would otherwise race
-    /// them.
-    ///
-    /// Reading a frame means transitioning its image out of its current layout
-    /// and back. That is harmless for a pool image, which nothing else touches,
-    /// but a zero-copy frame's image is a live DPB slot: later pictures may
-    /// still be reading it as a reference, and moving its layout underneath them
-    /// corrupts their output. These copies submit on the transfer queue with no
-    /// dependency on the decode queue, so the only correct answer is to let the
-    /// decode queue drain first.
-    fn wait_before_reading(&self, frame: &DecodedFrame) {
-        if frame
-            .pin
-            .as_ref()
-            .is_some_and(|pin| pin.borrows_dpb_image())
-        {
-            self.pipeline.wait_all_free();
-        }
-    }
-
     /// Copy a decoded picture back to the host, cropped to its visible region.
     ///
     /// Entirely codec-independent: it copies planes out of an image the decode
@@ -91,7 +71,6 @@ impl DecoderCommon {
     /// dedicated engine that need not advertise `TRANSFER_BIT` (it does not on
     /// RADV), so recording a copy there is invalid.
     pub fn download(&mut self, frame: &DecodedFrame) -> Result<DecodedFrameData> {
-        self.wait_before_reading(frame);
         let (bit_depth, pixel_format) = {
             let session = self.session()?;
             (session.bit_depth, session.pixel_format)
@@ -161,9 +140,12 @@ impl DecoderCommon {
                 base_array_layer: base_layer,
                 layer_count: 1,
             });
-        let barriers = [to_src];
-        let dependency = vk::DependencyInfo::default().image_memory_barriers(&barriers);
-        unsafe { device.cmd_pipeline_barrier2(self.transfer_command_buffer, &dependency) };
+        let no_transition = frame.layout == vk::ImageLayout::GENERAL;
+        if !no_transition {
+            let barriers = [to_src];
+            let dependency = vk::DependencyInfo::default().image_memory_barriers(&barriers);
+            unsafe { device.cmd_pipeline_barrier2(self.transfer_command_buffer, &dependency) };
+        }
 
         let regions = [
             vk::BufferImageCopy2::default()
@@ -201,7 +183,11 @@ impl DecoderCommon {
         ];
         let copy_info = vk::CopyImageToBufferInfo2::default()
             .src_image(frame.image)
-            .src_image_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+            .src_image_layout(if no_transition {
+                frame.layout
+            } else {
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL
+            })
             .dst_buffer(buffer)
             .regions(&regions);
         unsafe { device.cmd_copy_image_to_buffer2(self.transfer_command_buffer, &copy_info) };
@@ -226,9 +212,11 @@ impl DecoderCommon {
                 base_array_layer: base_layer,
                 layer_count: 1,
             });
-        let barriers = [restore];
-        let dependency = vk::DependencyInfo::default().image_memory_barriers(&barriers);
-        unsafe { device.cmd_pipeline_barrier2(self.transfer_command_buffer, &dependency) };
+        if !no_transition {
+            let barriers = [restore];
+            let dependency = vk::DependencyInfo::default().image_memory_barriers(&barriers);
+            unsafe { device.cmd_pipeline_barrier2(self.transfer_command_buffer, &dependency) };
+        }
 
         unsafe {
             device
@@ -438,7 +426,6 @@ impl DecoderCommon {
         y_image: vk::Image,
         uv_image: vk::Image,
     ) -> Result<()> {
-        self.wait_before_reading(frame);
         let base_layer = frame.array_layer;
         let device = self.context.device().clone();
 

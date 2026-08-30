@@ -141,14 +141,6 @@ pub(crate) enum FramePin {
     DpbSlot { slot: u8, pins: Arc<SlotPins> },
 }
 
-impl FramePin {
-    /// Whether this frame's image is a DPB slot the decoder is still using,
-    /// rather than a private copy.
-    pub(crate) fn borrows_dpb_image(&self) -> bool {
-        matches!(self, FramePin::DpbSlot { .. })
-    }
-}
-
 impl Drop for FramePin {
     fn drop(&mut self) {
         match self {
@@ -416,15 +408,13 @@ impl ReorderBuffer {
     /// otherwise. See [`Retained`].
     fn retain(&mut self, common: &mut DecoderCommon, picture: &DecodedPicture) -> Result<Retained> {
         let session = common.session()?;
-        // A distinct decode output image is overwritten by the next picture, so
-        // only a coincident DPB image can be pinned in place.
         //
         // The budget counts every pin that exists, not just this buffer's:
         // frames already emitted hold theirs until the caller drops them, and a
         // single decode call can emit many. Staying within `spare_slots` is what
         // guarantees the codec always has a slot to decode into, so a caller who
         // holds frames gets copies rather than a decoder that cannot proceed.
-        if session.coincide && common.slot_pins.count() < session.spare_slots {
+        if session.pinnable && common.slot_pins.count() < session.spare_slots {
             common.slot_pins.pin(picture.slot);
             return Ok(Retained::Slot {
                 pin: FramePin::DpbSlot {

@@ -32,11 +32,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // PIXELFORGE_VALIDATION=1 enables the Vulkan validation layers, which
     // report the exact offending call for any API misuse.
     let validation = std::env::var("PIXELFORGE_VALIDATION").is_ok();
-    let context = VideoContextBuilder::new()
+    // Set PIXELFORGE_NO_UNIFIED_LAYOUTS=1 to exercise the copying fallback on
+    // hardware that would otherwise take the zero-copy path.
+    let mut builder = VideoContextBuilder::new()
         .app_name("pixelforge-decode")
         .require_decode(Codec::H264)
-        .enable_validation(validation)
-        .build()?;
+        .enable_validation(validation);
+    if std::env::var("PIXELFORGE_NO_UNIFIED_LAYOUTS").is_ok() {
+        builder = builder.without_unified_image_layouts();
+    }
+    let context = builder.build()?;
 
     println!(
         "Device: {}",

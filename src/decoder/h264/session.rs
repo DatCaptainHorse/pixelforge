@@ -316,7 +316,15 @@ impl H264Decoder {
             .max_num_reorder_frames
             .map(|v| v as usize)
             .unwrap_or(sps.max_num_ref_frames as usize);
-        let wanted_spare = reorder_depth + self.output_depth;
+        // Spare slots only buy something when pictures can be pinned. Without
+        // that they are handed out as copies, which needs no DPB slot at all,
+        // so asking for spares would just reserve memory nothing uses.
+        let pinnable = coincide && self.common.context.has_unified_image_layouts();
+        let wanted_spare = if pinnable {
+            reorder_depth + self.output_depth
+        } else {
+            0
+        };
         let slot_count = (required + wanted_spare as u32).min(slot_limit) as usize;
         let spare_slots = slot_count - required as usize;
         if spare_slots < wanted_spare {
@@ -398,6 +406,7 @@ impl H264Decoder {
             spare_slots,
             max_active_references,
             coincide,
+            pinnable,
             sampleable,
             use_layered_dpb,
             dpb_usage,
@@ -416,7 +425,7 @@ impl H264Decoder {
 
         debug!(
             "H.264 decode session: {}x{} {:?}, {} DPB slots ({} spare), \
-             layered={}, coincide={}, sampleable={}, \
+             layered={}, coincide={}, pinnable={}, sampleable={}, \
              bitstream alignment {}/{} (offset/size)",
             coded_width,
             coded_height,
@@ -425,6 +434,7 @@ impl H264Decoder {
             spare_slots,
             use_layered_dpb,
             coincide,
+            pinnable,
             sampleable,
             self.common.bitstream_offset_alignment,
             self.common.bitstream_size_alignment
@@ -770,19 +780,22 @@ impl H264Decoder {
         let active = self.common.session.as_mut().expect("active");
         active.dpb_slot_active[slot as usize] = true;
 
+        let picture_layout = self.common.picture_layout();
+        let output_layout = self.common.output_layout();
+        let active = self.common.session.as_mut().expect("active");
         let (image, image_view, layout, array_layer) = if active.coincide {
             let (image, layer) = active.dpb_image_for_slot(slot);
             (
                 image,
                 active.dpb_views[slot as usize],
-                vk::ImageLayout::VIDEO_DECODE_DPB_KHR,
+                picture_layout,
                 layer,
             )
         } else {
             let (image, _, view) = active
                 .output_image
                 .expect("non-coincide implies output image");
-            (image, view, vk::ImageLayout::VIDEO_DECODE_DST_KHR, 0)
+            (image, view, output_layout, 0)
         };
 
         let (width, height) = sps.display_dimensions();

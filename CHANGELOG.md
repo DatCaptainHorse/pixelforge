@@ -30,6 +30,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `DecodeConfig::with_consumer_queue_family` names the queue family that will
   read decoded frames, adding it to each picture's sharing set so frames can be
   used from a graphics queue with no ownership transfer.
+- `VK_KHR_unified_image_layouts` is enabled where the device supports it, with
+  both `unifiedImageLayouts` and `unifiedImageLayoutsVideo`. Decoded pictures
+  then live in `VK_IMAGE_LAYOUT_GENERAL` and are never transitioned, which is
+  what makes it safe to hand one to a consumer while the decoder is still using
+  it as a reference. Without it every frame is copied into a private image
+  instead. Measured on RADV: 25% higher decode throughput than the copying
+  path, and 12% higher with host readback on top.
+- `VideoContextBuilder::declare_unified_image_layouts` lets a caller who adopts
+  their own device say they enabled the extension, since Vulkan cannot be asked
+  which features a device was created with.
+  `DeviceRequirements::unified_image_layouts` reports whether it is worth doing.
+- `VideoContextBuilder::without_unified_image_layouts` forces the copying path,
+  so it can be exercised on hardware that would otherwise never take it.
 - `Framing` says how input is framed, so the decoder can do the framing itself.
   `Framing::FrameAligned` (the default) takes whole coded frames per call, as a
   container or transport delivers them. `Framing::ByteStream`, selected with

@@ -56,6 +56,10 @@ pub struct VideoContextBuilder {
     enable_validation: bool,
     required_encode_codecs: Vec<Codec>,
     required_decode_codecs: Vec<Codec>,
+    /// `None` lets each path decide: a context that creates its own device
+    /// enables unified image layouts when the device supports them, and one
+    /// that adopts a caller's device assumes they were not enabled.
+    unified_image_layouts: Option<bool>,
 }
 
 impl Default for VideoContextBuilder {
@@ -73,6 +77,7 @@ impl VideoContextBuilder {
             enable_validation: false,
             required_encode_codecs: Vec::new(),
             required_decode_codecs: Vec::new(),
+            unified_image_layouts: None,
         }
     }
 
@@ -128,10 +133,51 @@ impl VideoContextBuilder {
             physical_device,
             &self.required_decode_codecs,
         )?;
+        let unified_image_layouts = supports_unified_image_layouts(instance, physical_device);
+        let mut extensions = decode_extension_names(&self.required_decode_codecs);
+        if unified_image_layouts {
+            extensions.push(ash::khr::unified_image_layouts::NAME);
+        }
         Ok(DeviceRequirements {
             queue_families: families.unique(),
-            extensions: decode_extension_names(&self.required_decode_codecs),
+            extensions,
+            unified_image_layouts,
         })
+    }
+
+    /// Declare that the adopted device was created with
+    /// `VK_KHR_unified_image_layouts` enabled, including both
+    /// `unifiedImageLayouts` and `unifiedImageLayoutsVideo`.
+    ///
+    /// Only meaningful for [`Self::build_from_existing_decode`]: a context that
+    /// creates its own device enables the extension itself when the hardware
+    /// has it. Vulkan offers no way to ask a device which features were enabled
+    /// on it, so this is a promise pixelforge cannot verify. What it *can*
+    /// check, and does, is that the physical device supports both bits; a
+    /// declaration on hardware that cannot support them is a clean error rather
+    /// than undefined behaviour.
+    ///
+    /// Getting it wrong the other way, declaring it without having enabled it,
+    /// is undefined behaviour. Validation layers report it immediately, so
+    /// develop with them on. This is the same kind of promise the adopted path
+    /// already relies on for `timelineSemaphore`.
+    ///
+    /// Worth making: without it every decoded frame is copied into a private
+    /// image before the caller sees it. With it, frames are the decoder's own
+    /// images, sampleable in place.
+    pub fn declare_unified_image_layouts(mut self) -> Self {
+        self.unified_image_layouts = Some(true);
+        self
+    }
+
+    /// Never use unified image layouts, even where the device supports them.
+    ///
+    /// Exists so the copying fallback can be exercised on hardware that would
+    /// otherwise always take the zero-copy path. There is no reason to reach
+    /// for this in production.
+    pub fn without_unified_image_layouts(mut self) -> Self {
+        self.unified_image_layouts = Some(false);
+        self
     }
 
     /// Adopt a caller-created device for decoding, rather than creating one.
@@ -153,6 +199,7 @@ impl VideoContextBuilder {
     ) -> Result<VideoContext> {
         VideoContext::from_existing_decode(
             self.required_decode_codecs,
+            self.unified_image_layouts.unwrap_or(false),
             entry,
             instance,
             physical_device,
@@ -174,6 +221,19 @@ pub struct DeviceRequirements {
     pub queue_families: Vec<u32>,
     /// Device extensions pixelforge needs enabled. Merge with your own.
     pub extensions: Vec<&'static std::ffi::CStr>,
+    /// Whether this device can support unified image layouts for video, which
+    /// is what lets decoded frames be sampled with no copy and no layout
+    /// transition. When true, `VK_KHR_unified_image_layouts` is included in
+    /// [`Self::extensions`]; enable it *and* chain
+    /// `VkPhysicalDeviceUnifiedImageLayoutsFeaturesKHR` with both
+    /// `unifiedImageLayouts` and `unifiedImageLayoutsVideo` set, then tell
+    /// pixelforge you did with
+    /// [`VideoContextBuilder::declare_unified_image_layouts`].
+    ///
+    /// Without that declaration the decoder falls back to copying every frame
+    /// into a private image, which is correct but costs a full-frame GPU copy
+    /// per frame.
+    pub unified_image_layouts: bool,
 }
 
 /// The queue families pixelforge selects for decoding on a given device.
@@ -281,6 +341,32 @@ fn find_decode_queue_families(
 }
 
 /// Device extensions required to decode the given codecs.
+/// Whether `physical_device` can support unified image layouts *for video*.
+///
+/// Both the extension and both of its feature bits are needed:
+/// `unifiedImageLayouts` alone leaves video picture resources under the old
+/// rules, which is exactly the case that matters here.
+fn supports_unified_image_layouts(
+    instance: &ash::Instance,
+    physical_device: vk::PhysicalDevice,
+) -> bool {
+    let exts = match unsafe { instance.enumerate_device_extension_properties(physical_device) } {
+        Ok(exts) => exts,
+        Err(_) => return false,
+    };
+    let present = exts.iter().any(|ext| {
+        let name = unsafe { std::ffi::CStr::from_ptr(ext.extension_name.as_ptr()) };
+        name == ash::khr::unified_image_layouts::NAME
+    });
+    if !present {
+        return false;
+    }
+    let mut features = vk::PhysicalDeviceUnifiedImageLayoutsFeaturesKHR::default();
+    let mut query = vk::PhysicalDeviceFeatures2::default().push(&mut features);
+    unsafe { instance.get_physical_device_features2(physical_device, &mut query) };
+    features.unified_image_layouts != 0 && features.unified_image_layouts_video != 0
+}
+
 fn decode_extension_names(decode_codecs: &[Codec]) -> Vec<&'static std::ffi::CStr> {
     let mut names = vec![
         ash::khr::video_queue::NAME,
@@ -326,6 +412,7 @@ struct VideoContextInner {
     supported_encode_codecs: Vec<Codec>,
     supported_decode_codecs: Vec<Codec>,
     has_descriptor_buffer: bool,
+    has_unified_image_layouts: bool,
     /// Whether this context created (and therefore must destroy) the device and
     /// instance. A context adopted from a caller's device via
     /// [`VideoContext::from_existing_decode`] borrows them and destroys neither.
@@ -436,6 +523,15 @@ impl VideoContext {
     /// Returns true if `VK_EXT_descriptor_buffer` is available and enabled.
     pub fn has_descriptor_buffer(&self) -> bool {
         self.inner.has_descriptor_buffer
+    }
+
+    /// Whether `VK_KHR_unified_image_layouts` is enabled, with its video bit.
+    ///
+    /// When it is, `VK_IMAGE_LAYOUT_GENERAL` is valid for every use including
+    /// video picture resources, so a decoded picture never has to change layout
+    /// to be sampled, copied from, or used as a reference.
+    pub fn has_unified_image_layouts(&self) -> bool {
+        self.inner.has_unified_image_layouts
     }
 }
 
@@ -864,6 +960,47 @@ impl VideoContext {
         let mut sync2_features =
             vk::PhysicalDeviceSynchronization2Features::default().synchronization2(true);
 
+        // VK_KHR_unified_image_layouts: makes VK_IMAGE_LAYOUT_GENERAL valid
+        // everywhere, and its `video` bit extends that to video picture
+        // resources. Both bits are what let a decoded picture be sampled
+        // without ever being transitioned out of the layout the decoder needs.
+        let has_unified_layouts_ext = if let Some(device_exts) = &selected_device_exts {
+            has_extension(device_exts, ash::khr::unified_image_layouts::NAME)
+        } else {
+            false
+        };
+        let mut supported_unified_layouts =
+            vk::PhysicalDeviceUnifiedImageLayoutsFeaturesKHR::default();
+        if has_unified_layouts_ext {
+            let mut query =
+                vk::PhysicalDeviceFeatures2::default().push(&mut supported_unified_layouts);
+            unsafe {
+                instance.get_physical_device_features2(physical_device, &mut query);
+            }
+        }
+        let has_unified_layouts = builder.unified_image_layouts != Some(false)
+            && has_unified_layouts_ext
+            && supported_unified_layouts.unified_image_layouts != 0
+            && supported_unified_layouts.unified_image_layouts_video != 0;
+        if has_unified_layouts {
+            debug!("Unified image layouts enabled: decoded frames need no copy to be read");
+        } else {
+            debug!(
+                "Unified image layouts unavailable (extension {}, unifiedImageLayouts {}, \
+                 unifiedImageLayoutsVideo {}); decoded frames will be copied out",
+                has_unified_layouts_ext,
+                supported_unified_layouts.unified_image_layouts,
+                supported_unified_layouts.unified_image_layouts_video
+            );
+        }
+        let mut unified_layout_features =
+            vk::PhysicalDeviceUnifiedImageLayoutsFeaturesKHR::default()
+                .unified_image_layouts(true)
+                .unified_image_layouts_video(true);
+        if has_unified_layouts {
+            push_ext(ash::khr::unified_image_layouts::NAME.as_ptr());
+        }
+
         let mut supported_timeline_features =
             vk::PhysicalDeviceTimelineSemaphoreFeatures::default();
         let mut timeline_feature_query =
@@ -953,6 +1090,10 @@ impl VideoContext {
             .push(&mut sync2_features)
             .push(&mut timeline_features);
 
+        if has_unified_layouts {
+            device_create_info = device_create_info.push(&mut unified_layout_features);
+        }
+
         if supported_encode_codecs.contains(&Codec::AV1) {
             device_create_info = device_create_info.push(&mut av1_encode_features);
         }
@@ -1014,6 +1155,7 @@ impl VideoContext {
                 supported_encode_codecs,
                 supported_decode_codecs,
                 has_descriptor_buffer,
+                has_unified_image_layouts: has_unified_layouts,
                 owns_device: true,
                 debug_messenger,
             }),
@@ -1027,6 +1169,7 @@ impl VideoContext {
     /// neither on drop.
     fn from_existing_decode(
         required_decode_codecs: Vec<Codec>,
+        declared_unified_image_layouts: bool,
         entry: ash::Entry,
         instance: ash::Instance,
         physical_device: vk::PhysicalDevice,
@@ -1049,6 +1192,20 @@ impl VideoContext {
         let compute_queue = unsafe { device.get_device_queue(families.compute, 0) };
 
         let supported_decode_codecs = query_decode_codecs(&entry, &instance, physical_device);
+
+        // The declaration is a promise about what the caller enabled, which
+        // cannot be verified. That the hardware could support it can be, so a
+        // declaration that is impossible fails here rather than in the driver.
+        if declared_unified_image_layouts
+            && !supports_unified_image_layouts(&instance, physical_device)
+        {
+            return Err(PixelForgeError::NoSuitableDevice(
+                "unified image layouts were declared, but this device does not support \
+                 VK_KHR_unified_image_layouts with both unifiedImageLayouts and \
+                 unifiedImageLayoutsVideo"
+                    .to_string(),
+            ));
+        }
 
         info!(
             "Adopted caller device for decode: decode family {}, transfer family {}, compute family {}",
@@ -1075,6 +1232,7 @@ impl VideoContext {
                 supported_encode_codecs: Vec::new(),
                 supported_decode_codecs,
                 has_descriptor_buffer: false,
+                has_unified_image_layouts: declared_unified_image_layouts,
                 owns_device: false,
                 // The caller owns the instance; reporting is theirs to set up.
                 debug_messenger: None,
