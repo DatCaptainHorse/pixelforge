@@ -1,0 +1,35 @@
+#version 450
+
+// Sample a decoded frame and write RGBA.
+//
+// The sampler carries a VkSamplerYcbcrConversion, so `texture()` returns RGB:
+// the hardware reconstructs chroma to full resolution and applies the YUV to
+// RGB matrix and range expansion. That is the whole point of sampling a decoded
+// picture in place rather than converting it in software first.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+// Combined image sampler with an immutable, ycbcr-converting sampler. A
+// multi-planar format may only be sampled this way.
+layout(set = 0, binding = 0) uniform sampler2D frame;
+layout(set = 0, binding = 1, rgba8) uniform writeonly image2D output_image;
+
+layout(push_constant) uniform Push {
+    // Visible size: what to write.
+    uvec2 visible;
+    // Coded size: what the image actually is, which is padded up to the
+    // codec's macroblock granularity. Sampling coordinates are relative to it.
+    uvec2 coded;
+} push;
+
+void main() {
+    uvec2 pixel = gl_GlobalInvocationID.xy;
+    if (pixel.x >= push.visible.x || pixel.y >= push.visible.y) {
+        return;
+    }
+    // Sample at texel centres of the coded image, so the visible region maps
+    // one to one instead of being stretched across the padding.
+    vec2 uv = (vec2(pixel) + 0.5) / vec2(push.coded);
+    vec3 rgb = texture(frame, uv).rgb;
+    imageStore(output_image, ivec2(pixel), vec4(rgb, 1.0));
+}

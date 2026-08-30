@@ -57,6 +57,21 @@ PIXELFORGE_NO_UNIFIED_LAYOUTS=1 cargo run --example decode_h264 -- \
 Which path a run took is in the debug log (`RUST_LOG=debug`), on the
 `H.264 decode session:` line as `pinnable=`.
 
+The render path has its own example. `sample_frame` reads decoded frames in a
+compute shader through a sampler-YCbCr conversion, which is the path that never
+copies anything, and writes RGBA:
+
+```bash
+cargo run --example sample_frame -- tests/data/bframes.264 out.rgba
+```
+
+Do not judge that one by PSNR. The hardware sampler and ffmpeg reconstruct
+subsampled chroma differently, so they agree almost everywhere and disagree
+hard on pixels sitting on a colour edge; on the synthetic test patterns that
+drags PSNR to ~26 dB while the images are indistinguishable. Compare the share
+of pixels that agree instead: both AMD and Intel land on 87.9% within 2 and
+33.2% exact for `bframes.264`.
+
 Make sure there are no Vulkan validation layer errors during execution. Enable
 them with `PIXELFORGE_VALIDATION=1`; the layer's messages are routed through
 `tracing`, so pair it with `RUST_LOG=warn` (or `debug` for the layer's own

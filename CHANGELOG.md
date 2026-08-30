@@ -30,6 +30,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stream fall back to copying rather than failing.
 - `DecodeConfig::with_output_depth` reserves DPB slots so decoded frames can be
   held while decoding continues.
+- `examples/sample_frame` shows the render path end to end: a decoded frame
+  sampled in a compute shader through a `VkSamplerYcbcrConversion`, with no
+  copy and no layout transition, while the decoder is still using that picture
+  as a reference.
 - Host readback and `copy_frame_to_planes` are gone. A `DecodedFrame` is a GPU
   image the consumer owns until they drop it, and what to do with it is theirs
   to decide; `examples/common` shows one way to read one back.
