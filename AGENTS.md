@@ -69,8 +69,9 @@ Do not judge that one by PSNR. The hardware sampler and ffmpeg reconstruct
 subsampled chroma differently, so they agree almost everywhere and disagree
 hard on pixels sitting on a colour edge; on the synthetic test patterns that
 drags PSNR to ~26 dB while the images are indistinguishable. Compare the share
-of pixels that agree instead: both AMD and Intel land on 87.9% within 2 and
-33.2% exact for `bframes.264`.
+of pixels that agree instead. For `bframes.264` that has been 87.9% within 2
+and 33.2% exact on every device tested so far, and it is deterministic enough
+to treat a change in it as a regression.
 
 `sample_planes` is the other half of that story, and the tighter test. It reads
 the same frames through per-plane views, with no ycbcr conversion and no sampler
@@ -82,9 +83,13 @@ cargo run --example sample_planes -- tests/data/bframes.264 out.yuv \
     && cmp ref.yuv out.yuv && echo "plane views match the decoder"
 ```
 
-Run that one on AMD too, not just locally. Its frames are pool copies on a
-device without unified image layouts, which carry no video usage, so a view
-mistake that only a real DPB image would catch passes silently on Intel.
+Where that example is worth extra attention: on a device *without*
+`VK_KHR_unified_image_layouts`, its frames are pool copies, which carry no video
+usage, so a mistake in how a plane view is created passes silently. The same
+mistake is an immediate validation error on a device that has the extension,
+because there the frame really is the decoder's DPB image. So if a device
+supporting it is available, run this example there before trusting a green run
+elsewhere. `RUST_LOG=debug` reports which case applies, as `pinnable=`.
 
 Make sure there are no Vulkan validation layer errors during execution. Enable
 them with `PIXELFORGE_VALIDATION=1`; the layer's messages are routed through
