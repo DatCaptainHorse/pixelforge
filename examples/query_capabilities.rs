@@ -268,10 +268,112 @@ fn query_detailed_capabilities(
             };
             println!("      Supported DPB Formats (DPB):");
             for prop in format_props {
-                println!("        Format: {:?}", prop.format);
+                println!(
+                    "        Format: {:?}  create flags: {:?}{}",
+                    prop.format,
+                    prop.image_create_flags,
+                    if prop
+                        .image_create_flags
+                        .contains(vk::ImageCreateFlags::MUTABLE_FORMAT)
+                    {
+                        "  (per-plane views available)"
+                    } else {
+                        ""
+                    }
+                );
             }
         }
     }
 
+    print_decode_image_flags(&context)?;
+
+    Ok(())
+}
+
+/// Report the image creation flags H.264 decode pictures allow.
+///
+/// Worth its own section because `imageCreateFlags` varies by *usage*, not just
+/// by format, and the answer a consumer cares about is the one for the usage
+/// pixelforge actually creates pictures with. `MUTABLE_FORMAT` there means
+/// decoded frames can have their luma and chroma planes viewed separately, so a
+/// renderer can read them as two ordinary textures instead of needing a
+/// sampler-YCbCr conversion. Asking about the DPB usage alone gives a different,
+/// and for this purpose wrong, answer: both RADV and ANV report no flags at all
+/// for that.
+fn print_decode_image_flags(
+    context: &pixelforge::VideoContext,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if !context.supports_decode(Codec::H264) {
+        return Ok(());
+    }
+    println!("\nH.264 Decode Picture Image Flags");
+    println!("---------------------------------");
+
+    let mut h264 = vk::VideoDecodeH264ProfileInfoKHR::default()
+        .std_profile_idc(ash::vk::native::StdVideoH264ProfileIdc_STD_VIDEO_H264_PROFILE_IDC_HIGH)
+        .picture_layout(vk::VideoDecodeH264PictureLayoutFlagsKHR::PROGRESSIVE);
+    let profile = vk::VideoProfileInfoKHR::default()
+        .video_codec_operation(vk::VideoCodecOperationFlagsKHR::DECODE_H264)
+        .chroma_subsampling(vk::VideoChromaSubsamplingFlagsKHR::TYPE_420)
+        .luma_bit_depth(vk::VideoComponentBitDepthFlagsKHR::TYPE_8)
+        .chroma_bit_depth(vk::VideoComponentBitDepthFlagsKHR::TYPE_8)
+        .push(&mut h264);
+
+    let dpb = vk::ImageUsageFlags::VIDEO_DECODE_DPB_KHR;
+    let coincide = dpb
+        | vk::ImageUsageFlags::VIDEO_DECODE_DST_KHR
+        | vk::ImageUsageFlags::TRANSFER_SRC
+        | vk::ImageUsageFlags::SAMPLED;
+
+    let video_queue_fn = ash::khr::video_queue::Instance::load(context.entry(), context.instance());
+    for (label, usage) in [
+        (
+            "pictures pixelforge creates (DPB|DST|SRC|SAMPLED)",
+            coincide,
+        ),
+        ("reference-only DPB", dpb),
+    ] {
+        let profiles = [profile];
+        let mut list = vk::VideoProfileListInfoKHR::default().profiles(&profiles);
+        let info = vk::PhysicalDeviceVideoFormatInfoKHR::default()
+            .image_usage(usage)
+            .push(&mut list);
+        let mut count = 0u32;
+        let result = unsafe {
+            (video_queue_fn
+                .fp()
+                .get_physical_device_video_format_properties_khr)(
+                context.physical_device(),
+                &info,
+                &mut count,
+                std::ptr::null_mut(),
+            )
+        };
+        if result != vk::Result::SUCCESS || count == 0 {
+            println!("  {label}: unsupported");
+            continue;
+        }
+        let mut props = vec![vk::VideoFormatPropertiesKHR::default(); count as usize];
+        unsafe {
+            let _ = (video_queue_fn
+                .fp()
+                .get_physical_device_video_format_properties_khr)(
+                context.physical_device(),
+                &info,
+                &mut count,
+                props.as_mut_ptr(),
+            );
+        }
+        println!("  {label}:");
+        for prop in props.iter().take(count as usize) {
+            let planes = prop
+                .image_create_flags
+                .contains(vk::ImageCreateFlags::MUTABLE_FORMAT);
+            println!(
+                "    {:?}  flags: {:?}  per-plane views: {}",
+                prop.format, prop.image_create_flags, planes
+            );
+        }
+    }
     Ok(())
 }

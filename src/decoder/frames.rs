@@ -11,7 +11,7 @@
 
 use std::sync::{Arc, Condvar, Mutex};
 
-use ash::vk;
+use ash::vk::{self, TaggedStructure as _};
 
 use crate::decoder::DecodedFrame;
 use crate::decoder::common::DecoderCommon;
@@ -318,6 +318,8 @@ struct ReorderEntry {
     /// Whether this picture's image can be sampled without a copy. Recorded at
     /// retain time, since it depends on which storage the picture ended up in.
     sampleable: bool,
+    /// Whether this picture's planes can be viewed separately. Same reason.
+    plane_views: bool,
     display_order: i32,
     pts: u64,
     is_keyframe: bool,
@@ -381,13 +383,18 @@ impl ReorderBuffer {
         let retained = self.retain(common, picture)?;
         // A pool copy is always sampleable; a pinned DPB image only if the
         // device gave the session a picture format supporting SAMPLED.
-        let sampleable = match retained {
-            Retained::Slot { .. } => common.session()?.sampleable,
-            Retained::Pool { .. } => true,
+        let (sampleable, plane_views) = match retained {
+            Retained::Slot { .. } => {
+                let session = common.session()?;
+                (session.sampleable, session.plane_views)
+            }
+            // A pool image is an ordinary image: both are unconditional.
+            Retained::Pool { .. } => (true, true),
         };
         self.buffered.push(ReorderEntry {
             retained,
             sampleable,
+            plane_views,
             display_order: picture.display_order,
             pts: picture.pts,
             is_keyframe: picture.is_keyframe,
@@ -501,6 +508,7 @@ impl ReorderBuffer {
             display_order: entry.display_order,
             is_keyframe: entry.is_keyframe,
             sampleable: entry.sampleable,
+            plane_views: entry.plane_views,
             pin: Some(pin),
         }
     }
@@ -547,8 +555,11 @@ fn create_pool_image(
         .samples(vk::SampleCountFlags::TYPE_1)
         .tiling(vk::ImageTiling::OPTIMAL)
         // SAMPLED unconditionally: a pool image carries no video profile, so it
-        // is an ordinary image and every driver can sample one. That keeps a
-        // copied-out frame as usable to a renderer as a pinned one.
+        // is an ordinary image and every driver can sample one. Same for
+        // MUTABLE_FORMAT, which needs no driver permission here. That keeps a
+        // copied-out frame exactly as usable to a renderer as a pinned one, so
+        // a consumer never has to handle "plane views work on some frames".
+        .flags(vk::ImageCreateFlags::MUTABLE_FORMAT)
         .usage(
             vk::ImageUsageFlags::TRANSFER_DST
                 | vk::ImageUsageFlags::TRANSFER_SRC
@@ -557,6 +568,13 @@ fn create_pool_image(
         .sharing_mode(sharing_mode)
         .queue_family_indices(&families)
         .initial_layout(vk::ImageLayout::UNDEFINED);
+    let view_formats = crate::video::plane_view_formats(format);
+    let mut format_list = vk::ImageFormatListCreateInfo::default().view_formats(&view_formats);
+    let create_info = if view_formats.is_empty() {
+        create_info
+    } else {
+        create_info.push(&mut format_list)
+    };
     let image = unsafe { context.device().create_image(&create_info, None) }
         .map_err(|e| PixelForgeError::ResourceCreation(format!("reorder pool image: {}", e)))?;
 

@@ -98,6 +98,13 @@ pub(crate) struct SessionPlan {
     pub pinnable: bool,
     /// `dpb_usage` includes `SAMPLED`, so handed-out frames can be sampled.
     pub sampleable: bool,
+    /// Picture images are created with `MUTABLE_FORMAT`, so a consumer can view
+    /// their planes separately. See [`DecodeSession::plane_views`].
+    pub plane_views: bool,
+    /// Creation flags for picture images, from what the driver reported.
+    pub image_flags: vk::ImageCreateFlags,
+    /// Formats views of a picture image may use. Empty unless `plane_views`.
+    pub view_formats: Vec<vk::Format>,
     /// One layered DPB image rather than one image per slot.
     pub use_layered_dpb: bool,
     pub dpb_usage: vk::ImageUsageFlags,
@@ -146,6 +153,14 @@ pub(crate) struct DecodeSession {
     pub pinnable: bool,
     /// Whether decoded pictures can be sampled without being copied first.
     pub sampleable: bool,
+    /// Whether a consumer may create per-plane views of a decoded picture.
+    ///
+    /// True when the picture images were created with `MUTABLE_FORMAT`, which
+    /// the driver has to allow for this profile, format and usage. It is what
+    /// lets a renderer read the luma and chroma planes as two ordinary
+    /// single-plane textures instead of needing a `VkSamplerYcbcrConversion`,
+    /// which some shader toolchains cannot express at all.
+    pub plane_views: bool,
     /// Distinct decode output image, only when `!coincide`.
     pub output_image: Option<(vk::Image, vk::DeviceMemory, vk::ImageView)>,
 }
@@ -346,6 +361,8 @@ impl DecoderCommon {
             format: plan.picture_format,
             usage: plan.dpb_usage,
             sharing_families: &families,
+            flags: plan.image_flags,
+            view_formats: &plan.view_formats,
         };
 
         let (dpb_images, dpb_memories, dpb_views) = create_dpb_images(
@@ -391,6 +408,7 @@ impl DecoderCommon {
             spare_slots: plan.spare_slots,
             pinnable: plan.pinnable,
             sampleable: plan.sampleable,
+            plane_views: plan.plane_views,
             output_image,
         });
         Ok(())

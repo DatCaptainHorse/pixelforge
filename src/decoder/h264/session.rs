@@ -374,14 +374,43 @@ impl H264Decoder {
             (sampled_usage, true, sampled_formats)
         };
         let preferred = get_video_format(pixel_format, bit_depth);
-        let picture_format = if supported.contains(&preferred) {
-            preferred
-        } else {
-            *supported.first().ok_or_else(|| {
+        let chosen = supported
+            .iter()
+            .find(|f| f.format == preferred)
+            .or_else(|| supported.first())
+            .copied()
+            .ok_or_else(|| {
                 PixelForgeError::CodecNotSupported(
                     "H.264 decode: no supported picture format for this profile".to_string(),
                 )
-            })?
+            })?;
+        let picture_format = chosen.format;
+
+        // MUTABLE_FORMAT lets a consumer view the picture's planes separately,
+        // which is the only way to read a multi-planar image without a
+        // sampler-YCbCr conversion, and the only way at all for a renderer
+        // whose shaders come from a toolchain that cannot express one (naga and
+        // therefore wgpu, among others). It is opportunistic: the driver
+        // enumerates which creation flags it accepts for this profile, format
+        // and usage, and DPB-only images on both RADV and ANV accept none.
+        //
+        // Naming the plane formats keeps a driver from having to assume the
+        // image might be reinterpreted as anything, which is what would
+        // otherwise cost it compression.
+        let plane_views = chosen
+            .create_flags
+            .contains(vk::ImageCreateFlags::MUTABLE_FORMAT);
+        let image_flags = if plane_views {
+            vk::ImageCreateFlags::MUTABLE_FORMAT
+        } else {
+            vk::ImageCreateFlags::empty()
+        };
+        let view_formats: Vec<vk::Format> = if plane_views {
+            let mut list = vec![picture_format];
+            list.extend(crate::video::plane_view_formats(picture_format));
+            list
+        } else {
+            Vec::new()
         };
 
         // Hand the shared layer everything it needs to build the session; it
@@ -399,6 +428,9 @@ impl H264Decoder {
             coincide,
             pinnable,
             sampleable,
+            plane_views,
+            image_flags,
+            view_formats,
             use_layered_dpb,
             dpb_usage,
         };
@@ -417,7 +449,7 @@ impl H264Decoder {
         debug!(
             "H.264 decode session: {}x{} {:?}, {} DPB slots ({} spare), \
              layered={}, coincide={}, pinnable={}, sampleable={}, \
-             bitstream alignment {}/{} (offset/size)",
+             plane_views={}, bitstream alignment {}/{} (offset/size)",
             coded_width,
             coded_height,
             picture_format,
@@ -427,6 +459,7 @@ impl H264Decoder {
             coincide,
             pinnable,
             sampleable,
+            plane_views,
             self.common.bitstream_offset_alignment,
             self.common.bitstream_size_alignment
         );

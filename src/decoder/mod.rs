@@ -251,8 +251,32 @@ pub struct DecodedFrame {
     ///
     /// Sampling also needs a view of the caller's own: the format is
     /// multi-planar YCbCr, so it takes a `VkSamplerYcbcrConversion`, and the
-    /// image must be transitioned out of [`layout`](Self::layout) first.
+    /// image must be transitioned out of [`layout`](Self::layout) first, unless
+    /// it is already in `GENERAL`.
     pub sampleable: bool,
+    /// Whether views of [`image`](Self::image)'s individual planes are legal:
+    /// a view with a `VK_IMAGE_ASPECT_PLANE_i_BIT` aspect and that plane's
+    /// compatible single-plane format (`R8_UNORM` for luma and `R8G8_UNORM`
+    /// for chroma in NV12, `R10X6_UNORM_PACK16` and
+    /// `R10X6G10X6_UNORM_2PACK16` in P010).
+    ///
+    /// This is the way to read a decoded picture *without* a
+    /// `VkSamplerYcbcrConversion`: two ordinary single-plane textures, with the
+    /// YUV to RGB matrix left to the shader. Worth caring about because a
+    /// combined image sampler with an immutable ycbcr sampler cannot be
+    /// expressed by every shader toolchain, naga and so wgpu among them, and a
+    /// renderer built on one of those otherwise has to copy every picture.
+    ///
+    /// The image is created with `MUTABLE_FORMAT` where the driver allows it
+    /// for this profile, format and usage, which both RADV and ANV do for
+    /// H.264 4:2:0. Frames that came through the copying path always allow it,
+    /// since those images carry no video profile. When false, a consumer needs
+    /// the conversion, or a copy of their own.
+    ///
+    /// Views are the consumer's to create and cache; the decoder rotates
+    /// through a handful of images, so key a cache on
+    /// [`image`](Self::image) and [`array_layer`](Self::array_layer).
+    pub plane_views: bool,
     /// Keeps this frame's storage reserved; releases it on drop. `None` for a
     /// frame that borrows the decoder's DPB image (see the validity rules).
     // Held purely for its `Drop`, which is what returns the storage.

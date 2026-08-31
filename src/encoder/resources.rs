@@ -37,6 +37,8 @@ pub(crate) fn create_dpb_images(
         format,
         usage: vk::ImageUsageFlags::VIDEO_ENCODE_DPB_KHR,
         sharing_families: &[],
+        flags: vk::ImageCreateFlags::empty(),
+        view_formats: &[],
     };
     create_dpb_images_shared(context, &dpb_params, profile_info, count, use_layered)
 }
@@ -74,6 +76,8 @@ pub(crate) fn create_image(
         format,
         usage,
         sharing_families: &families,
+        flags: vk::ImageCreateFlags::empty(),
+        view_formats: &[],
     };
     create_video_image(context, &dpb_params, profile_info)
 }

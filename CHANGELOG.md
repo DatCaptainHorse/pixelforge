@@ -35,6 +35,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stream fall back to copying rather than failing.
 - `DecodeConfig::with_output_depth` reserves DPB slots so decoded frames can be
   held while decoding continues.
+- Decoded picture images are created with `VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT`
+  where the driver reports it in `VkVideoFormatPropertiesKHR::imageCreateFlags`,
+  paired with `VkImageFormatListCreateInfo` naming the plane formats.
+  `DecodedFrame::plane_views` says whether it worked. A consumer can then view
+  the luma and chroma planes separately, as `R8_UNORM` and `R8G8_UNORM`, and
+  read a decoded frame with no `VkSamplerYcbcrConversion` at all. That matters
+  because some shader toolchains cannot express a combined image sampler with an
+  immutable ycbcr sampler (naga, and so wgpu), leaving those renderers no
+  zero-copy path otherwise. Both RADV and ANV allow it for H.264 4:2:0, and it
+  costs no measurable decode throughput on either. Frames from the copying path
+  always allow it, since those images carry no video profile.
+- `query_capabilities` reports decode picture `imageCreateFlags`, for both the
+  usage pixelforge creates pictures with and the reference-only DPB, which are
+  not the same answer.
 - `examples/sample_frame` shows the render path end to end: a decoded frame
   sampled in a compute shader through a `VkSamplerYcbcrConversion`, with no
   copy and no layout transition, while the decoder is still using that picture

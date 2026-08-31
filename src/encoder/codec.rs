@@ -570,7 +570,10 @@ pub(crate) fn build_encoder_common(req: &CommonInitRequest) -> Result<CommonInit
             "No supported Vulkan Video DPB formats for this profile".to_string(),
         ));
     }
-    if !supported_src_formats.contains(&preferred_src_format) {
+    if !supported_src_formats
+        .iter()
+        .any(|f| f.format == preferred_src_format)
+    {
         return Err(PixelForgeError::NoSuitableDevice(format!(
             "Preferred input format {:?} is not supported for VIDEO_ENCODE_SRC_KHR. Supported: {:?}",
             preferred_src_format, supported_src_formats
@@ -579,9 +582,9 @@ pub(crate) fn build_encoder_common(req: &CommonInitRequest) -> Result<CommonInit
     let picture_format = preferred_src_format;
     let reference_picture_format = supported_dpb_formats
         .iter()
-        .copied()
+        .map(|f| f.format)
         .find(|f| *f == picture_format)
-        .unwrap_or(supported_dpb_formats[0]);
+        .unwrap_or(supported_dpb_formats[0].format);
 
     // Negotiate DPB slots and active references.
     let max_dpb_slots_supported = capabilities.max_dpb_slots as usize;

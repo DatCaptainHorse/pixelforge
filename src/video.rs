@@ -48,6 +48,14 @@ pub(crate) struct VideoImageParams<'a> {
     pub format: vk::Format,
     pub usage: vk::ImageUsageFlags,
     pub sharing_families: &'a [u32],
+    /// Extra creation flags, which for a video image may only be ones the
+    /// driver reported in [`VideoFormatSupport::create_flags`].
+    pub flags: vk::ImageCreateFlags,
+    /// Formats views of this image may use, when `flags` includes
+    /// `MUTABLE_FORMAT`. Naming them lets a driver keep compression it would
+    /// otherwise have to give up, since it no longer has to assume the image
+    /// might be reinterpreted as anything at all. Empty chains nothing.
+    pub view_formats: &'a [vk::Format],
 }
 
 /// Deduplicate `families` and decide CONCURRENT vs EXCLUSIVE sharing mode.
@@ -108,8 +116,11 @@ fn create_video_image_raw(
 
     let profiles = [*profile_info];
     let mut profile_list = vk::VideoProfileListInfoKHR::default().profiles(&profiles);
+    let mut format_list =
+        vk::ImageFormatListCreateInfo::default().view_formats(params.view_formats);
 
-    let create_info = vk::ImageCreateInfo::default()
+    let mut create_info = vk::ImageCreateInfo::default()
+        .flags(params.flags)
         .image_type(vk::ImageType::TYPE_2D)
         .format(params.format)
         .extent(vk::Extent3D {
@@ -126,6 +137,9 @@ fn create_video_image_raw(
         .queue_family_indices(&queue_families)
         .initial_layout(vk::ImageLayout::UNDEFINED)
         .push(&mut profile_list);
+    if !params.view_formats.is_empty() {
+        create_info = create_info.push(&mut format_list);
+    }
 
     let image = unsafe { context.device().create_image(&create_info, None) }
         .map_err(|e| PixelForgeError::ResourceCreation(format!("image creation: {}", e)))?;
@@ -175,11 +189,43 @@ fn create_video_image_view(
         .map_err(|e| PixelForgeError::ResourceCreation(format!("image view creation: {}", e)))
 }
 
+/// The single-plane formats a multi-planar picture format's planes can be
+/// viewed as, per the format compatibility table in the Vulkan spec.
+///
+/// Naming these in `VkImageFormatListCreateInfo` alongside `MUTABLE_FORMAT` is
+/// what lets a consumer read luma and chroma as two ordinary textures, and what
+/// keeps a driver from having to assume the image could become anything.
+pub(crate) fn plane_view_formats(picture_format: vk::Format) -> Vec<vk::Format> {
+    match picture_format {
+        vk::Format::G8_B8R8_2PLANE_420_UNORM | vk::Format::G8_B8R8_2PLANE_444_UNORM => {
+            vec![vk::Format::R8_UNORM, vk::Format::R8G8_UNORM]
+        }
+        vk::Format::G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16
+        | vk::Format::G10X6_B10X6R10X6_2PLANE_444_UNORM_3PACK16 => vec![
+            vk::Format::R10X6_UNORM_PACK16,
+            vk::Format::R10X6G10X6_UNORM_2PACK16,
+        ],
+        _ => Vec::new(),
+    }
+}
+
+/// What a driver will accept for one picture format under a given profile and
+/// usage.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct VideoFormatSupport {
+    pub format: vk::Format,
+    /// Image creation flags this format allows here. `MUTABLE_FORMAT` is the
+    /// interesting one: with it, a consumer can view the planes of a
+    /// multi-planar picture separately, which is the only way to read one
+    /// without a sampler-YCbCr conversion.
+    pub create_flags: vk::ImageCreateFlags,
+}
+
 pub(crate) fn query_supported_video_formats(
     context: &VideoContext,
     profile_info: &vk::VideoProfileInfoKHR,
     image_usage: vk::ImageUsageFlags,
-) -> Result<Vec<vk::Format>> {
+) -> Result<Vec<VideoFormatSupport>> {
     let video_queue_fn = ash::khr::video_queue::Instance::load(context.entry(), context.instance());
 
     // Vulkan expects a profile list in the pNext chain.
@@ -234,7 +280,13 @@ pub(crate) fn query_supported_video_formats(
     }
 
     props.truncate(count as usize);
-    Ok(props.into_iter().map(|p| p.format).collect())
+    Ok(props
+        .into_iter()
+        .map(|p| VideoFormatSupport {
+            format: p.format,
+            create_flags: p.image_create_flags,
+        })
+        .collect())
 }
 
 /// Get the Vulkan format for a given pixel format and bit depth.
