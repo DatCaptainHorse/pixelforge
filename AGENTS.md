@@ -72,6 +72,20 @@ drags PSNR to ~26 dB while the images are indistinguishable. Compare the share
 of pixels that agree instead: both AMD and Intel land on 87.9% within 2 and
 33.2% exact for `bframes.264`.
 
+`sample_planes` is the other half of that story, and the tighter test. It reads
+the same frames through per-plane views, with no ycbcr conversion and no sampler
+at all, and writes the samples straight through, so its output is plain NV12 and
+can be compared exactly:
+
+```bash
+cargo run --example sample_planes -- tests/data/bframes.264 out.yuv \
+    && cmp ref.yuv out.yuv && echo "plane views match the decoder"
+```
+
+Run that one on AMD too, not just locally. Its frames are pool copies on a
+device without unified image layouts, which carry no video usage, so a view
+mistake that only a real DPB image would catch passes silently on Intel.
+
 Make sure there are no Vulkan validation layer errors during execution. Enable
 them with `PIXELFORGE_VALIDATION=1`; the layer's messages are routed through
 `tracing`, so pair it with `RUST_LOG=warn` (or `debug` for the layer's own

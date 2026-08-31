@@ -285,7 +285,7 @@ fn query_detailed_capabilities(
         }
     }
 
-    print_decode_image_flags(&context)?;
+    print_decode_image_flags(context)?;
 
     Ok(())
 }

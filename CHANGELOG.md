@@ -49,6 +49,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `query_capabilities` reports decode picture `imageCreateFlags`, for both the
   usage pixelforge creates pictures with and the reference-only DPB, which are
   not the same answer.
+- `examples/sample_planes` reads decoded frames through per-plane views with no
+  ycbcr conversion and no sampler, the path a wgpu-style renderer needs, and
+  writes the samples through unchanged so its output is byte-identical to the
+  decoder's own NV12.
 - `examples/sample_frame` shows the render path end to end: a decoded frame
   sampled in a compute shader through a `VkSamplerYcbcrConversion`, with no
   copy and no layout transition, while the decoder is still using that picture

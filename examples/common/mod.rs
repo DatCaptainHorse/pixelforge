@@ -21,6 +21,32 @@ use pixelforge::decoder::DecodedFrame;
 use pixelforge::encoder::BitDepth;
 use pixelforge::vulkan::VideoContext;
 
+/// Find a memory type satisfying `flags` for `reqs`, and allocate from it.
+pub fn allocate(
+    device: &ash::Device,
+    props: &vk::PhysicalDeviceMemoryProperties,
+    reqs: vk::MemoryRequirements,
+    flags: vk::MemoryPropertyFlags,
+) -> Result<vk::DeviceMemory, Box<dyn std::error::Error>> {
+    let index = (0..props.memory_type_count)
+        .find(|&i| {
+            reqs.memory_type_bits & (1 << i) != 0
+                && props.memory_types[i as usize]
+                    .property_flags
+                    .contains(flags)
+        })
+        .ok_or("no suitable memory type")?;
+    let memory = unsafe {
+        device.allocate_memory(
+            &vk::MemoryAllocateInfo::default()
+                .allocation_size(reqs.size)
+                .memory_type_index(index),
+            None,
+        )
+    }?;
+    Ok(memory)
+}
+
 /// One frame's pixels on the host, cropped to the visible region.
 pub struct FrameData {
     pub y: Vec<u8>,

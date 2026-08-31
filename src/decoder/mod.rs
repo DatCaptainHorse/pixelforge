@@ -276,6 +276,14 @@ pub struct DecodedFrame {
     /// Views are the consumer's to create and cache; the decoder rotates
     /// through a handful of images, so key a cache on
     /// [`image`](Self::image) and [`array_layer`](Self::array_layer).
+    ///
+    /// One thing to get right: a view inherits the image's usage, and a decoded
+    /// picture's usage includes `VIDEO_DECODE_DST_KHR`, which a single-plane
+    /// format cannot satisfy. Chain a `VkImageViewUsageCreateInfo` naming only
+    /// what the view is for, typically `SAMPLED`. Skipping it produces an
+    /// invalid view, and only on the drivers where the frame really is the
+    /// decoder's DPB image, so it passes on hardware that copies. See
+    /// `examples/sample_planes`.
     pub plane_views: bool,
     /// Keeps this frame's storage reserved; releases it on drop. `None` for a
     /// frame that borrows the decoder's DPB image (see the validity rules).

@@ -18,6 +18,7 @@ use std::collections::VecDeque;
 use std::fs::File;
 use std::io::{Read, Write};
 
+#[allow(dead_code)]
 mod common;
 use common::Readback;
 

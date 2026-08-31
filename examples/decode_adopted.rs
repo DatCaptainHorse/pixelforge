@@ -15,6 +15,7 @@ use std::io::Write;
 
 use ash::vk;
 use ash::vk::TaggedStructure;
+#[allow(dead_code)]
 mod common;
 use common::Readback;
 

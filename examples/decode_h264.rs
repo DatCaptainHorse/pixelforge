@@ -12,6 +12,7 @@
 use std::fs::File;
 use std::io::Write;
 
+#[allow(dead_code)]
 mod common;
 use common::Readback;
 
