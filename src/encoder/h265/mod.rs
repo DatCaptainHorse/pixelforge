@@ -60,9 +60,7 @@ impl VideoCodec for H265 {
             self.l0_references.clear();
             self.has_backward_reference = false;
             // All DPB slots become inactive at the start of a coded video sequence.
-            for active in &mut common.dpb_slot_active {
-                *active = false;
-            }
+            common.dpb_slot_active.fill(false);
         }
 
         let header = if plan.is_idr() {

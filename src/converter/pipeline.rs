@@ -23,7 +23,9 @@ const COLOR_CONVERT_SPIRV_BYTES: &[u8] = include_bytes!("../../shader/color_conv
 /// Workgroup size: 8x8x1.
 pub fn get_spirv_code() -> Result<Vec<u32>> {
     let words = COLOR_CONVERT_SPIRV_BYTES
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|chunk| u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
         .collect();
     Ok(words)

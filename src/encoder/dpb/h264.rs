@@ -139,20 +139,19 @@ impl DpbH264 {
         }
 
         let poc_lsb = info.pic_order_cnt;
-        let poc_msb;
 
         // (8-3)
-        if (poc_lsb < self.prev_poc_lsb)
+        let poc_msb = if (poc_lsb < self.prev_poc_lsb)
             && ((self.prev_poc_lsb - poc_lsb) >= (self.max_poc_lsb / 2))
         {
-            poc_msb = self.prev_poc_msb + self.max_poc_lsb;
+            self.prev_poc_msb + self.max_poc_lsb
         } else if (poc_lsb > self.prev_poc_lsb)
             && ((poc_lsb - self.prev_poc_lsb) > (self.max_poc_lsb / 2))
         {
-            poc_msb = self.prev_poc_msb - self.max_poc_lsb;
+            self.prev_poc_msb - self.max_poc_lsb
         } else {
-            poc_msb = self.prev_poc_msb;
-        }
+            self.prev_poc_msb
+        };
 
         let entry = &mut self.entries[self.current_slot as usize];
 
@@ -168,26 +167,23 @@ impl DpbH264 {
 
     /// Calculate POC Type 2 (8.2.1.3).
     fn calculate_poc_type2(&mut self, info: &PictureStartInfo) {
-        let frame_num_offset;
-        let temp_poc;
-
         // FrameNumOffset (8-12)
-        if info.pic_type == PictureType::Idr {
-            frame_num_offset = 0;
+        let frame_num_offset = if info.pic_type == PictureType::Idr {
+            0
         } else if self.prev_frame_num > info.frame_num {
-            frame_num_offset = self.prev_frame_num_offset + self.max_frame_num as i32;
+            self.prev_frame_num_offset + self.max_frame_num as i32
         } else {
-            frame_num_offset = self.prev_frame_num_offset;
-        }
+            self.prev_frame_num_offset
+        };
 
         // tempPicOrderCnt (8-13)
-        if info.pic_type == PictureType::Idr {
-            temp_poc = 0;
+        let temp_poc = if info.pic_type == PictureType::Idr {
+            0
         } else if !info.is_reference {
-            temp_poc = 2 * (frame_num_offset + info.frame_num as i32) - 1;
+            2 * (frame_num_offset + info.frame_num as i32) - 1
         } else {
-            temp_poc = 2 * (frame_num_offset + info.frame_num as i32);
-        }
+            2 * (frame_num_offset + info.frame_num as i32)
+        };
 
         let entry = &mut self.entries[self.current_slot as usize];
 
