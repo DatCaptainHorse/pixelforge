@@ -324,6 +324,7 @@ impl Av1 {
         all_reference_slots.extend_from_slice(&reference_slots);
 
         let is_first_frame = plan.is_first_frame();
+        let should_reset_coding_state = is_first_frame || (is_key_frame && !rc.is_disabled());
         // Clamp GOP values to at least 1; a value of 0 is undefined in
         // Vulkan and causes undefined behavior on some drivers (RADV).
         let gop_frames = common.config.gop_size.max(1);
@@ -336,19 +337,22 @@ impl Av1 {
         // Reset and write start timestamp
         reset_start_timestamp(common.device(), command_buffer, timestamp_query_pool);
 
+        // Ash links pNext chains in place, so each command needs its own extension structs.
+        let mut begin_rc_info = rc_info;
+        let mut begin_av1_rc_info = av1_rc_info;
         let begin_coding_info = if is_first_frame {
             vk::VideoBeginCodingInfoKHR::default()
                 .video_session(common.session)
                 .video_session_parameters(common.session_params)
                 .reference_slots(&all_reference_slots)
-                .push(&mut av1_rc_info)
+                .push(&mut begin_av1_rc_info)
         } else {
             vk::VideoBeginCodingInfoKHR::default()
                 .video_session(common.session)
                 .video_session_parameters(common.session_params)
                 .reference_slots(&all_reference_slots)
-                .push(&mut rc_info)
-                .push(&mut av1_rc_info)
+                .push(&mut begin_rc_info)
+                .push(&mut begin_av1_rc_info)
         };
 
         unsafe {
@@ -357,7 +361,7 @@ impl Av1 {
                 .cmd_begin_video_coding(command_buffer, &begin_coding_info);
         }
 
-        if is_first_frame {
+        if should_reset_coding_state {
             let mut quality_level_info =
                 vk::VideoEncodeQualityLevelInfoKHR::default().quality_level(0);
             let control_info = vk::VideoCodingControlInfoKHR::default()
