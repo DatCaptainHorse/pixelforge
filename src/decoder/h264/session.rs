@@ -801,6 +801,7 @@ impl H264Decoder {
 
         let picture_layout = self.common.picture_layout();
         let output_layout = self.common.output_layout();
+        let generation = self.common.generation;
         let active = self.common.session.as_mut().expect("active");
         let (image, image_view, layout, array_layer) = if active.coincide {
             let (image, layer) = active.dpb_image_for_slot(slot);
@@ -826,6 +827,7 @@ impl H264Decoder {
             array_layer,
             pixel_format: active.pixel_format,
             bit_depth: active.bit_depth,
+            generation,
             width,
             height,
             coded_width: active.coded_width,

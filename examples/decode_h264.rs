@@ -78,18 +78,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let start = std::time::Instant::now();
     let mut frame_count = 0usize;
     let mut last_info: Option<(u32, u32, i32, bool)> = None;
+    let mut last_generation: Option<u64> = None;
 
     let consume = |frame: DecodedFrame,
                    output: &mut Option<File>,
                    readback: &mut Option<Readback>,
                    frame_count: &mut usize,
-                   last_info: &mut Option<(u32, u32, i32, bool)>|
+                   last_info: &mut Option<(u32, u32, i32, bool)>,
+                   last_generation: &mut Option<u64>|
      -> Result<(), Box<dyn std::error::Error>> {
         if let (Some(file), Some(readback)) = (output.as_mut(), readback.as_mut()) {
             let data = readback.read(&frame)?;
             file.write_all(&data.y)?;
             file.write_all(&data.uv)?;
         }
+        // A rebuilt session means a new set of images, so anything caching
+        // per-image state has to notice. Reporting it here is what makes the
+        // field visible in an example rather than only in the docs.
+        if last_generation.is_some_and(|g| g != frame.generation) {
+            println!(
+                "  generation {} -> {} at frame {}: the decoder rebuilt its images",
+                last_generation.unwrap(),
+                frame.generation,
+                frame_count
+            );
+        }
+        *last_generation = Some(frame.generation);
         *last_info = Some((
             frame.width,
             frame.height,
@@ -126,6 +140,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 &mut readback,
                 &mut frame_count,
                 &mut last_info,
+                &mut last_generation,
             )?;
         }
     }
@@ -140,6 +155,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             &mut readback,
             &mut frame_count,
             &mut last_info,
+            &mut last_generation,
         )?;
     }
     let decode_time = start.elapsed();

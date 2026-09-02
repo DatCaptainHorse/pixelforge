@@ -34,6 +34,7 @@ pub(crate) struct DecodedPicture {
     pub array_layer: u32,
     pub pixel_format: PixelFormat,
     pub bit_depth: BitDepth,
+    pub generation: u64,
     pub width: u32,
     pub height: u32,
     pub coded_width: u32,
@@ -320,6 +321,8 @@ struct ReorderEntry {
     sampleable: bool,
     /// Whether this picture's planes can be viewed separately. Same reason.
     plane_views: bool,
+    /// Which set of decoder images this picture's storage belongs to.
+    generation: u64,
     display_order: i32,
     pts: u64,
     is_keyframe: bool,
@@ -395,6 +398,7 @@ impl ReorderBuffer {
             retained,
             sampleable,
             plane_views,
+            generation: picture.generation,
             display_order: picture.display_order,
             pts: picture.pts,
             is_keyframe: picture.is_keyframe,
@@ -509,6 +513,7 @@ impl ReorderBuffer {
             is_keyframe: entry.is_keyframe,
             sampleable: entry.sampleable,
             plane_views: entry.plane_views,
+            generation: entry.generation,
             pin: Some(pin),
         }
     }

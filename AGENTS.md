@@ -91,6 +91,21 @@ because there the frame really is the decoder's DPB image. So if a device
 supporting it is available, run this example there before trusting a green run
 elsewhere. `RUST_LOG=debug` reports which case applies, as `pinnable=`.
 
+Nothing in `tests/data` changes resolution mid-stream, and that path has its
+own hazards, so build one and check it:
+
+```bash
+ffmpeg -f lavfi -i testsrc2=size=320x240:rate=30:duration=1 -c:v libx264 -bf 2 -f h264 a.264
+ffmpeg -f lavfi -i testsrc2=size=640x480:rate=30:duration=1 -c:v libx264 -bf 2 -f h264 b.264
+cat a.264 b.264 > switch.264
+cargo run --example decode_h264 -- switch.264 out.yuv
+```
+
+Sixty frames, thirty at each size, and one `generation N -> N+1` line at the
+changeover. Build the reference per segment, since ffmpeg rescales a
+resolution-changing stream to its first size and a whole-stream reference will
+not compare.
+
 Make sure there are no Vulkan validation layer errors during execution. Enable
 them with `PIXELFORGE_VALIDATION=1`; the layer's messages are routed through
 `tracing`, so pair it with `RUST_LOG=warn` (or `debug` for the layer's own

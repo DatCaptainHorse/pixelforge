@@ -209,6 +209,15 @@ pub(crate) struct DecoderCommon {
     /// The active session, created lazily from the stream's parameter sets.
     pub session: Option<DecodeSession>,
 
+    /// Which set of picture images the decoder is currently handing out.
+    ///
+    /// Incremented every time a session is created. Copied onto each
+    /// [`DecodedFrame`], where it is the only thing that lets a consumer tell
+    /// one set of images from the next: a rebuilt session destroys its images,
+    /// and drivers reuse `VkImage` handles freely, so a handle alone cannot
+    /// identify anything.
+    pub generation: u64,
+
     /// DPB slots reserved by frames the caller still holds. Shared with those
     /// frames, which release their slot when dropped.
     pub slot_pins: Arc<SlotPins>,
@@ -258,6 +267,7 @@ impl DecoderCommon {
             bitstream_offset_alignment: 1,
             bitstream_size_alignment: 1,
             session: None,
+            generation: 0,
             slot_pins: Arc::new(SlotPins::default()),
             frames_rx: Some(frames_rx),
             consumer_queue_family,
@@ -390,6 +400,9 @@ impl DecoderCommon {
 
         let session_params = make_params(self, session)?;
 
+        // A new set of images, so a new generation. Frames from the previous
+        // one keep their old number and a consumer can tell them apart.
+        self.generation = self.generation.wrapping_add(1);
         self.session = Some(DecodeSession {
             session,
             session_memory,
@@ -421,11 +434,17 @@ impl DecoderCommon {
         let Some(session) = self.session.take() else {
             return;
         };
-        // The slots these pins refer to are about to stop existing.
+        // The slots these pins refer to are about to stop existing, and so are
+        // the images. Debug rather than a warning: a consumer that keys on
+        // `DecodedFrame::generation` handles this as a matter of course, and a
+        // warning on every resolution change under correct usage only teaches
+        // people to filter the log.
         if self.slot_pins.any_pinned() {
-            tracing::warn!(
-                "decode session torn down while decoded frames still hold DPB slots; \
-                 those frames' images are now invalid"
+            tracing::debug!(
+                "decode session rebuilt while {} decoded frame(s) still hold DPB slots; \
+                 their images belong to generation {} and are now destroyed",
+                self.slot_pins.count(),
+                self.generation
             );
         }
         self.slot_pins.clear();

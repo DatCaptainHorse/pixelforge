@@ -193,9 +193,10 @@ impl DecodeConfig {
 ///   [`DecodeConfig::with_output_depth`] spare slots. Once they are all
 ///   reserved the decoder falls back to copying pictures out, which still
 ///   works but gives up the zero-copy path. Drop frames promptly.
-/// - Drop every frame before the [`Decoder`], and before feeding a stream that
-///   changes resolution (which rebuilds the session and its images). The
-///   decoder warns rather than leaving handles silently dangling.
+/// - Drop every frame before the [`Decoder`]. A frame that outlives a session
+///   rebuild, which a change of resolution or parameter sets causes, keeps its
+///   DPB slot but loses its image; [`generation`](Self::generation) is how to
+///   tell, and dropping such a frame is safe.
 #[derive(Debug)]
 pub struct DecodedFrame {
     /// The decoded picture on the GPU.
@@ -224,6 +225,30 @@ pub struct DecodedFrame {
     pub pixel_format: PixelFormat,
     /// Bit depth of the samples: eight for NV12, ten for P010.
     pub bit_depth: BitDepth,
+    /// Which set of decoder images [`image`](Self::image) belongs to.
+    ///
+    /// The decoder rebuilds its session, and with it every picture image, when
+    /// the stream's geometry or parameter sets change. Frames decoded before a
+    /// rebuild keep the generation they were decoded under, and their images
+    /// are destroyed once the rebuild happens: holding the frame keeps its DPB
+    /// slot reserved, but it does not keep the image alive across a rebuild.
+    ///
+    /// This matters for anything that caches per-image state, such as the
+    /// views a renderer builds over a frame. `vk::Image` handles are reused
+    /// freely by drivers, so a handle from a destroyed image can come back
+    /// attached to a new one and a cache keyed on the handle alone will hit and
+    /// hand back views of dead memory. Key on `(generation, image,
+    /// array_layer)` instead, and treat a frame whose generation is behind the
+    /// newest one seen as expired: drop it rather than using its image.
+    ///
+    /// Dropping such a frame is always safe; only its slot release runs, which
+    /// touches no Vulkan object.
+    ///
+    /// Frames that came through the copying path carry a generation too, and
+    /// their images are private and never destroyed while the frame is alive.
+    /// The rule above is still the right one to write, since which path a frame
+    /// took is not something a consumer should have to branch on.
+    pub generation: u64,
     /// Visible (cropped) width in pixels.
     pub width: u32,
     /// Visible (cropped) height in pixels.

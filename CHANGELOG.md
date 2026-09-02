@@ -21,6 +21,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   consumer can run on their own threads. `DecodeSource::next_frame` awaits the
   next frame and `try_next_frame` takes one only if it is ready. Measured
   10-21% higher decode throughput than the previous synchronous decoder.
+- `DecodedFrame::generation` identifies which set of decoder images a frame's
+  image belongs to. The decoder rebuilds its session, and every picture image
+  with it, when the stream's parameter sets change; frames decoded earlier keep
+  their old generation and their images are gone. Since drivers reuse
+  `VkImage` handles, a consumer caching per-image state (a renderer's views,
+  say) has to key on `(generation, image, array_layer)` and discard frames from
+  a superseded generation. Nothing else can tell those apart.
 - `DecodeSink::decode` returns a `DecodeStatus` (`Decoded`, `Buffered` or
   `NeedsKeyframe`) rather than reporting a missing keyframe as an error. Data
   that cannot be decoded yet is the normal state of affairs when joining a live
