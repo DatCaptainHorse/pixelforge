@@ -21,13 +21,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   consumer can run on their own threads. `DecodeSource::next_frame` awaits the
   next frame and `try_next_frame` takes one only if it is ready. Measured
   10-21% higher decode throughput than the previous synchronous decoder.
-- `DecodedFrame::generation` identifies which set of decoder images a frame's
-  image belongs to. The decoder rebuilds its session, and every picture image
-  with it, when the stream's parameter sets change; frames decoded earlier keep
-  their old generation and their images are gone. Since drivers reuse
-  `VkImage` handles, a consumer caching per-image state (a renderer's views,
-  say) has to key on `(generation, image, array_layer)` and discard frames from
-  a superseded generation. Nothing else can tell those apart.
+- A decoded frame's image is now valid for exactly as long as the frame, with
+  no exceptions. A session rebuild, which a resolution or parameter set change
+  causes, used to destroy the images of frames still in flight; they are now
+  reference counted per image, so a rebuild frees only what nothing is holding
+  and the last frame to be dropped releases the rest. Before this, a mid-stream
+  resolution change crashed a consumer reading a frame decoded just before it.
+- `DecodedFrame::generation` says which set of decoder images a frame belongs
+  to. Not needed for validity, but a consumer caching per-image state (a
+  renderer's views, say) must key on `(generation, image, array_layer)`:
+  handles are reused once a generation's images are finally released.
+- DPB slot reservations are per session, so a frame outliving a rebuild
+  releases into the set it was decoded under and cannot free a slot the current
+  session reserved for someone else.
 - `DecodeSink::decode` returns a `DecodeStatus` (`Decoded`, `Buffered` or
   `NeedsKeyframe`) rather than reporting a missing keyframe as an error. Data
   that cannot be decoded yet is the normal state of affairs when joining a live

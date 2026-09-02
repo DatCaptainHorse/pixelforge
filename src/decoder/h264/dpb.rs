@@ -908,18 +908,30 @@ mod tests {
         pins.wait_for_release();
     }
 
-    /// Clearing pins (session teardown) makes every slot allocatable again.
+    /// Each session owns its pins, so a frame outliving a rebuild releases into
+    /// the set it was decoded under and cannot free a slot the *current*
+    /// session has reserved for someone else.
     #[test]
-    fn clearing_pins_frees_every_slot() {
-        let pins = Arc::new(SlotPins::default());
-        let mut dpb = DecodeDpb::new(2, pins.clone());
-        let slot = dpb.try_allocate_slot().unwrap();
-        pins.pin(slot);
-        dpb.release_slot(slot);
-        assert_eq!(dpb.try_allocate_slot(), Some(1));
+    fn pins_do_not_leak_across_sessions() {
+        let old_pins = Arc::new(SlotPins::default());
+        let mut old_dpb = DecodeDpb::new(2, old_pins.clone());
+        let held = old_dpb.try_allocate_slot().unwrap();
+        old_pins.pin(held);
 
-        pins.clear();
-        dpb.release_slot(1);
-        assert_eq!(dpb.try_allocate_slot(), Some(slot));
+        // A rebuild: new session, new pin set, and a frame from the old one is
+        // still alive.
+        let new_pins = Arc::new(SlotPins::default());
+        let mut new_dpb = DecodeDpb::new(2, new_pins.clone());
+        let reused = new_dpb.try_allocate_slot().unwrap();
+        assert_eq!(reused, held, "the new session should reuse the slot number");
+        new_pins.pin(reused);
+
+        // The old frame is dropped, releasing into the old set.
+        old_pins.release(held);
+
+        assert!(
+            new_pins.is_pinned(reused),
+            "a stale frame must not release a slot the current session pinned"
+        );
     }
 }

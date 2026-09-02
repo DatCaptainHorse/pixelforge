@@ -74,18 +74,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let start = std::time::Instant::now();
 
     let consume = |frame: &DecodedFrame,
-                   current_generation: u64,
                    planes: &mut Option<PlaneReader>,
                    output: &mut Option<File>,
                    count: &mut usize|
      -> Result<(), Box<dyn std::error::Error>> {
-        // A session rebuild destroyed this frame's image, and any view cached
-        // over it. Drop it rather than reading freed memory; see
-        // `DecodeSink::generation` for why the frame's own value is not enough
-        // to decide this on its own.
-        if frame.generation != current_generation {
-            return Ok(());
-        }
         if !frame.plane_views {
             return Err(
                 "this device does not allow per-plane views of decoded pictures; \
@@ -111,15 +103,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             DecodeStatus::Decoded | DecodeStatus::Buffered => {}
             DecodeStatus::NeedsKeyframe => continue,
         }
-        let generation = decoder.generation();
         while let FramePoll::Frame(frame) = decoder.try_next_frame()? {
-            consume(&frame, generation, &mut planes, &mut output, &mut count)?;
+            consume(&frame, &mut planes, &mut output, &mut count)?;
         }
     }
     decoder.finish()?;
-    let generation = decoder.generation();
     while let Some(frame) = pollster::block_on(decoder.next_frame())? {
-        consume(&frame, generation, &mut planes, &mut output, &mut count)?;
+        consume(&frame, &mut planes, &mut output, &mut count)?;
     }
 
     let elapsed = start.elapsed();
@@ -290,24 +280,7 @@ impl PlaneReader {
             )?,
         ];
 
-        let size = (w as u64 * h as u64) * 3 / 2;
-        let staging = unsafe {
-            device.create_buffer(
-                &vk::BufferCreateInfo::default()
-                    .size(size)
-                    .usage(vk::BufferUsageFlags::TRANSFER_DST)
-                    .sharing_mode(vk::SharingMode::EXCLUSIVE),
-                None,
-            )
-        }?;
-        let reqs = unsafe { device.get_buffer_memory_requirements(staging) };
-        let staging_memory = common::allocate(
-            &device,
-            &memory_properties,
-            reqs,
-            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-        )?;
-        unsafe { device.bind_buffer_memory(staging, staging_memory, 0) }?;
+        let (staging, staging_memory) = make_staging(&device, &memory_properties, w, h)?;
 
         Ok(Self {
             _context: context.clone(),
@@ -337,6 +310,7 @@ impl PlaneReader {
         &mut self,
         frame: &DecodedFrame,
     ) -> Result<(Vec<u8>, Vec<u8>), Box<dyn std::error::Error>> {
+        self.resize_for(frame)?;
         let [luma, chroma] = self.frame_views(frame)?;
         let device = self.device.clone();
 
@@ -508,6 +482,56 @@ impl PlaneReader {
         Ok((y, uv))
     }
 
+    /// Rebuild this reader's own images when the stream's size changes.
+    ///
+    /// A decoder can change resolution mid-stream, so anything sized from a
+    /// frame has to be prepared to be resized. Cached views go too: they belong
+    /// to images the decoder has moved on from.
+    fn resize_for(&mut self, frame: &DecodedFrame) -> Result<(), Box<dyn std::error::Error>> {
+        if self.width == frame.width && self.height == frame.height {
+            return Ok(());
+        }
+        unsafe {
+            self.device.device_wait_idle()?;
+            for view in self.views.values() {
+                for v in view {
+                    self.device.destroy_image_view(*v, None);
+                }
+            }
+            self.views.clear();
+            for plane in &self.out {
+                self.device.destroy_image_view(plane.view, None);
+                self.device.destroy_image(plane.image, None);
+                self.device.free_memory(plane.memory, None);
+            }
+            self.device.destroy_buffer(self.staging, None);
+            self.device.free_memory(self.staging_memory, None);
+        }
+        self.width = frame.width;
+        self.height = frame.height;
+        let (w, h) = (self.width, self.height);
+        self.out = [
+            make_plane(
+                &self.device,
+                &self.memory_properties,
+                w,
+                h,
+                vk::Format::R8_UNORM,
+            )?,
+            make_plane(
+                &self.device,
+                &self.memory_properties,
+                w / 2,
+                h / 2,
+                vk::Format::R8G8_UNORM,
+            )?,
+        ];
+        let (staging, staging_memory) = make_staging(&self.device, &self.memory_properties, w, h)?;
+        self.staging = staging;
+        self.staging_memory = staging_memory;
+        Ok(())
+    }
+
     /// Views of a decoded picture's two planes, created once per image.
     ///
     /// This is the whole trick: an ordinary view, with a plane aspect and that
@@ -633,6 +657,34 @@ fn storage_to_copy(image: vk::Image) -> vk::ImageMemoryBarrier2<'static> {
             base_array_layer: 0,
             layer_count: 1,
         })
+}
+
+/// A host-visible buffer big enough for one NV12 frame of `width` x `height`.
+fn make_staging(
+    device: &ash::Device,
+    props: &vk::PhysicalDeviceMemoryProperties,
+    width: u32,
+    height: u32,
+) -> Result<(vk::Buffer, vk::DeviceMemory), Box<dyn std::error::Error>> {
+    let size = (width as u64 * height as u64) * 3 / 2;
+    let buffer = unsafe {
+        device.create_buffer(
+            &vk::BufferCreateInfo::default()
+                .size(size)
+                .usage(vk::BufferUsageFlags::TRANSFER_DST)
+                .sharing_mode(vk::SharingMode::EXCLUSIVE),
+            None,
+        )
+    }?;
+    let reqs = unsafe { device.get_buffer_memory_requirements(buffer) };
+    let memory = common::allocate(
+        device,
+        props,
+        reqs,
+        vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+    )?;
+    unsafe { device.bind_buffer_memory(buffer, memory, 0) }?;
+    Ok((buffer, memory))
 }
 
 fn make_plane(

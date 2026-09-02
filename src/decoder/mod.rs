@@ -23,10 +23,11 @@
 //!   [`DecodeSink::finish`] at end of stream to emit what reordering held back.
 //!   Streams without B-frames buffer nothing and add no latency.
 //! - **Zero-copy output**: where the device supports unified image layouts, a
-//!   [`DecodedFrame`] is the decoder's own DPB image, pinned until the frame is
-//!   dropped, and reordering holds pins rather than copying pictures out.
-//!   Elsewhere pictures are copied into private images instead. See
-//!   [`DecodedFrame`] for validity rules and what holding one costs.
+//!   [`DecodedFrame`] is the decoder's own DPB image, held until the frame is
+//!   dropped, and reordering holds images rather than copying pictures out.
+//!   Elsewhere pictures are copied into private images instead. Either way the
+//!   image is valid for exactly as long as the frame is; see [`DecodedFrame`]
+//!   for what holding one costs.
 //!
 //! # Limitations (H.264)
 //!
@@ -188,15 +189,18 @@ impl DecodeConfig {
 ///
 /// Two consequences worth planning for:
 ///
-/// - Holding frames costs the decoder something. The image *is* a DPB slot (no
-///   copy), so a held frame reserves one of the
-///   [`DecodeConfig::with_output_depth`] spare slots. Once they are all
-///   reserved the decoder falls back to copying pictures out, which still
-///   works but gives up the zero-copy path. Drop frames promptly.
-/// - Drop every frame before the [`Decoder`]. A frame that outlives a session
-///   rebuild, which a change of resolution or parameter sets causes, keeps its
-///   DPB slot but loses its image; [`generation`](Self::generation) is how to
-///   tell, and dropping such a frame is safe.
+/// - **Hold frames briefly.** The image *is* a DPB slot (no copy), so a live
+///   frame reserves one of the [`DecodeConfig::with_output_depth`] spare slots,
+///   and once they are all reserved the decoder copies pictures out instead of
+///   handing over its own, which still works but gives up the zero-copy path.
+///   A frame alive across a session rebuild also keeps that whole image alive.
+///
+///   If something needs a picture for longer than the moment it is rendered,
+///   copy it into an image of your own and drop the frame. Keeping decoded
+///   frames as a buffer is the one usage this API is not built for.
+/// - **Do not drop a frame while your own GPU work on it is still running.**
+///   The drop is what returns the storage, so the image may be reused or
+///   destroyed immediately afterwards. Wait for your fence first.
 #[derive(Debug)]
 pub struct DecodedFrame {
     /// The decoded picture on the GPU.
@@ -228,26 +232,20 @@ pub struct DecodedFrame {
     /// Which set of decoder images [`image`](Self::image) belongs to.
     ///
     /// The decoder rebuilds its session, and with it every picture image, when
-    /// the stream's geometry or parameter sets change. Frames decoded before a
-    /// rebuild keep the generation they were decoded under, and their images
-    /// are destroyed once the rebuild happens: holding the frame keeps its DPB
-    /// slot reserved, but it does not keep the image alive across a rebuild.
+    /// the stream's geometry or parameter sets change. This frame's image
+    /// stays valid regardless, for as long as the frame lives; the generation
+    /// is not about validity.
     ///
-    /// This matters for anything that caches per-image state, such as the
-    /// views a renderer builds over a frame. `vk::Image` handles are reused
-    /// freely by drivers, so a handle from a destroyed image can come back
-    /// attached to a new one and a cache keyed on the handle alone will hit and
-    /// hand back views of dead memory. Key on `(generation, image,
-    /// array_layer)` instead, and treat a frame whose generation is behind the
-    /// newest one seen as expired: drop it rather than using its image.
+    /// It is about **caching**. Anything keyed on a `vk::Image` handle, such as
+    /// the views a renderer builds over decoded frames, outlives the frames it
+    /// was built from. Once the last frame of a generation is dropped its
+    /// images really are destroyed, and drivers reuse handles freely, so a
+    /// handle can come back naming a different image and a cache keyed on the
+    /// handle alone will hit and return views of something else. Key on
+    /// `(generation, image, array_layer)` and the problem disappears.
     ///
-    /// Dropping such a frame is always safe; only its slot release runs, which
-    /// touches no Vulkan object.
-    ///
-    /// Frames that came through the copying path carry a generation too, and
-    /// their images are private and never destroyed while the frame is alive.
-    /// The rule above is still the right one to write, since which path a frame
-    /// took is not something a consumer should have to branch on.
+    /// Frames from the copying path carry a generation too, so a consumer never
+    /// has to know which path a frame took.
     pub generation: u64,
     /// Visible (cropped) width in pixels.
     pub width: u32,
@@ -348,7 +346,6 @@ pub(crate) type FrameReceiver = futures_channel::mpsc::UnboundedReceiver<Result<
 /// The codec-erased operations every codec decoder exposes.
 trait DecoderApi: Send {
     fn decode(&mut self, data: &[u8], pts: u64) -> Result<DecodeStatus>;
-    fn generation(&self) -> u64;
     fn finish(&mut self) -> Result<()>;
     fn take_frame_receiver(&mut self) -> Option<FrameReceiver>;
     fn picture_format(&self) -> Option<vk::Format>;
@@ -471,12 +468,6 @@ impl Decoder {
     pub fn picture_format(&self) -> Option<vk::Format> {
         self.sink.picture_format()
     }
-
-    /// The generation the decoder is currently producing. See
-    /// [`DecodeSink::generation`].
-    pub fn generation(&self) -> u64 {
-        self.sink.generation()
-    }
 }
 
 impl DecodeSink {
@@ -523,25 +514,6 @@ impl DecodeSink {
     /// negotiated from the stream's profile).
     pub fn picture_format(&self) -> Option<vk::Format> {
         self.inner.picture_format()
-    }
-
-    /// The generation of images the decoder is currently producing.
-    ///
-    /// A frame whose [`DecodedFrame::generation`] is behind this has had its
-    /// image destroyed and must not be read; drop it. Comparing against the
-    /// newest generation *seen on a frame* is not enough, because frames are
-    /// delivered in decode order: the stale ones arrive before any frame of the
-    /// new generation does, so by the time a newer one shows up the stale ones
-    /// have already been handled.
-    ///
-    /// Reading this is only race-free when the same thread drives the sink, as
-    /// it is the sink that advances it. A consumer on another thread can still
-    /// be handed a frame that goes stale immediately afterwards; there is no
-    /// way to close that from the consumer's side, and doing so needs the
-    /// decoder to defer destroying a session's images until the last frame
-    /// referencing them is dropped.
-    pub fn generation(&self) -> u64 {
-        self.inner.generation()
     }
 }
 

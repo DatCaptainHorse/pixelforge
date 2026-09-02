@@ -102,7 +102,9 @@ cargo run --example decode_h264 -- switch.264 out.yuv
 ```
 
 Sixty frames, thirty at each size, and one `generation N -> N+1` line at the
-changeover. Build the reference per segment, since ffmpeg rescales a
+changeover. Run `sample_frame` and `sample_planes` over it too: a consumer's own
+images are sized from a frame, so a resolution change is where they have to be
+rebuilt, and getting that wrong is silent rather than loud. Build the reference per segment, since ffmpeg rescales a
 resolution-changing stream to its first size and a whole-stream reference will
 not compare.
 

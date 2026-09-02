@@ -110,6 +110,48 @@ pub(crate) struct SessionPlan {
     pub dpb_usage: vk::ImageUsageFlags,
 }
 
+/// One DPB image and everything that lives and dies with it.
+///
+/// Held behind an `Arc` shared with every frame decoded into it, so a session
+/// rebuild frees only the images nothing is still holding. The rest outlive the
+/// session that made them and are destroyed by the last frame to let go, which
+/// is what makes a `DecodedFrame`'s image valid for as long as the frame is,
+/// full stop, with no exception for a stream that changes resolution.
+pub(crate) struct DpbImage {
+    context: VideoContext,
+    image: vk::Image,
+    memory: vk::DeviceMemory,
+    /// One view per slot backed by this image: all of them for a layered DPB,
+    /// exactly one when each slot has an image of its own.
+    views: Vec<vk::ImageView>,
+}
+
+impl std::fmt::Debug for DpbImage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // `VideoContext` is not Debug, and the handles are what matter anyway.
+        f.debug_struct("DpbImage")
+            .field("image", &self.image)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for DpbImage {
+    fn drop(&mut self) {
+        // Runs on whichever thread dropped the last frame referencing this
+        // image. Safe because the decoder waited for the device to idle before
+        // giving the image up, and a caller must not drop a frame while their
+        // own work on it is still in flight.
+        unsafe {
+            let device = self.context.device();
+            for &view in &self.views {
+                device.destroy_image_view(view, None);
+            }
+            device.destroy_image(self.image, None);
+            device.free_memory(self.memory, None);
+        }
+    }
+}
+
 /// The Vulkan video session and the images it decodes into.
 ///
 /// Recreated whenever the stream's parameter sets change in a way that matters
@@ -127,10 +169,8 @@ pub(crate) struct DecodeSession {
     pub pixel_format: PixelFormat,
 
     /// DPB images. One image per slot, or a single layered image.
-    pub dpb_images: Vec<vk::Image>,
-    pub dpb_memories: Vec<vk::DeviceMemory>,
-    /// One view per slot (indexes slots even when layered).
-    pub dpb_views: Vec<vk::ImageView>,
+    /// One entry per slot, or a single shared entry when the DPB is layered.
+    pub dpb: Vec<Arc<DpbImage>>,
     /// Whether each slot has been written at least once (governs the
     /// UNDEFINED-vs-DPB old layout in the pre-decode barrier).
     pub dpb_slot_active: Vec<bool>,
@@ -153,6 +193,14 @@ pub(crate) struct DecodeSession {
     pub pinnable: bool,
     /// Whether decoded pictures can be sampled without being copied first.
     pub sampleable: bool,
+    /// Slots reserved by frames the caller still holds, shared with those
+    /// frames so they release on drop.
+    ///
+    /// Per session, not per decoder: a frame decoded under an earlier session
+    /// releases into *that* session's set when it is finally dropped, where it
+    /// can no longer free a slot the current session has reserved for someone
+    /// else.
+    pub slot_pins: Arc<SlotPins>,
     /// Whether a consumer may create per-plane views of a decoded picture.
     ///
     /// True when the picture images were created with `MUTABLE_FORMAT`, which
@@ -166,13 +214,21 @@ pub(crate) struct DecodeSession {
 }
 impl DecodeSession {
     /// The image and array layer holding DPB slot `slot`.
-    /// For layered DPBs all slots share `dpb_images[0]` and are distinguished
-    /// by layer; for separate images each slot has its own image at layer 0.
+    /// For layered DPBs all slots share `dpb[0]` and are distinguished by
+    /// layer; for separate images each slot has its own image at layer 0.
     pub fn dpb_image_for_slot(&self, slot: u8) -> (vk::Image, u32) {
+        let (entry, layer, _) = self.dpb_entry(slot);
+        (entry.image, layer)
+    }
+
+    /// The image backing `slot`, the array layer within it, and its view.
+    pub fn dpb_entry(&self, slot: u8) -> (&Arc<DpbImage>, u32, vk::ImageView) {
         if self.use_layered_dpb {
-            (self.dpb_images[0], slot as u32)
+            let entry = &self.dpb[0];
+            (entry, slot as u32, entry.views[slot as usize])
         } else {
-            (self.dpb_images[slot as usize], 0)
+            let entry = &self.dpb[slot as usize];
+            (entry, 0, entry.views[0])
         }
     }
 }
@@ -217,10 +273,6 @@ pub(crate) struct DecoderCommon {
     /// and drivers reuse `VkImage` handles freely, so a handle alone cannot
     /// identify anything.
     pub generation: u64,
-
-    /// DPB slots reserved by frames the caller still holds. Shared with those
-    /// frames, which release their slot when dropped.
-    pub slot_pins: Arc<SlotPins>,
 
     /// Receiving half of the frame channel, until a `DecodeSource` takes it.
     pub frames_rx: Option<futures_channel::mpsc::UnboundedReceiver<Result<DecodedFrame>>>,
@@ -268,7 +320,6 @@ impl DecoderCommon {
             bitstream_size_alignment: 1,
             session: None,
             generation: 0,
-            slot_pins: Arc::new(SlotPins::default()),
             frames_rx: Some(frames_rx),
             consumer_queue_family,
         })
@@ -375,13 +426,39 @@ impl DecoderCommon {
             view_formats: &plan.view_formats,
         };
 
-        let (dpb_images, dpb_memories, dpb_views) = create_dpb_images(
+        let (raw_images, raw_memories, raw_views) = create_dpb_images(
             &self.context,
             &dpb_params,
             profile_info,
             plan.slot_count,
             plan.use_layered_dpb,
         )?;
+
+        // Group the raw handles by the image they belong to, so each can be
+        // retained on its own: a layered DPB is one image carrying every slot's
+        // view, otherwise it is one image and one view per slot.
+        let dpb: Vec<Arc<DpbImage>> = if plan.use_layered_dpb {
+            vec![Arc::new(DpbImage {
+                context: self.context.clone(),
+                image: raw_images[0],
+                memory: raw_memories[0],
+                views: raw_views,
+            })]
+        } else {
+            raw_images
+                .into_iter()
+                .zip(raw_memories)
+                .zip(raw_views)
+                .map(|((image, memory), view)| {
+                    Arc::new(DpbImage {
+                        context: self.context.clone(),
+                        image,
+                        memory,
+                        views: vec![view],
+                    })
+                })
+                .collect()
+        };
 
         let output_image = if plan.coincide {
             None
@@ -412,9 +489,8 @@ impl DecoderCommon {
             picture_format: plan.picture_format,
             bit_depth: plan.bit_depth,
             pixel_format: plan.pixel_format,
-            dpb_images,
-            dpb_memories,
-            dpb_views,
+            dpb,
+            slot_pins: Arc::new(SlotPins::default()),
             dpb_slot_active: vec![false; plan.slot_count],
             use_layered_dpb: plan.use_layered_dpb,
             coincide: plan.coincide,
@@ -434,33 +510,22 @@ impl DecoderCommon {
         let Some(session) = self.session.take() else {
             return;
         };
-        // The slots these pins refer to are about to stop existing, and so are
-        // the images. Debug rather than a warning: a consumer that keys on
-        // `DecodedFrame::generation` handles this as a matter of course, and a
-        // warning on every resolution change under correct usage only teaches
-        // people to filter the log.
-        if self.slot_pins.any_pinned() {
+        // Frames decoded under this session may still be alive. Their images
+        // are reference counted, so dropping the session's handles here frees
+        // every image nothing is holding and leaves the rest to the last frame
+        // that lets go. Nothing dangles, and nothing that is finished lingers.
+        if session.slot_pins.any_pinned() {
             tracing::debug!(
-                "decode session rebuilt while {} decoded frame(s) still hold DPB slots; \
-                 their images belong to generation {} and are now destroyed",
-                self.slot_pins.count(),
+                "decode session rebuilt while {} decoded frame(s) are still alive; \
+                 their images outlive generation {} until those frames are dropped",
+                session.slot_pins.count(),
                 self.generation
             );
         }
-        self.slot_pins.clear();
         unsafe {
             self.context.device().device_wait_idle().ok();
             self.video_queue_fn
                 .destroy_video_session_parameters(session.session_params, None);
-            for &view in &session.dpb_views {
-                self.context.device().destroy_image_view(view, None);
-            }
-            for &image in &session.dpb_images {
-                self.context.device().destroy_image(image, None);
-            }
-            for &memory in &session.dpb_memories {
-                self.context.device().free_memory(memory, None);
-            }
             if let Some((image, memory, view)) = session.output_image {
                 self.context.device().destroy_image_view(view, None);
                 self.context.device().destroy_image(image, None);

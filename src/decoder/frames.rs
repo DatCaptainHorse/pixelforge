@@ -14,7 +14,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use ash::vk::{self, TaggedStructure as _};
 
 use crate::decoder::DecodedFrame;
-use crate::decoder::common::DecoderCommon;
+use crate::decoder::common::{DecoderCommon, DpbImage};
 use crate::encoder::{BitDepth, PixelFormat};
 use crate::error::{PixelForgeError, Result};
 use crate::video::find_memory_type;
@@ -98,13 +98,6 @@ impl SlotPins {
             pinned = self.released.wait(pinned).unwrap();
         }
     }
-
-    /// Forget every pin. Called when the session is torn down and the slots it
-    /// refers to no longer exist.
-    pub fn clear(&self) {
-        *self.pinned.lock().unwrap() = 0;
-        self.released.notify_all();
-    }
 }
 
 /// Pins released by frames the caller has dropped, waiting to be reclaimed.
@@ -139,15 +132,21 @@ pub(crate) enum FramePin {
         releases: Arc<ReleaseQueue>,
     },
     /// The DPB slot the picture was decoded into, handed out without a copy.
-    /// Released eagerly, because a decode may be blocked waiting for it.
-    DpbSlot { slot: u8, pins: Arc<SlotPins> },
+    /// Releases the slot on drop, and holds the image itself so that a session
+    /// rebuilt while this frame is alive cannot take the pixels away.
+    DpbSlot {
+        slot: u8,
+        pins: Arc<SlotPins>,
+        #[allow(dead_code)]
+        image: Arc<DpbImage>,
+    },
 }
 
 impl Drop for FramePin {
     fn drop(&mut self) {
         match self {
             FramePin::Pool { index, releases } => releases.push(*index),
-            FramePin::DpbSlot { slot, pins } => pins.release(*slot),
+            FramePin::DpbSlot { slot, pins, .. } => pins.release(*slot),
         }
     }
 }
@@ -428,12 +427,16 @@ impl ReorderBuffer {
         // single decode call can emit many. Staying within `spare_slots` is what
         // guarantees the codec always has a slot to decode into, so a caller who
         // holds frames gets copies rather than a decoder that cannot proceed.
-        if session.pinnable && common.slot_pins.count() < session.spare_slots {
-            common.slot_pins.pin(picture.slot);
+        if session.pinnable && session.slot_pins.count() < session.spare_slots {
+            session.slot_pins.pin(picture.slot);
+            let (entry, _, _) = session.dpb_entry(picture.slot);
             return Ok(Retained::Slot {
                 pin: FramePin::DpbSlot {
                     slot: picture.slot,
-                    pins: common.slot_pins.clone(),
+                    pins: session.slot_pins.clone(),
+                    // Holding the image is what keeps it alive past a session
+                    // rebuild, so the frame stays readable for its whole life.
+                    image: entry.clone(),
                 },
                 image: picture.image,
                 image_view: picture.image_view,
@@ -573,9 +576,14 @@ fn create_pool_image(
         .sharing_mode(sharing_mode)
         .queue_family_indices(&families)
         .initial_layout(vk::ImageLayout::UNDEFINED);
-    let view_formats = crate::video::plane_view_formats(format);
+    // The image's own format has to be in the list too, not just the plane
+    // formats: a consumer sampling through a ycbcr conversion views the whole
+    // image, and a format list that omits its format makes that view invalid.
+    let mut view_formats = vec![format];
+    view_formats.extend(crate::video::plane_view_formats(format));
     let mut format_list = vk::ImageFormatListCreateInfo::default().view_formats(&view_formats);
-    let create_info = if view_formats.is_empty() {
+    let create_info = if view_formats.len() < 2 {
+        // Nothing to reinterpret this format as, so no list and no promise.
         create_info
     } else {
         create_info.push(&mut format_list)

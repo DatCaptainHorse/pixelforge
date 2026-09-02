@@ -78,14 +78,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let start = std::time::Instant::now();
 
     let consume = |frame: &DecodedFrame,
-                   current_generation: u64,
                    sampler: &mut Option<Sampler>,
                    output: &mut Option<File>,
                    count: &mut usize|
      -> Result<(), Box<dyn std::error::Error>> {
-        if frame.generation != current_generation {
-            return Ok(());
-        }
         let sampler = match sampler {
             Some(s) => s,
             none => none.insert(Sampler::new(&context, consumer_family, frame)?),
@@ -106,15 +102,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // by itself once one arrives.
             DecodeStatus::NeedsKeyframe => continue,
         }
-        let generation = decoder.generation();
         while let FramePoll::Frame(frame) = decoder.try_next_frame()? {
-            consume(&frame, generation, &mut sampler, &mut output, &mut count)?;
+            consume(&frame, &mut sampler, &mut output, &mut count)?;
         }
     }
     decoder.finish()?;
-    let generation = decoder.generation();
     while let Some(frame) = pollster::block_on(decoder.next_frame())? {
-        consume(&frame, generation, &mut sampler, &mut output, &mut count)?;
+        consume(&frame, &mut sampler, &mut output, &mut count)?;
     }
 
     let elapsed = start.elapsed();
@@ -386,6 +380,7 @@ impl Sampler {
 
     /// Sample one frame and return its RGBA pixels.
     fn sample(&mut self, frame: &DecodedFrame) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        self.resize_for(frame)?;
         let view = self.frame_view(frame)?;
         let device = self.device.clone();
 
@@ -577,6 +572,33 @@ impl Sampler {
             device.unmap_memory(self.staging_memory);
         }
         Ok(out)
+    }
+
+    /// Rebuild the render target when the stream's size changes.
+    ///
+    /// A decoder can change resolution mid-stream, so anything sized from a
+    /// frame has to be prepared to be resized. Cached views go too: they belong
+    /// to images the decoder has moved on from.
+    fn resize_for(&mut self, frame: &DecodedFrame) -> Result<(), Box<dyn std::error::Error>> {
+        if self.width == frame.width && self.height == frame.height {
+            return Ok(());
+        }
+        unsafe {
+            self.device.device_wait_idle()?;
+            for view in self.frame_views.values() {
+                self.device.destroy_image_view(*view, None);
+            }
+            self.frame_views.clear();
+            self.device.destroy_buffer(self.staging, None);
+            self.device.free_memory(self.staging_memory, None);
+            self.device.destroy_image_view(self.target_view, None);
+            self.device.destroy_image(self.target, None);
+            self.device.free_memory(self.target_memory, None);
+        }
+        self.width = frame.width;
+        self.height = frame.height;
+        self.target_initialised = false;
+        self.create_target()
     }
 
     /// A ycbcr-converting view of a decoded image, created once per image.

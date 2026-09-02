@@ -143,12 +143,6 @@ impl H264Decoder {
         self.common.frames_rx.take()
     }
 
-    /// The generation of images being produced now. See
-    /// [`DecodeSink::generation`](crate::decoder::DecodeSink::generation).
-    pub(crate) fn generation(&self) -> u64 {
-        self.common.generation
-    }
-
     pub(crate) fn picture_format(&self) -> Option<vk::Format> {
         self.common.session.as_ref().map(|a| a.picture_format)
     }
@@ -462,7 +456,8 @@ impl H264Decoder {
         self.active_sps = Some(sps.clone());
         self.active_pps = Some(pps.clone());
         self.reorder_depth = reorder_depth;
-        self.dpb = Some(DecodeDpb::new(slot_count, self.common.slot_pins.clone()));
+        let pins = self.common.session()?.slot_pins.clone();
+        self.dpb = Some(DecodeDpb::new(slot_count, pins));
 
         debug!(
             "H.264 decode session: {}x{} {:?}, {} DPB slots ({} spare), \
@@ -785,7 +780,7 @@ impl H264Decoder {
                         .to_string(),
                 ));
             }
-            self.common.slot_pins.wait_for_release();
+            self.common.session()?.slot_pins.wait_for_release();
         };
 
         // --- Record and submit ---
@@ -811,12 +806,7 @@ impl H264Decoder {
         let active = self.common.session.as_mut().expect("active");
         let (image, image_view, layout, array_layer) = if active.coincide {
             let (image, layer) = active.dpb_image_for_slot(slot);
-            (
-                image,
-                active.dpb_views[slot as usize],
-                picture_layout,
-                layer,
-            )
+            (image, active.dpb_entry(slot).2, picture_layout, layer)
         } else {
             let (image, _, view) = active
                 .output_image
@@ -945,7 +935,7 @@ impl H264Decoder {
                 .coded_offset(vk::Offset2D { x: 0, y: 0 })
                 .coded_extent(extent)
                 .base_array_layer(0)
-                .image_view_binding(active.dpb_views[slot as usize])
+                .image_view_binding(active.dpb_entry(slot).2)
         };
 
         let ref_resources: Vec<vk::VideoPictureResourceInfoKHR> =
