@@ -348,6 +348,7 @@ pub(crate) type FrameReceiver = futures_channel::mpsc::UnboundedReceiver<Result<
 /// The codec-erased operations every codec decoder exposes.
 trait DecoderApi: Send {
     fn decode(&mut self, data: &[u8], pts: u64) -> Result<DecodeStatus>;
+    fn generation(&self) -> u64;
     fn finish(&mut self) -> Result<()>;
     fn take_frame_receiver(&mut self) -> Option<FrameReceiver>;
     fn picture_format(&self) -> Option<vk::Format>;
@@ -470,6 +471,12 @@ impl Decoder {
     pub fn picture_format(&self) -> Option<vk::Format> {
         self.sink.picture_format()
     }
+
+    /// The generation the decoder is currently producing. See
+    /// [`DecodeSink::generation`].
+    pub fn generation(&self) -> u64 {
+        self.sink.generation()
+    }
 }
 
 impl DecodeSink {
@@ -516,6 +523,25 @@ impl DecodeSink {
     /// negotiated from the stream's profile).
     pub fn picture_format(&self) -> Option<vk::Format> {
         self.inner.picture_format()
+    }
+
+    /// The generation of images the decoder is currently producing.
+    ///
+    /// A frame whose [`DecodedFrame::generation`] is behind this has had its
+    /// image destroyed and must not be read; drop it. Comparing against the
+    /// newest generation *seen on a frame* is not enough, because frames are
+    /// delivered in decode order: the stale ones arrive before any frame of the
+    /// new generation does, so by the time a newer one shows up the stale ones
+    /// have already been handled.
+    ///
+    /// Reading this is only race-free when the same thread drives the sink, as
+    /// it is the sink that advances it. A consumer on another thread can still
+    /// be handed a frame that goes stale immediately afterwards; there is no
+    /// way to close that from the consumer's side, and doing so needs the
+    /// decoder to defer destroying a session's images until the last frame
+    /// referencing them is dropped.
+    pub fn generation(&self) -> u64 {
+        self.inner.generation()
     }
 }
 

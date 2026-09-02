@@ -78,10 +78,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let start = std::time::Instant::now();
 
     let consume = |frame: &DecodedFrame,
+                   current_generation: u64,
                    sampler: &mut Option<Sampler>,
                    output: &mut Option<File>,
                    count: &mut usize|
      -> Result<(), Box<dyn std::error::Error>> {
+        if frame.generation != current_generation {
+            return Ok(());
+        }
         let sampler = match sampler {
             Some(s) => s,
             none => none.insert(Sampler::new(&context, consumer_family, frame)?),
@@ -102,13 +106,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // by itself once one arrives.
             DecodeStatus::NeedsKeyframe => continue,
         }
+        let generation = decoder.generation();
         while let FramePoll::Frame(frame) = decoder.try_next_frame()? {
-            consume(&frame, &mut sampler, &mut output, &mut count)?;
+            consume(&frame, generation, &mut sampler, &mut output, &mut count)?;
         }
     }
     decoder.finish()?;
+    let generation = decoder.generation();
     while let Some(frame) = pollster::block_on(decoder.next_frame())? {
-        consume(&frame, &mut sampler, &mut output, &mut count)?;
+        consume(&frame, generation, &mut sampler, &mut output, &mut count)?;
     }
 
     let elapsed = start.elapsed();
@@ -181,7 +187,7 @@ struct Sampler {
     staging_memory: vk::DeviceMemory,
     /// One view per decoded image, since a view is bound to its image and the
     /// decoder rotates through several.
-    frame_views: std::collections::HashMap<u64, vk::ImageView>,
+    frame_views: std::collections::HashMap<(u64, u64, u32), vk::ImageView>,
     width: u32,
     height: u32,
     format: vk::Format,
@@ -580,7 +586,13 @@ impl Sampler {
     ) -> Result<vk::ImageView, Box<dyn std::error::Error>> {
         // Key on image and layer: the decoder rotates through its DPB slots, so
         // the same handful of images come back again and again.
-        let key = (ash::vk::Handle::as_raw(frame.image) << 8) | frame.array_layer as u64;
+        // Keyed on the generation as well as the handle: a rebuilt session
+        // destroys its images and drivers reuse handles.
+        let key = (
+            frame.generation,
+            ash::vk::Handle::as_raw(frame.image),
+            frame.array_layer,
+        );
         if let Some(view) = self.frame_views.get(&key) {
             return Ok(*view);
         }

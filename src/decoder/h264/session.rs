@@ -143,6 +143,12 @@ impl H264Decoder {
         self.common.frames_rx.take()
     }
 
+    /// The generation of images being produced now. See
+    /// [`DecodeSink::generation`](crate::decoder::DecodeSink::generation).
+    pub(crate) fn generation(&self) -> u64 {
+        self.common.generation
+    }
+
     pub(crate) fn picture_format(&self) -> Option<vk::Format> {
         self.common.session.as_ref().map(|a| a.picture_format)
     }

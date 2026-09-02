@@ -67,6 +67,10 @@ impl crate::decoder::DecoderApi for H264Decoder {
         H264Decoder::finish(self)
     }
 
+    fn generation(&self) -> u64 {
+        H264Decoder::generation(self)
+    }
+
     fn take_frame_receiver(&mut self) -> Option<FrameReceiver> {
         H264Decoder::take_frame_receiver(self)
     }

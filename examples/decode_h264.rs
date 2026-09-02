@@ -79,14 +79,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut frame_count = 0usize;
     let mut last_info: Option<(u32, u32, i32, bool)> = None;
     let mut last_generation: Option<u64> = None;
+    let mut dropped = 0usize;
 
     let consume = |frame: DecodedFrame,
+                   current_generation: u64,
                    output: &mut Option<File>,
                    readback: &mut Option<Readback>,
                    frame_count: &mut usize,
                    last_info: &mut Option<(u32, u32, i32, bool)>,
-                   last_generation: &mut Option<u64>|
+                   last_generation: &mut Option<u64>,
+                   dropped: &mut usize|
      -> Result<(), Box<dyn std::error::Error>> {
+        // A session rebuild destroys the images of every frame decoded before
+        // it, including ones already queued for delivery. Reading one is a
+        // use-after-free, so check against the generation the decoder is
+        // producing *now* rather than against the newest generation seen on a
+        // frame: frames arrive in decode order, so the stale ones come first.
+        if frame.generation != current_generation {
+            *dropped += 1;
+            return Ok(());
+        }
         if let (Some(file), Some(readback)) = (output.as_mut(), readback.as_mut()) {
             let data = readback.read(&frame)?;
             file.write_all(&data.y)?;
@@ -133,14 +145,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // by itself once one arrives.
             DecodeStatus::NeedsKeyframe => continue,
         }
+        let generation = decoder.generation();
         while let FramePoll::Frame(frame) = decoder.try_next_frame()? {
             consume(
                 frame,
+                generation,
                 &mut output,
                 &mut readback,
                 &mut frame_count,
                 &mut last_info,
                 &mut last_generation,
+                &mut dropped,
             )?;
         }
     }
@@ -148,14 +163,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // End of stream: decodes the trailing picture nothing followed, emits the
     // frames held back for reordering, and closes the source.
     decoder.finish()?;
+    let generation = decoder.generation();
     while let Some(frame) = pollster::block_on(decoder.next_frame())? {
         consume(
             frame,
+            generation,
             &mut output,
             &mut readback,
             &mut frame_count,
             &mut last_info,
             &mut last_generation,
+            &mut dropped,
         )?;
     }
     let decode_time = start.elapsed();
@@ -170,6 +188,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!(
             "Last frame: {}x{} display_order={} keyframe={}",
             w, h, order, key
+        );
+    }
+    if dropped > 0 {
+        println!(
+            "Dropped {} frame(s) whose images a session rebuild destroyed",
+            dropped
         );
     }
     if let Some(path) = output_path {

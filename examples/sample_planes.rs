@@ -74,10 +74,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let start = std::time::Instant::now();
 
     let consume = |frame: &DecodedFrame,
+                   current_generation: u64,
                    planes: &mut Option<PlaneReader>,
                    output: &mut Option<File>,
                    count: &mut usize|
      -> Result<(), Box<dyn std::error::Error>> {
+        // A session rebuild destroyed this frame's image, and any view cached
+        // over it. Drop it rather than reading freed memory; see
+        // `DecodeSink::generation` for why the frame's own value is not enough
+        // to decide this on its own.
+        if frame.generation != current_generation {
+            return Ok(());
+        }
         if !frame.plane_views {
             return Err(
                 "this device does not allow per-plane views of decoded pictures; \
@@ -103,13 +111,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             DecodeStatus::Decoded | DecodeStatus::Buffered => {}
             DecodeStatus::NeedsKeyframe => continue,
         }
+        let generation = decoder.generation();
         while let FramePoll::Frame(frame) = decoder.try_next_frame()? {
-            consume(&frame, &mut planes, &mut output, &mut count)?;
+            consume(&frame, generation, &mut planes, &mut output, &mut count)?;
         }
     }
     decoder.finish()?;
+    let generation = decoder.generation();
     while let Some(frame) = pollster::block_on(decoder.next_frame())? {
-        consume(&frame, &mut planes, &mut output, &mut count)?;
+        consume(&frame, generation, &mut planes, &mut output, &mut count)?;
     }
 
     let elapsed = start.elapsed();
@@ -149,7 +159,7 @@ struct PlaneReader {
     staging_memory: vk::DeviceMemory,
     /// One pair of plane views per decoded image, since the decoder rotates
     /// through a handful of them.
-    views: std::collections::HashMap<u64, [vk::ImageView; 2]>,
+    views: std::collections::HashMap<(u64, u64, u32), [vk::ImageView; 2]>,
     width: u32,
     height: u32,
 }
@@ -508,7 +518,14 @@ impl PlaneReader {
         &mut self,
         frame: &DecodedFrame,
     ) -> Result<[vk::ImageView; 2], Box<dyn std::error::Error>> {
-        let key = (ash::vk::Handle::as_raw(frame.image) << 8) | frame.array_layer as u64;
+        // Keyed on the generation as well as the handle: a rebuilt session
+        // destroys its images and drivers reuse handles, so a handle alone can
+        // name two different images over a decode's lifetime.
+        let key = (
+            frame.generation,
+            ash::vk::Handle::as_raw(frame.image),
+            frame.array_layer,
+        );
         if let Some(views) = self.views.get(&key) {
             return Ok(*views);
         }
