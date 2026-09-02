@@ -137,7 +137,7 @@ impl<'a> Iterator for NalIterator<'a> {
 }
 
 /// Parsed H.264 sequence parameter set (the subset Vulkan decode needs).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct Sps {
     pub profile_idc: u8,
     pub constraint_set_flags: u8,
@@ -409,7 +409,7 @@ fn parse_hrd(r: &mut BitReader) -> Result<()> {
 }
 
 /// Parsed H.264 picture parameter set (the subset Vulkan decode needs).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct Pps {
     pub pps_id: u8,
     pub sps_id: u8,

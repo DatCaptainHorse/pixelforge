@@ -34,10 +34,12 @@ pub(crate) struct H264Decoder {
     sps_map: HashMap<u8, Sps>,
     pps_map: HashMap<u8, Pps>,
 
-    /// The SPS/PPS the current session parameters were built from, so a change
-    /// that matters can be detected.
-    active_sps_id: u8,
-    active_pps_id: u8,
+    /// The SPS/PPS the current session parameters were built from, kept whole
+    /// rather than by id so that a stream reusing an id for different content,
+    /// which is how a resolution change is signalled, is seen as the change it
+    /// is.
+    active_sps: Option<Sps>,
+    active_pps: Option<Pps>,
 
     /// POC and reference state, recreated alongside the session.
     dpb: Option<DecodeDpb>,
@@ -85,6 +87,16 @@ struct Picture<'a> {
     ref_idc: u8,
     is_intra: bool,
     slices: Vec<&'a [u8]>,
+    /// The parameter sets in effect when this picture was grouped.
+    ///
+    /// Captured here rather than looked up later, because a chunk can carry a
+    /// parameter set *change*: an SPS reusing an id it has already used, which
+    /// is how a stream signals a new resolution. Resolving by id after the
+    /// whole chunk has been scanned would decode every picture in it against
+    /// the last SPS seen, so a resolution change would apply retroactively to
+    /// the pictures before it.
+    sps: Sps,
+    pps: Pps,
 }
 
 impl H264Decoder {
@@ -94,8 +106,8 @@ impl H264Decoder {
             output_depth: config.output_depth,
             sps_map: HashMap::new(),
             pps_map: HashMap::new(),
-            active_sps_id: 0,
-            active_pps_id: 0,
+            active_sps: None,
+            active_pps: None,
             dpb: None,
             reorder: ReorderBuffer::new(),
             reorder_depth: 0,
@@ -194,12 +206,12 @@ impl H264Decoder {
 
     /// Create (or recreate) the Vulkan session for the given parameter sets.
     fn activate(&mut self, sps: &Sps, pps: &Pps) -> Result<()> {
-        // Reuse the session when nothing relevant changed.
-        if let Some(active) = &self.common.session
-            && self.active_sps_id == sps.sps_id
-            && self.active_pps_id == pps.pps_id
-            && active.coded_width == sps.coded_width()
-            && active.coded_height == sps.coded_height()
+        // Reuse the session only when the parameter sets are the same ones, not
+        // merely the same ids: an SPS may be resent with different content
+        // under an id it has already used.
+        if self.common.session.is_some()
+            && self.active_sps.as_ref() == Some(sps)
+            && self.active_pps.as_ref() == Some(pps)
         {
             return Ok(());
         }
@@ -441,8 +453,8 @@ impl H264Decoder {
             |common, session| Self::build_session_params(common, session, sps, pps),
         )?;
 
-        self.active_sps_id = sps.sps_id;
-        self.active_pps_id = pps.pps_id;
+        self.active_sps = Some(sps.clone());
+        self.active_pps = Some(pps.clone());
         self.reorder_depth = reorder_depth;
         self.dpb = Some(DecodeDpb::new(slot_count, self.common.slot_pins.clone()));
 
@@ -700,24 +712,10 @@ impl H264Decoder {
                 continue;
             }
 
-            // Resolve the parameter sets this picture uses. Missing sets mean we
-            // joined before they were sent — also a keyframe-recovery case.
-            let pps = match self.pps_map.get(&picture.header.pps_id).cloned() {
-                Some(pps) => pps,
-                None => {
-                    awaiting.get_or_insert_with(|| {
-                        format!("PPS {} not yet received", picture.header.pps_id)
-                    });
-                    continue;
-                }
-            };
-            let sps = match self.sps_map.get(&pps.sps_id).cloned() {
-                Some(sps) => sps,
-                None => {
-                    awaiting.get_or_insert_with(|| format!("SPS {} not yet received", pps.sps_id));
-                    continue;
-                }
-            };
+            // The parameter sets this picture was grouped under, not whatever
+            // currently sits at those ids: a later SPS in the same chunk must
+            // not reach back and change how this picture is decoded.
+            let (sps, pps) = (picture.sps.clone(), picture.pps.clone());
 
             // (Re)build the session if the stream's geometry or ids changed.
             self.activate(&sps, &pps)?;
@@ -1013,7 +1011,7 @@ impl H264Decoder {
 
         let std_pic_info = ash::vk::native::StdVideoDecodeH264PictureInfo {
             flags: pic_flags,
-            seq_parameter_set_id: self.active_sps_id,
+            seq_parameter_set_id: picture.sps.sps_id,
             pic_parameter_set_id: picture.header.pps_id,
             reserved1: 0,
             reserved2: 0,
@@ -1129,6 +1127,7 @@ fn group_slices<'a>(
 
     let header = parser::parse_slice_header(nal, sps, pps)?;
     let is_intra = matches!(header.slice_type, SliceType::I | SliceType::Si);
+    let (sps, pps) = (sps.clone(), pps.clone());
 
     // Picture boundary detection (clause 7.4.1.2.4, frame-picture subset).
     //
@@ -1155,6 +1154,8 @@ fn group_slices<'a>(
             ref_idc: nal.ref_idc,
             is_intra,
             slices: vec![nal.data],
+            sps,
+            pps,
         });
     } else {
         let picture = pictures.last_mut().expect("checked above");
@@ -1228,6 +1229,74 @@ fn std_level_idc(level_idc: u8) -> ash::vk::native::StdVideoH264LevelIdc {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A chunk carrying a parameter set *change* must not apply it backwards.
+    ///
+    /// A stream signals a new resolution by resending an SPS under an id it has
+    /// already used. Pictures grouped before that point belong to the old SPS,
+    /// and if the parameter sets were resolved by id after the whole chunk had
+    /// been scanned, every picture in it would be decoded against the last SPS
+    /// seen. That produced a real failure: a 320x240 clip followed by a 640x480
+    /// one, fed as one byte stream, decoded entirely at 640x480.
+    #[test]
+    fn a_later_parameter_set_does_not_reach_back() {
+        let first: &[u8] = include_bytes!("../../../tests/data/base.264");
+        let second: &[u8] = include_bytes!("../../../tests/data/multislice.264");
+
+        // Both fixtures use SPS id 0, so concatenating them is exactly the
+        // id-reuse case, and `group_slices` sees the second SPS partway
+        // through.
+        let mut stream = first.to_vec();
+        stream.extend_from_slice(second);
+
+        let mut sps_map = HashMap::new();
+        let mut pps_map = HashMap::new();
+        let mut pictures: Vec<Picture> = Vec::new();
+        let mut sps_seen = 0usize;
+
+        for nal in parser::iter_nal_units(&stream) {
+            match nal.nal_type {
+                NalType::Sps => {
+                    let sps = parser::parse_sps(nal.payload()).unwrap();
+                    sps_seen += 1;
+                    sps_map.insert(sps.sps_id, sps);
+                }
+                NalType::Pps => {
+                    let pps = parser::parse_pps(nal.payload(), |id| {
+                        sps_map.get(&id).map(|s: &Sps| s.chroma_format_idc)
+                    })
+                    .unwrap();
+                    pps_map.insert(pps.pps_id, pps);
+                }
+                t if t.is_slice() => {
+                    group_slices(&mut pictures, &nal, &sps_map, &pps_map).unwrap();
+                }
+                _ => {}
+            }
+        }
+
+        assert!(sps_seen >= 2, "fixture should carry more than one SPS");
+        assert_ne!(
+            pictures[0].sps, pictures[59].sps,
+            "the two fixtures must differ in SPS content, or this test proves nothing"
+        );
+        assert_eq!(pictures.len(), 60, "30 pictures from each fixture");
+
+        // Every picture must carry the parameter sets that were in effect when
+        // it was grouped, so the two halves keep their own.
+        let first_sps = &pictures[0].sps;
+        let second_sps = &pictures[59].sps;
+        assert_eq!(
+            first_sps.sps_id, second_sps.sps_id,
+            "the fixtures should reuse the same id, or this proves nothing"
+        );
+        for (i, picture) in pictures.iter().enumerate().take(30) {
+            assert_eq!(&picture.sps, first_sps, "picture {i} took a later SPS");
+        }
+        for (i, picture) in pictures.iter().enumerate().skip(30) {
+            assert_eq!(&picture.sps, second_sps, "picture {i} kept an earlier SPS");
+        }
+    }
 
     /// Joining a stream after its parameter sets were sent must be reported as
     /// needing a keyframe, not as a failure and not by silently decoding
