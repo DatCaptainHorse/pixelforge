@@ -116,6 +116,9 @@ mod tests {
         assert!(r.bit().is_err());
     }
 
+    // The literals below are grouped by exp-Golomb codeword, not by nibble,
+    // which is the whole point of writing them out in binary.
+    #[allow(clippy::unusual_byte_groupings)]
     #[test]
     fn test_ue() {
         // ue codes: 1 -> 0, 010 -> 1, 011 -> 2, 00100 -> 3
@@ -127,6 +130,7 @@ mod tests {
         assert_eq!(r.ue().unwrap(), 3);
     }
 
+    #[allow(clippy::unusual_byte_groupings)]
     #[test]
     fn test_se() {
         // se: code 1 -> 0, 010 -> +1, 011 -> -1

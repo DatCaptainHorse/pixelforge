@@ -1120,6 +1120,17 @@ pub(crate) unsafe fn query_timestamp_diff(
     encode_time_ns
 }
 
+pub(crate) struct ClearImageParams {
+    pub command_buffer: vk::CommandBuffer,
+    pub fence: vk::Fence,
+    pub queue: vk::Queue,
+    pub image: vk::Image,
+    pub width: u32,
+    pub height: u32,
+    pub pixel_format: PixelFormat,
+    pub bit_depth: BitDepth,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1157,15 +1168,4 @@ mod tests {
         // AMD-realistic case: align 130 to lcm(32, 16) = 32.
         assert_eq!(align_up(130, lcm(32, 16)), 160);
     }
-}
-
-pub(crate) struct ClearImageParams {
-    pub command_buffer: vk::CommandBuffer,
-    pub fence: vk::Fence,
-    pub queue: vk::Queue,
-    pub image: vk::Image,
-    pub width: u32,
-    pub height: u32,
-    pub pixel_format: PixelFormat,
-    pub bit_depth: BitDepth,
 }

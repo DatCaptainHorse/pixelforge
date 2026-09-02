@@ -147,8 +147,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .into());
     }
-    if yuv_path.is_some() {
-        println!("Wrote decoded frames to {}", yuv_path.unwrap());
+    if let Some(path) = yuv_path {
+        println!("Wrote decoded frames to {}", path);
     }
 
     Ok(())
