@@ -5,6 +5,109 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- H.264 hardware decoding via Vulkan Video: `Decoder` and `DecodeConfig`.
+  Stream-driven, so the
+  Vulkan session is created from the stream's own parameter sets and a mid-stream
+  resolution change is handled transparently. Verified byte-identical to
+  `ffmpeg -pix_fmt nv12` on AMD (RADV), NVIDIA and Intel (ANV).
+- Asynchronous decoding, split into a sink and a source. `DecodeSink::decode`
+  submits without waiting; frames arrive on a `DecodeSource` as the GPU
+  finishes with them, in presentation order. `Decoder` holds both halves for
+  single-threaded use, and `Decoder::split` separates them so a producer and a
+  consumer can run on their own threads. `DecodeSource::next_frame` awaits the
+  next frame and `try_next_frame` takes one only if it is ready. Measured
+  10-21% higher decode throughput than the previous synchronous decoder.
+- A decoded frame's image is now valid for exactly as long as the frame, with
+  no exceptions. A session rebuild, which a resolution or parameter set change
+  causes, used to destroy the images of frames still in flight; they are now
+  reference counted per image, so a rebuild frees only what nothing is holding
+  and the last frame to be dropped releases the rest. Before this, a mid-stream
+  resolution change crashed a consumer reading a frame decoded just before it.
+- `DecodedFrame::generation` says which set of decoder images a frame belongs
+  to. Not needed for validity, but a consumer caching per-image state (a
+  renderer's views, say) must key on `(generation, image, array_layer)`:
+  handles are reused once a generation's images are finally released.
+- DPB slot reservations are per session, so a frame outliving a rebuild
+  releases into the set it was decoded under and cannot free a slot the current
+  session reserved for someone else.
+- `DecodeSink::decode` returns a `DecodeStatus` (`Decoded`, `Buffered` or
+  `NeedsKeyframe`) rather than reporting a missing keyframe as an error. Data
+  that cannot be decoded yet is the normal state of affairs when joining a live
+  stream or recovering from loss, so it is no longer something a caller has to
+  filter out of their error handling. `PixelForgeError::NeedsKeyframe` is gone.
+- `DecodeSink::finish` ends a stream: it decodes whatever framing still holds
+  back, emits the frames reordering held back, and closes the source.
+- Zero-copy output in presentation order: a decoded picture is never copied on
+  its way to the caller. A picture waiting its turn in display order stays
+  pinned in the DPB slot it was decoded into, and that pin passes to the
+  `DecodedFrame` the caller receives. Devices with too few DPB slots for the
+  stream fall back to copying rather than failing.
+- `DecodeConfig::with_output_depth` reserves DPB slots so decoded frames can be
+  held while decoding continues.
+- Decoded picture images are created with `VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT`
+  where the driver reports it in `VkVideoFormatPropertiesKHR::imageCreateFlags`,
+  paired with `VkImageFormatListCreateInfo` naming the plane formats.
+  `DecodedFrame::plane_views` says whether it worked. A consumer can then view
+  the luma and chroma planes separately, as `R8_UNORM` and `R8G8_UNORM`, and
+  read a decoded frame with no `VkSamplerYcbcrConversion` at all. That matters
+  because some shader toolchains cannot express a combined image sampler with an
+  immutable ycbcr sampler (naga, and so wgpu), leaving those renderers no
+  zero-copy path otherwise. Both RADV and ANV allow it for H.264 4:2:0, and it
+  costs no measurable decode throughput on either. Frames from the copying path
+  always allow it, since those images carry no video profile.
+- `query_capabilities` reports decode picture `imageCreateFlags`, for both the
+  usage pixelforge creates pictures with and the reference-only DPB, which are
+  not the same answer.
+- `examples/sample_planes` reads decoded frames through per-plane views with no
+  ycbcr conversion and no sampler, the path a wgpu-style renderer needs, and
+  writes the samples through unchanged so its output is byte-identical to the
+  decoder's own NV12.
+- `examples/sample_frame` shows the render path end to end: a decoded frame
+  sampled in a compute shader through a `VkSamplerYcbcrConversion`, with no
+  copy and no layout transition, while the decoder is still using that picture
+  as a reference.
+- Host readback and `copy_frame_to_planes` are gone. A `DecodedFrame` is a GPU
+  image the consumer owns until they drop it, and what to do with it is theirs
+  to decide; `examples/common` shows one way to read one back.
+- Decoded pictures are created with `SAMPLED` usage where the device allows it,
+  so a renderer can read a `DecodedFrame` in a shader instead of copying it out
+  first. `DecodedFrame::sampleable` reports whether it worked.
+- `DecodeConfig::with_consumer_queue_family` names the queue family that will
+  read decoded frames, adding it to each picture's sharing set so frames can be
+  used from a graphics queue with no ownership transfer.
+- `VK_KHR_unified_image_layouts` is enabled where the device supports it, with
+  both `unifiedImageLayouts` and `unifiedImageLayoutsVideo`. Decoded pictures
+  then live in `VK_IMAGE_LAYOUT_GENERAL` and are never transitioned, which is
+  what makes it safe to hand one to a consumer while the decoder is still using
+  it as a reference. Without it every frame is copied into a private image
+  instead. Measured on RADV: 25% higher decode throughput than the copying
+  path, and 12% higher with host readback on top.
+- `VideoContextBuilder::declare_unified_image_layouts` lets a caller who adopts
+  their own device say they enabled the extension, since Vulkan cannot be asked
+  which features a device was created with.
+  `DeviceRequirements::unified_image_layouts` reports whether it is worth doing.
+- `VideoContextBuilder::without_unified_image_layouts` forces the copying path,
+  so it can be exercised on hardware that would otherwise never take it.
+- `Framing` says how input is framed, so the decoder can do the framing itself.
+  `Framing::FrameAligned` (the default) takes whole coded frames per call, as a
+  container or transport delivers them. `Framing::ByteStream`, selected with
+  `DecodeConfig::with_byte_stream`, takes a stream that may cut anywhere and
+  buffers a partial trailing frame until later bytes complete it. This replaces
+  the `Decoder::split` free-standing splitter, which needed the whole stream in
+  memory and so could not be used for live decoding.
+- Validation layer messages are now routed into `tracing` through a
+  `VK_EXT_debug_utils` messenger. Previously the layer was loaded with nowhere to
+  report, so enabling validation verified nothing.
+
+### Changed
+
+- Adopting a caller-created device for decode (`build_from_existing_decode`) now
+  requires the `timelineSemaphore` feature in addition to `synchronization2`.
+
 ## [0.9.1] - 01-09-2026
 
 ### Fixed

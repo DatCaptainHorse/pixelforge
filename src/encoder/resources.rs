@@ -5,247 +5,85 @@ use ash::vk::TaggedStructure;
 use ash::vk::{self, Handle};
 use std::ptr;
 
+// Shared, direction-agnostic Vulkan Video helpers live in `crate::video`.
+// Re-export them so encoder-internal call sites keep working unchanged.
+#[cfg(test)]
+pub(crate) use crate::video::gcd;
+pub(crate) use crate::video::{
+    VideoImageParams, align_up, allocate_command_buffers, allocate_session_memory,
+    create_bitstream_buffer, create_buffer_with_device_address, create_command_pool,
+    create_dpb_images as create_dpb_images_shared, create_fence, create_video_image,
+    find_memory_type, get_video_format, lcm, map_bitstream_buffer, query_supported_video_formats,
+};
+
+/// Create the encoder's DPB images.
+///
+/// Thin wrapper over [`crate::video::create_dpb_images`] that supplies the
+/// encode-side usage flags; encode DPB images are only ever touched by the
+/// video encode queue, so they need no queue sharing.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn create_dpb_images(
+    context: &VideoContext,
+    width: u32,
+    height: u32,
+    format: vk::Format,
+    count: usize,
+    profile_info: &vk::VideoProfileInfoKHR,
+    use_layered: bool,
+) -> Result<(Vec<vk::Image>, Vec<vk::DeviceMemory>, Vec<vk::ImageView>)> {
+    let dpb_params = VideoImageParams {
+        width,
+        height,
+        format,
+        usage: vk::ImageUsageFlags::VIDEO_ENCODE_DPB_KHR,
+        sharing_families: &[],
+        flags: vk::ImageCreateFlags::empty(),
+        view_formats: &[],
+    };
+    create_dpb_images_shared(context, &dpb_params, profile_info, count, use_layered)
+}
+
+/// Create an image for video encoding (input or DPB).
+///
+/// Thin encoder-specific wrapper over [`crate::video::create_video_image`]:
+/// picks the encode usage flags and the queue families that may touch an
+/// encode input image (encode + transfer + compute).
+pub(crate) fn create_image(
+    context: &VideoContext,
+    width: u32,
+    height: u32,
+    format: vk::Format,
+    is_dpb: bool,
+    profile_info: &vk::VideoProfileInfoKHR,
+) -> Result<(vk::Image, vk::DeviceMemory, vk::ImageView)> {
+    let (usage, families) = if is_dpb {
+        (vk::ImageUsageFlags::VIDEO_ENCODE_DPB_KHR, Vec::new())
+    } else {
+        let mut families = Vec::new();
+        if let Some(encode_family) = context.video_encode_queue_family() {
+            families.push(encode_family);
+            families.push(context.transfer_queue_family());
+            families.push(context.compute_queue_family());
+        }
+        (
+            vk::ImageUsageFlags::VIDEO_ENCODE_SRC_KHR | vk::ImageUsageFlags::TRANSFER_DST,
+            families,
+        )
+    };
+    let dpb_params = VideoImageParams {
+        width,
+        height,
+        format,
+        usage,
+        sharing_families: &families,
+        flags: vk::ImageCreateFlags::empty(),
+        view_formats: &[],
+    };
+    create_video_image(context, &dpb_params, profile_info)
+}
+
 /// Minimum bitstream buffer size.
 pub(crate) const MIN_BITSTREAM_BUFFER_SIZE: usize = 2 * 1024 * 1024;
-
-/// Compute greatest common divisor of two values.
-pub(crate) fn gcd(mut a: u32, mut b: u32) -> u32 {
-    while b != 0 {
-        let tmp = a % b;
-        a = b;
-        b = tmp;
-    }
-    a
-}
-
-/// Compute least common multiple of two values.
-pub(crate) fn lcm(a: u32, b: u32) -> u32 {
-    if a == 0 || b == 0 {
-        0
-    } else {
-        (a / gcd(a, b)).saturating_mul(b)
-    }
-}
-
-/// Align a value up to the next multiple of the given alignment.
-pub(crate) fn align_up(value: u32, alignment: u32) -> u32 {
-    if alignment <= 1 {
-        value
-    } else {
-        value.div_ceil(alignment) * alignment
-    }
-}
-
-pub(crate) fn query_supported_video_formats(
-    context: &VideoContext,
-    profile_info: &vk::VideoProfileInfoKHR,
-    image_usage: vk::ImageUsageFlags,
-) -> Result<Vec<vk::Format>> {
-    let video_queue_fn = ash::khr::video_queue::Instance::load(context.entry(), context.instance());
-
-    // Vulkan expects a profile list in the pNext chain.
-    let profiles = [*profile_info];
-    let mut profile_list = vk::VideoProfileListInfoKHR::default().profiles(&profiles);
-
-    let format_info = vk::PhysicalDeviceVideoFormatInfoKHR::default()
-        .image_usage(image_usage)
-        .push(&mut profile_list);
-
-    let physical_device = context.physical_device();
-    let mut count = 0u32;
-    let result = unsafe {
-        (video_queue_fn
-            .fp()
-            .get_physical_device_video_format_properties_khr)(
-            physical_device,
-            &format_info,
-            &mut count,
-            ptr::null_mut(),
-        )
-    };
-
-    if result != vk::Result::SUCCESS {
-        return Err(PixelForgeError::NoSuitableDevice(format!(
-            "Failed to query video format properties for usage {:?}: {:?}",
-            image_usage, result
-        )));
-    }
-
-    if count == 0 {
-        return Ok(Vec::new());
-    }
-
-    let mut props = vec![vk::VideoFormatPropertiesKHR::default(); count as usize];
-    let result = unsafe {
-        (video_queue_fn
-            .fp()
-            .get_physical_device_video_format_properties_khr)(
-            physical_device,
-            &format_info,
-            &mut count,
-            props.as_mut_ptr(),
-        )
-    };
-
-    if result != vk::Result::SUCCESS {
-        return Err(PixelForgeError::NoSuitableDevice(format!(
-            "Failed to enumerate video format properties for usage {:?}: {:?}",
-            image_usage, result
-        )));
-    }
-
-    props.truncate(count as usize);
-    Ok(props.into_iter().map(|p| p.format).collect())
-}
-
-/// Get the Vulkan format for a given pixel format and bit depth.
-///
-/// Supports YUV420 and YUV444 in 8-bit and 10-bit.
-/// For YUV444, uses 2-plane (semi-planar) formats from VK_EXT_ycbcr_2plane_444_formats
-/// which are supported by NVIDIA hardware for video encoding.
-pub(crate) fn get_video_format(pixel_format: PixelFormat, bit_depth: BitDepth) -> vk::Format {
-    match (pixel_format, bit_depth) {
-        (PixelFormat::Yuv420, BitDepth::Eight) => vk::Format::G8_B8R8_2PLANE_420_UNORM,
-        (PixelFormat::Yuv420, BitDepth::Ten) => {
-            vk::Format::G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16
-        }
-        // Use 2-plane semi-planar formats for YUV444 (supported by NVIDIA for video encoding).
-        (PixelFormat::Yuv444, BitDepth::Eight) => vk::Format::G8_B8R8_2PLANE_444_UNORM,
-        (PixelFormat::Yuv444, BitDepth::Ten) => {
-            vk::Format::G10X6_B10X6R10X6_2PLANE_444_UNORM_3PACK16
-        }
-        // TODO: Add support for YUV422 formats.
-        _ => unimplemented!(
-            "Unsupported pixel format / bit depth combination: {:?} / {:?}",
-            pixel_format,
-            bit_depth
-        ),
-    }
-}
-
-/// Create a buffer that requires device addresses (SHADER_DEVICE_ADDRESS usage).
-///
-/// This allocates memory with `VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT` so that
-/// `get_buffer_device_address` returns a valid address.
-pub(crate) fn create_buffer_with_device_address(
-    device: &ash::Device,
-    memory_properties: &vk::PhysicalDeviceMemoryProperties,
-    size: vk::DeviceSize,
-    usage: vk::BufferUsageFlags,
-    properties: vk::MemoryPropertyFlags,
-) -> Result<(vk::Buffer, vk::DeviceMemory)> {
-    let buffer_info = vk::BufferCreateInfo::default()
-        .size(size)
-        .usage(usage)
-        .sharing_mode(vk::SharingMode::EXCLUSIVE);
-
-    let buffer = unsafe { device.create_buffer(&buffer_info, None) }
-        .map_err(|e| PixelForgeError::ResourceCreation(format!("buffer creation: {}", e)))?;
-
-    let mem_requirements = unsafe { device.get_buffer_memory_requirements(buffer) };
-
-    let memory_type_index = find_memory_type(
-        memory_properties,
-        mem_requirements.memory_type_bits,
-        properties,
-    )
-    .ok_or_else(|| {
-        PixelForgeError::MemoryAllocation(format!(
-            "No suitable memory type for buffer with properties {:?}",
-            properties
-        ))
-    })?;
-
-    let mut alloc_flags_info =
-        vk::MemoryAllocateFlagsInfo::default().flags(vk::MemoryAllocateFlags::DEVICE_ADDRESS);
-    let alloc_info = vk::MemoryAllocateInfo::default()
-        .allocation_size(mem_requirements.size)
-        .memory_type_index(memory_type_index)
-        .push(&mut alloc_flags_info);
-
-    let memory = match unsafe { device.allocate_memory(&alloc_info, None) } {
-        Ok(m) => m,
-        Err(e) => {
-            unsafe { device.destroy_buffer(buffer, None) };
-            return Err(PixelForgeError::MemoryAllocation(e.to_string()));
-        }
-    };
-
-    match unsafe { device.bind_buffer_memory(buffer, memory, 0) } {
-        Ok(()) => Ok((buffer, memory)),
-        Err(e) => {
-            unsafe {
-                device.destroy_buffer(buffer, None);
-                device.free_memory(memory, None);
-            }
-            Err(PixelForgeError::MemoryAllocation(e.to_string()))
-        }
-    }
-}
-
-pub(crate) fn find_memory_type(
-    memory_props: &vk::PhysicalDeviceMemoryProperties,
-    type_filter: u32,
-    properties: vk::MemoryPropertyFlags,
-) -> Option<u32> {
-    (0..memory_props.memory_type_count).find(|&i| {
-        (type_filter & (1 << i)) != 0
-            && memory_props.memory_types[i as usize]
-                .property_flags
-                .contains(properties)
-    })
-}
-
-pub(crate) fn create_bitstream_buffer(
-    context: &VideoContext,
-    size: usize,
-    profile_info: &vk::VideoProfileInfoKHR,
-) -> Result<(vk::Buffer, vk::DeviceMemory)> {
-    let profiles = [*profile_info];
-    let mut profile_list = vk::VideoProfileListInfoKHR::default().profiles(&profiles);
-
-    let create_info = vk::BufferCreateInfo::default()
-        .size(size as vk::DeviceSize)
-        .usage(vk::BufferUsageFlags::VIDEO_ENCODE_DST_KHR)
-        .sharing_mode(vk::SharingMode::EXCLUSIVE)
-        .push(&mut profile_list);
-
-    let buffer = unsafe { context.device().create_buffer(&create_info, None) }
-        .map_err(|e| PixelForgeError::ResourceCreation(format!("buffer creation: {}", e)))?;
-
-    let mem_requirements = unsafe { context.device().get_buffer_memory_requirements(buffer) };
-
-    let memory_type_index = find_memory_type(
-        context.memory_properties(),
-        mem_requirements.memory_type_bits,
-        vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-    )
-    .ok_or_else(|| {
-        PixelForgeError::MemoryAllocation("No suitable memory type for buffer".to_string())
-    })?;
-
-    let alloc_info = vk::MemoryAllocateInfo::default()
-        .allocation_size(mem_requirements.size)
-        .memory_type_index(memory_type_index);
-
-    let memory = unsafe { context.device().allocate_memory(&alloc_info, None) }
-        .map_err(|e| PixelForgeError::MemoryAllocation(e.to_string()))?;
-
-    unsafe { context.device().bind_buffer_memory(buffer, memory, 0) }
-        .map_err(|e| PixelForgeError::MemoryAllocation(e.to_string()))?;
-
-    Ok((buffer, memory))
-}
-
-pub(crate) fn create_timeline_semaphore(context: &VideoContext) -> Result<vk::Semaphore> {
-    let mut type_info = vk::SemaphoreTypeCreateInfo::default()
-        .semaphore_type(vk::SemaphoreType::TIMELINE)
-        .initial_value(0);
-    let create_info = vk::SemaphoreCreateInfo::default().push(&mut type_info);
-
-    unsafe { context.device().create_semaphore(&create_info, None) }
-        .map_err(|e| PixelForgeError::Synchronization(e.to_string()))
-}
 
 pub(crate) fn create_encode_feedback_query_pool(
     context: &VideoContext,
@@ -286,228 +124,6 @@ pub(crate) fn create_encode_timestamp_query_pool(context: &VideoContext) -> Resu
     .map_err(|e| PixelForgeError::QueryPool(e.to_string()))
 }
 
-/// Create an image for video encoding (input or DPB).
-///
-/// This creates a VkImage suitable for use with a video encoder.
-/// For DPB images, the usage is VIDEO_ENCODE_DPB_KHR.
-/// For input images, the usage is VIDEO_ENCODE_SRC_KHR | TRANSFER_DST.
-///
-/// # Arguments
-/// * `context` - The Vulkan video context
-/// * `width` - Image width in pixels
-/// * `height` - Image height in pixels
-/// * `format` - The Vulkan format to use for the image
-/// * `is_dpb` - If true, create a DPB image; if false, create an input image
-/// * `profile_info` - Video profile info for the encoder session
-pub(crate) fn create_image(
-    context: &VideoContext,
-    width: u32,
-    height: u32,
-    format: vk::Format,
-    is_dpb: bool,
-    profile_info: &vk::VideoProfileInfoKHR,
-) -> Result<(vk::Image, vk::DeviceMemory, vk::ImageView)> {
-    let usage = if is_dpb {
-        vk::ImageUsageFlags::VIDEO_ENCODE_DPB_KHR
-    } else {
-        vk::ImageUsageFlags::VIDEO_ENCODE_SRC_KHR | vk::ImageUsageFlags::TRANSFER_DST
-    };
-
-    // For input (non-DPB) images, use CONCURRENT sharing mode when multiple
-    // queue families need access. The image may be accessed by:
-    // - The video encode queue (for encoding)
-    // - The transfer queue (for InputImage upload)
-    // - The compute queue (for ColorConverter buffer-to-image copy)
-    let mut queue_families = Vec::new();
-    let sharing_mode = if !is_dpb {
-        if let Some(encode_family) = context.video_encode_queue_family() {
-            queue_families.push(encode_family);
-            let transfer_family = context.transfer_queue_family();
-            if !queue_families.contains(&transfer_family) {
-                queue_families.push(transfer_family);
-            }
-            let compute_family = context.compute_queue_family();
-            if !queue_families.contains(&compute_family) {
-                queue_families.push(compute_family);
-            }
-        }
-        if queue_families.len() > 1 {
-            vk::SharingMode::CONCURRENT
-        } else {
-            queue_families.clear();
-            vk::SharingMode::EXCLUSIVE
-        }
-    } else {
-        vk::SharingMode::EXCLUSIVE
-    };
-
-    let profiles = [*profile_info];
-    let mut profile_list = vk::VideoProfileListInfoKHR::default().profiles(&profiles);
-
-    let create_info = vk::ImageCreateInfo::default()
-        .image_type(vk::ImageType::TYPE_2D)
-        .format(format)
-        .extent(vk::Extent3D {
-            width,
-            height,
-            depth: 1,
-        })
-        .mip_levels(1)
-        .array_layers(1)
-        .samples(vk::SampleCountFlags::TYPE_1)
-        .tiling(vk::ImageTiling::OPTIMAL)
-        .usage(usage)
-        .sharing_mode(sharing_mode)
-        .queue_family_indices(&queue_families)
-        .initial_layout(vk::ImageLayout::UNDEFINED)
-        .push(&mut profile_list);
-
-    let image = unsafe { context.device().create_image(&create_info, None) }
-        .map_err(|e| PixelForgeError::ResourceCreation(format!("image creation: {}", e)))?;
-
-    let mem_requirements = unsafe { context.device().get_image_memory_requirements(image) };
-
-    let memory_type_index = find_memory_type(
-        context.memory_properties(),
-        mem_requirements.memory_type_bits,
-        vk::MemoryPropertyFlags::DEVICE_LOCAL,
-    )
-    .ok_or_else(|| {
-        PixelForgeError::MemoryAllocation("No suitable memory type for image".to_string())
-    })?;
-
-    let alloc_info = vk::MemoryAllocateInfo::default()
-        .allocation_size(mem_requirements.size)
-        .memory_type_index(memory_type_index);
-
-    let memory = unsafe { context.device().allocate_memory(&alloc_info, None) }
-        .map_err(|e| PixelForgeError::MemoryAllocation(e.to_string()))?;
-
-    unsafe { context.device().bind_image_memory(image, memory, 0) }
-        .map_err(|e| PixelForgeError::MemoryAllocation(e.to_string()))?;
-
-    let view_create_info = vk::ImageViewCreateInfo::default()
-        .image(image)
-        .view_type(vk::ImageViewType::TYPE_2D)
-        .format(format)
-        .components(vk::ComponentMapping {
-            r: vk::ComponentSwizzle::IDENTITY,
-            g: vk::ComponentSwizzle::IDENTITY,
-            b: vk::ComponentSwizzle::IDENTITY,
-            a: vk::ComponentSwizzle::IDENTITY,
-        })
-        .subresource_range(vk::ImageSubresourceRange {
-            aspect_mask: vk::ImageAspectFlags::COLOR,
-            base_mip_level: 0,
-            level_count: 1,
-            base_array_layer: 0,
-            layer_count: 1,
-        });
-
-    let view = unsafe { context.device().create_image_view(&view_create_info, None) }
-        .map_err(|e| PixelForgeError::ResourceCreation(format!("image view creation: {}", e)))?;
-
-    Ok((image, memory, view))
-}
-/// Allocate and bind memory for a video session.
-///
-/// Returns the allocated device memory handles.
-pub(crate) fn allocate_session_memory(
-    context: &VideoContext,
-    session: vk::VideoSessionKHR,
-    video_queue_fn: &ash::khr::video_queue::Device,
-) -> Result<Vec<vk::DeviceMemory>> {
-    // Query memory requirements count.
-    let mut memory_requirements_count = 0u32;
-    let result = unsafe {
-        (video_queue_fn
-            .fp()
-            .get_video_session_memory_requirements_khr)(
-            context.device().handle(),
-            session,
-            &mut memory_requirements_count,
-            ptr::null_mut(),
-        )
-    };
-    if result != vk::Result::SUCCESS {
-        return Err(PixelForgeError::MemoryAllocation(format!("{:?}", result)));
-    }
-
-    // Query actual requirements.
-    let mut memory_requirements =
-        vec![vk::VideoSessionMemoryRequirementsKHR::default(); memory_requirements_count as usize];
-    let result = unsafe {
-        (video_queue_fn
-            .fp()
-            .get_video_session_memory_requirements_khr)(
-            context.device().handle(),
-            session,
-            &mut memory_requirements_count,
-            memory_requirements.as_mut_ptr(),
-        )
-    };
-    if result != vk::Result::SUCCESS {
-        return Err(PixelForgeError::MemoryAllocation(format!("{:?}", result)));
-    }
-
-    // Allocate and bind memory for each requirement.
-    let mut session_memory = Vec::new();
-    let mut bind_infos = Vec::new();
-
-    for req in &memory_requirements {
-        let memory_type_index = find_memory_type(
-            context.memory_properties(),
-            req.memory_requirements.memory_type_bits,
-            vk::MemoryPropertyFlags::DEVICE_LOCAL,
-        )
-        .or_else(|| {
-            find_memory_type(
-                context.memory_properties(),
-                req.memory_requirements.memory_type_bits,
-                vk::MemoryPropertyFlags::empty(),
-            )
-        })
-        .ok_or_else(|| {
-            PixelForgeError::MemoryAllocation(format!(
-                "No suitable memory type for video session (type_bits: 0x{:x})",
-                req.memory_requirements.memory_type_bits
-            ))
-        })?;
-
-        let alloc_info = vk::MemoryAllocateInfo::default()
-            .allocation_size(req.memory_requirements.size)
-            .memory_type_index(memory_type_index);
-
-        let memory = unsafe { context.device().allocate_memory(&alloc_info, None) }
-            .map_err(|e| PixelForgeError::MemoryAllocation(e.to_string()))?;
-
-        bind_infos.push(
-            vk::BindVideoSessionMemoryInfoKHR::default()
-                .memory_bind_index(req.memory_bind_index)
-                .memory(memory)
-                .memory_offset(0)
-                .memory_size(req.memory_requirements.size),
-        );
-
-        session_memory.push(memory);
-    }
-
-    // Bind all memory to the session.
-    let result = unsafe {
-        (video_queue_fn.fp().bind_video_session_memory_khr)(
-            context.device().handle(),
-            session,
-            bind_infos.len() as u32,
-            bind_infos.as_ptr(),
-        )
-    };
-    if result != vk::Result::SUCCESS {
-        return Err(PixelForgeError::MemoryAllocation(format!("{:?}", result)));
-    }
-
-    Ok(session_memory)
-}
-
 /// Command resources for encoding operations.
 pub(crate) struct CommandResources {
     /// Command pool for encode commands.
@@ -531,52 +147,20 @@ pub(crate) fn create_command_resources(
     encode_queue_family: u32,
     upload_queue_family: u32,
 ) -> Result<CommandResources> {
-    // Create command pool for encode commands.
-    let pool_create_info = vk::CommandPoolCreateInfo::default()
-        .queue_family_index(encode_queue_family)
-        .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
+    let command_pool = create_command_pool(context, encode_queue_family, "encode")?;
 
-    let command_pool = unsafe {
-        context
-            .device()
-            .create_command_pool(&pool_create_info, None)
-    }
-    .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
-
-    // Create command pool for upload commands (may be the same family).
+    // The upload pool is the encode pool when one family does both.
     let upload_command_pool = if upload_queue_family == encode_queue_family {
         command_pool
     } else {
-        let upload_pool_info = vk::CommandPoolCreateInfo::default()
-            .queue_family_index(upload_queue_family)
-            .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
-        unsafe {
-            context
-                .device()
-                .create_command_pool(&upload_pool_info, None)
-        }
-        .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?
+        create_command_pool(context, upload_queue_family, "encode upload")?
     };
 
-    // Allocate upload command buffer from the upload pool.
-    let upload_alloc_info = vk::CommandBufferAllocateInfo::default()
-        .command_pool(upload_command_pool)
-        .level(vk::CommandBufferLevel::PRIMARY)
-        .command_buffer_count(1);
+    let upload_command_buffer = allocate_command_buffers(context, upload_command_pool, 1)?[0];
 
-    let upload_command_buffers = unsafe {
-        context
-            .device()
-            .allocate_command_buffers(&upload_alloc_info)
-    }
-    .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
-    let upload_command_buffer = upload_command_buffers[0];
-
-    // Upload fence is created unsignaled. Per-slot encode fences are created by
-    // the encode pipeline (see `encoder::pipeline`).
-    let fence_create_info = vk::FenceCreateInfo::default();
-    let upload_fence = unsafe { context.device().create_fence(&fence_create_info, None) }
-        .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
+    // Unsignaled: the upload path always submits before it waits. Per-slot
+    // encode fences are created by the encode pipeline (see `encoder::pipeline`).
+    let upload_fence = create_fence(context, false)?;
 
     Ok(CommandResources {
         command_pool,
@@ -596,152 +180,6 @@ pub(crate) fn create_command_resources(
 ///
 /// When `use_layered` is false the previous behaviour is preserved: one
 /// separate image/memory/view per DPB slot.
-pub(crate) fn create_dpb_images(
-    context: &VideoContext,
-    width: u32,
-    height: u32,
-    format: vk::Format,
-    count: usize,
-    profile_info: &vk::VideoProfileInfoKHR,
-    use_layered: bool,
-) -> Result<(Vec<vk::Image>, Vec<vk::DeviceMemory>, Vec<vk::ImageView>)> {
-    if use_layered {
-        // Create a single image with `count` array layers.
-        let profiles = [*profile_info];
-        let mut profile_list = vk::VideoProfileListInfoKHR::default().profiles(&profiles);
-
-        let create_info = vk::ImageCreateInfo::default()
-            .image_type(vk::ImageType::TYPE_2D)
-            .format(format)
-            .extent(vk::Extent3D {
-                width,
-                height,
-                depth: 1,
-            })
-            .mip_levels(1)
-            .array_layers(count as u32)
-            .samples(vk::SampleCountFlags::TYPE_1)
-            .tiling(vk::ImageTiling::OPTIMAL)
-            .usage(vk::ImageUsageFlags::VIDEO_ENCODE_DPB_KHR)
-            .sharing_mode(vk::SharingMode::EXCLUSIVE)
-            .initial_layout(vk::ImageLayout::UNDEFINED)
-            .push(&mut profile_list);
-
-        let image = unsafe { context.device().create_image(&create_info, None) }
-            .map_err(|e| PixelForgeError::ResourceCreation(format!("layered DPB image: {}", e)))?;
-
-        let mem_requirements = unsafe { context.device().get_image_memory_requirements(image) };
-
-        let memory_type_index = find_memory_type(
-            context.memory_properties(),
-            mem_requirements.memory_type_bits,
-            vk::MemoryPropertyFlags::DEVICE_LOCAL,
-        )
-        .ok_or_else(|| {
-            PixelForgeError::MemoryAllocation(
-                "No suitable memory type for layered DPB image".to_string(),
-            )
-        })?;
-
-        let alloc_info = vk::MemoryAllocateInfo::default()
-            .allocation_size(mem_requirements.size)
-            .memory_type_index(memory_type_index);
-
-        let memory = unsafe { context.device().allocate_memory(&alloc_info, None) }
-            .map_err(|e| PixelForgeError::MemoryAllocation(e.to_string()))?;
-
-        unsafe { context.device().bind_image_memory(image, memory, 0) }
-            .map_err(|e| PixelForgeError::MemoryAllocation(e.to_string()))?;
-
-        // Create one view per array layer.
-        let mut dpb_image_views = Vec::with_capacity(count);
-        for layer in 0..count as u32 {
-            let view_create_info = vk::ImageViewCreateInfo::default()
-                .image(image)
-                .view_type(vk::ImageViewType::TYPE_2D)
-                .format(format)
-                .components(vk::ComponentMapping {
-                    r: vk::ComponentSwizzle::IDENTITY,
-                    g: vk::ComponentSwizzle::IDENTITY,
-                    b: vk::ComponentSwizzle::IDENTITY,
-                    a: vk::ComponentSwizzle::IDENTITY,
-                })
-                .subresource_range(vk::ImageSubresourceRange {
-                    aspect_mask: vk::ImageAspectFlags::COLOR,
-                    base_mip_level: 0,
-                    level_count: 1,
-                    base_array_layer: layer,
-                    layer_count: 1,
-                });
-
-            let view = unsafe { context.device().create_image_view(&view_create_info, None) }
-                .map_err(|e| {
-                    PixelForgeError::ResourceCreation(format!(
-                        "layered DPB image view layer {}: {}",
-                        layer, e
-                    ))
-                })?;
-            dpb_image_views.push(view);
-        }
-
-        Ok((vec![image], vec![memory], dpb_image_views))
-    } else {
-        let mut dpb_images = Vec::with_capacity(count);
-        let mut dpb_image_memories = Vec::with_capacity(count);
-        let mut dpb_image_views = Vec::with_capacity(count);
-
-        for _ in 0..count {
-            let (dpb_image, dpb_image_memory, dpb_image_view) =
-                create_image(context, width, height, format, true, profile_info)?;
-            dpb_images.push(dpb_image);
-            dpb_image_memories.push(dpb_image_memory);
-            dpb_image_views.push(dpb_image_view);
-        }
-
-        Ok((dpb_images, dpb_image_memories, dpb_image_views))
-    }
-}
-
-/// Map a bitstream buffer for persistent access.
-pub(crate) fn map_bitstream_buffer(
-    context: &VideoContext,
-    memory: vk::DeviceMemory,
-    size: usize,
-) -> Result<*mut u8> {
-    let ptr = unsafe {
-        context.device().map_memory(
-            memory,
-            0,
-            size as vk::DeviceSize,
-            vk::MemoryMapFlags::empty(),
-        )
-    }
-    .map_err(|e| {
-        PixelForgeError::MemoryAllocation(format!("Failed to map bitstream buffer: {}", e))
-    })? as *mut u8;
-
-    Ok(ptr)
-}
-
-/// Parameters for clearing the input image at initialization.
-pub(crate) struct ClearImageParams {
-    pub command_buffer: vk::CommandBuffer,
-    pub fence: vk::Fence,
-    pub queue: vk::Queue,
-    pub image: vk::Image,
-    pub width: u32,
-    pub height: u32,
-    pub pixel_format: PixelFormat,
-    pub bit_depth: BitDepth,
-}
-
-/// Clear the input image by filling it with zeros via a staging buffer.
-///
-/// This must be called once after creating the input image to ensure
-/// the padding region (between the user dimensions and the aligned coded
-/// extent) contains defined values. Without this, the first frame's
-/// padding is undefined, which can cause encoding artifacts on strict
-/// drivers.
 pub(crate) fn clear_input_image(context: &VideoContext, params: &ClearImageParams) -> Result<()> {
     let device = context.device();
     let bytes_per_component: u32 = match params.bit_depth {
@@ -1684,6 +1122,17 @@ pub(crate) unsafe fn query_timestamp_diff(
         encode_time_ns = Some(((timestamps[1] - timestamps[0]) as f32 * timestamp_period) as u64);
     }
     encode_time_ns
+}
+
+pub(crate) struct ClearImageParams {
+    pub command_buffer: vk::CommandBuffer,
+    pub fence: vk::Fence,
+    pub queue: vk::Queue,
+    pub image: vk::Image,
+    pub width: u32,
+    pub height: u32,
+    pub pixel_format: PixelFormat,
+    pub bit_depth: BitDepth,
 }
 
 #[cfg(test)]

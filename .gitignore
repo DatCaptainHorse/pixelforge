@@ -3,3 +3,6 @@ output.*
 
 # Generated at runtime by examples/verify_all.rs (ensure_test_data); dimension-keyed.
 testdata/test_frames_*x*_*.yuv
+
+# Stray raw decode outputs from manual testing
+*.yuv

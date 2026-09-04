@@ -87,6 +87,15 @@ impl PixelFormat {
             PixelFormat::Yuv444 => luma_size * 3,     // Y + U + V
         }
     }
+
+    /// Returns chroma divisor (horizontal, vertical) for the pixel format.
+    pub fn chroma_div(&self) -> (u32, u32) {
+        match self {
+            PixelFormat::Yuv444 => (1, 1),
+            PixelFormat::Yuv422 => (2, 1),
+            PixelFormat::Yuv420 => (2, 2),
+        }
+    }
 }
 
 /// Bit depth for video encoding.

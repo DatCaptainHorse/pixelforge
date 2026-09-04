@@ -1,9 +1,13 @@
-//! A Vulkan-based video encoding library for Rust, supporting H.264, H.265, and AV1 codecs.
+//! A Vulkan-based video encoding and decoding library for Rust, supporting H.264,
+//! H.265 and AV1 encode, and H.264 decode.
 //!
 //! # Features
 //!
-//! - **Hardware-accelerated** video encoding using Vulkan Video extensions.
-//! - **Multiple codec support**: H.264/AVC, H.265/HEVC, AV1.
+//! - **Hardware-accelerated** video encoding and decoding using Vulkan Video extensions.
+//! - **Multiple codec support**: H.264/AVC, H.265/HEVC, AV1 encode; H.264 decode.
+//! - **Asynchronous pipelines**: both directions submit without waiting.
+//!   Encoding hands back an [`EncodeFuture`]; decoding delivers frames through a
+//!   [`DecodeSource`] as the GPU finishes with them.
 //! - **GPU color conversion**: RGB/BGR → YUV via Vulkan compute shaders (BT.709, BT.2020, sRGB→BT.2020+PQ, scRGB-linear→BT.2020+PQ).
 //! - **HDR support**: 10-bit encoding (P010, YUV444P10), PQ transfer function, BT.2020 color space.
 //! - **GPU-native API**: Encode directly from Vulkan images (`vk::Image`).
@@ -16,15 +20,20 @@
 //!
 //! # Supported Codecs
 //!
-//! | Codec | Encode |
-//! |-------|--------|
-//! | H.264/AVC | ✓ |
-//! | H.265/HEVC | ✓ |
-//! | AV1 | ✓ |
+//! | Codec | Encode | Decode |
+//! |-------|--------|--------|
+//! | H.264/AVC | ✓ | ✓ |
+//! | H.265/HEVC | ✓ | |
+//! | AV1 | ✓ | |
+//!
+//! H.264 decoding is verified byte-identical to `ffmpeg -pix_fmt nv12` on AMD
+//! (RADV), NVIDIA and Intel (ANV).
 //!
 //! # Requirements
 //!
-//! - A GPU with Vulkan video encoding support (e.g., NVIDIA RTX series, AMD RDNA2+, Intel Arc)
+//! - A GPU with Vulkan video support (e.g., NVIDIA RTX series, AMD RDNA2+, Intel Arc).
+//!   Decoding additionally needs a video decode queue; on Intel Arc under Mesa it
+//!   currently has to be enabled with `ANV_DEBUG=video-decode,video-encode`.
 //!
 //! # Installation
 //!
@@ -110,6 +119,64 @@
 //! }
 //! ```
 //!
+//! ## Decoding Video
+//!
+//! The decoder is stream-driven: it creates its Vulkan session from the
+//! stream's own parameter sets, so nothing has to be configured up front, and a
+//! mid-stream resolution change is handled transparently.
+//!
+//! Bytes go in through a [`DecodeSink`], frames come out
+//! of a [`DecodeSource`]. A [`Decoder`] holds both, so
+//! one thread can drive the whole thing; [`Decoder::split`](decoder::Decoder::split)
+//! separates them for a producer and a consumer on their own threads.
+//!
+//! Frames come out in presentation order and, where the device supports unified
+//! image layouts, without ever being copied: the frame *is* the decoder's own
+//! image. Drop each one when done, which returns its storage.
+//!
+//! ```rust,no_run
+//! use pixelforge::{Codec, VideoContextBuilder};
+//! use pixelforge::decoder::{DecodeConfig, Decoder, FramePoll};
+//!
+//! fn main() -> Result<(), Box<dyn std::error::Error>> {
+//!     let context = VideoContextBuilder::new()
+//!         .app_name("Decoder Example")
+//!         .require_decode(Codec::H264)
+//!         .build()?;
+//!
+//!     // A file can cut anywhere, so let the decoder frame it. Input that
+//!     // arrives already framed (RTP, a container) skips `with_byte_stream`.
+//!     let config = DecodeConfig::h264().with_byte_stream();
+//!     let mut decoder = Decoder::new(context, config)?;
+//!     let stream: Vec<u8> = std::fs::read("input.264")?;
+//!
+//!     for (i, chunk) in stream.chunks(64 * 1024).enumerate() {
+//!         // The status says what happened; an `Err` means something is
+//!         // actually wrong. Joining a stream partway through is not.
+//!         let _status = decoder.decode(chunk, i as u64)?;
+//!         // Take what the GPU has finished with; `Pending` just means "not yet".
+//!         while let FramePoll::Frame(frame) = decoder.try_next_frame()? {
+//!             // `frame.image` is a decoder-owned GPU image, valid until dropped.
+//!             let _ = frame.image;
+//!         }
+//!     }
+//!
+//!     // End of stream: decodes the trailing picture, emits what reordering
+//!     // held back, and closes the source.
+//!     decoder.finish()?;
+//!     while let Some(frame) = pollster::block_on(decoder.next_frame())? {
+//!         let _ = frame.image;
+//!     }
+//!     Ok(())
+//! }
+//! ```
+//!
+//! A live frame reserves a DPB slot, so
+//! [`DecodeConfig::with_output_depth`](decoder::DecodeConfig::with_output_depth)
+//! bounds how many can be outstanding before the decoder starts copying
+//! pictures out instead of handing over its own. Reading a frame back to the
+//! CPU is the consumer's job; `examples/common` shows one way.
+//!
 //! ## Color Conversion (RGB → YUV)
 //!
 //! PixelForge includes a GPU compute shader for converting RGB input to YUV output, supporting multiple color spaces:
@@ -157,6 +224,9 @@
 //! # Query codec capabilities
 //! cargo run --example query_capabilities
 //!
+//! # H.264 decoding to raw YUV
+//! cargo run --example decode_h264 -- input.264 output.yuv
+//!
 //! # H.264 encoding example
 //! cargo run --example encode_h264
 //!
@@ -177,8 +247,8 @@
 //!
 //! # TODO's
 //!
-//! 1. [] Decoding.
-//! 1. [] B-frames support.
+//! 1. [] H.265 and AV1 decoding.
+//! 1. [] B-frames support (encode).
 //!
 //! # Contributing
 //!
@@ -190,9 +260,11 @@
 //! repository by NVIDIA, which provided invaluable reference for Vulkan Video encoding.
 
 pub mod converter;
+pub mod decoder;
 pub mod encoder;
 pub mod error;
 pub mod image;
+pub(crate) mod video;
 pub mod vulkan;
 
 /// Align a byte size up to a multiple of 4.
@@ -204,6 +276,9 @@ pub(crate) const fn align4(size: usize) -> usize {
 }
 
 pub use converter::{ColorConverter, ColorConverterConfig, ColorSpace, InputFormat, OutputFormat};
+pub use decoder::{
+    DecodeConfig, DecodeSink, DecodeSource, DecodeStatus, DecodedFrame, Decoder, FramePoll, Framing,
+};
 pub use encoder::{
     BitDepth as EncodeBitDepth, Codec, ColorDescription, DEFAULT_FRAME_RATE, DEFAULT_GOP_SIZE,
     DEFAULT_H264_QP, DEFAULT_H265_QP, DEFAULT_MAX_BITRATE, DEFAULT_MAX_REFERENCE_FRAMES,

@@ -220,6 +220,7 @@ dependencies = [
  "ash",
  "env_logger",
  "futures-channel",
+ "futures-core",
  "pollster",
  "thiserror",
  "tracing",
