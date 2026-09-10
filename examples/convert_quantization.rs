@@ -24,7 +24,7 @@
 
 use ash::vk;
 use pixelforge::{
-    Codec, ColorConverter, ColorConverterConfig, EncodeBitDepth, EncodeConfig, Encoder,
+    Codec, ColorConverter, ColorConverterConfig, ColorRange, EncodeBitDepth, EncodeConfig, Encoder,
     InputFormat, OutputFormat, RateControlMode, VideoContext, VideoContextBuilder,
 };
 
@@ -265,8 +265,12 @@ fn convert_and_read_luma(
     output_format: OutputFormat,
     full_range: bool,
 ) -> Result<Vec<u32>, Box<dyn std::error::Error>> {
-    let mut config = ColorConverterConfig::new(WIDTH, HEIGHT, InputFormat::BGRA, output_format);
-    config.full_range = full_range;
+    let config = ColorConverterConfig::new(WIDTH, HEIGHT, InputFormat::BGRA, output_format)
+        .with_range(if full_range {
+            ColorRange::Full
+        } else {
+            ColorRange::Limited
+        });
     let mut converter = ColorConverter::new(context.clone(), config)?;
     converter.convert(
         src.image,
