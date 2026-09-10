@@ -185,30 +185,65 @@ CPU is the consumer's job; `examples/common` shows one way.
 
 ### Color Conversion (RGB → YUV)
 
-PixelForge includes a GPU compute shader for converting RGB input to YUV output, supporting multiple color spaces:
+PixelForge includes a GPU compute shader for converting RGB input to YUV
+output. The conversion is two decisions: what the input already is, and
+what the encoded stream should be.
 
-| Color Space | Description |
-|-------------|-------------|
-| `Bt709` | Standard SDR (BT.709 coefficients) |
-| `Bt2020` | HDR passthrough (BT.2020 coefficients, PQ-encoded input) |
-| `SrgbToBt2020Pq` | SDR-in-HDR (sRGB → linear → BT.2020 gamut → PQ OETF) |
-| `Bt709LinearToBt2020Pq` | scRGB HDR (linear BT.709 → BT.2020 gamut → PQ OETF). `sdr_reference_white_nits` sets the interpretation of 1.0; per the scRGB spec (IEC 61966-2-2), 80 nits. |
+| `SourceColor` | What the input pixels are |
+|---------------|---------------------------|
+| `Srgb` | BT.709 primaries, sRGB transfer. Ordinary SDR content. |
+| `Bt709Linear` | Linear BT.709. This is scRGB, from an `EXTENDED_SRGB_LINEAR_EXT` swapchain. |
+| `Bt2020Linear` | Linear BT.2020. |
+| `Bt2020Pq` | BT.2020 primaries, already PQ-encoded. |
+
+| `TargetColor` | What the stream is |
+|---------------|--------------------|
+| `Bt709` | BT.709 primaries, transfer and matrix. SDR. |
+| `Bt2020Pq` | BT.2020 primaries, PQ transfer, BT.2020 NCL matrix. HDR10. |
+
+The relative sources carry the luminance that a sample value of 1.0 stands
+for, since that is a property of the source and not of the target: 203 nits
+for `Srgb` per ITU-R BT.2408, and 80 for scRGB per IEC 61966-2-2. It is read
+only on the way to `Bt2020Pq`, where the PQ encode needs it to be absolute.
+
+Every source reaches `Bt2020Pq`. Only `Srgb` reaches `Bt709`, because the
+others would need a forward gamma encode or tone mapping; those pairings are
+rejected by [`ColorConverter::new`] rather than quietly passed through.
 
 Supported input formats: BGRx, RGBx, BGRA, RGBA, ABGR2101010 (10-bit packed), RGBA16F (FP16).
 Supported output formats: NV12 (8-bit), I420 (8-bit), YUV444 (8-bit), P010 (10-bit), YUV444P10 (10-bit).
 
+Because the target and the range fully determine the stream's colour
+signalling, [`ColorConverterConfig::color_description`] derives the
+encoder's VUI declaration from the conversion itself. Use it rather than
+declaring the same thing twice: full-range samples tagged as limited are
+expanded a second time on playback, and the API cannot catch that if the two
+are set independently.
+
 ```rust
-use pixelforge::{ColorConverter, ColorConverterConfig, ColorSpace, InputFormat, OutputFormat, VideoContextBuilder};
+use pixelforge::{
+    Codec, ColorConverter, ColorConverterConfig, ColorRange, EncodeConfig, Encoder,
+    InputFormat, OutputFormat, SourceColor, TargetColor, VideoContextBuilder,
+};
 
 let context = VideoContextBuilder::new()
     .app_name("Color Converter")
+    .require_encode(Codec::H265)
     .build()?;
 
-let mut config = ColorConverterConfig::new(1920, 1080, InputFormat::BGRx, OutputFormat::NV12);
-config.color_space = ColorSpace::SrgbToBt2020Pq;
+// SDR desktop content, encoded as HDR10 for an HDR streaming session.
+let config = ColorConverterConfig::new(1920, 1080, InputFormat::BGRx, OutputFormat::P010)
+    .with_source(SourceColor::srgb())
+    .with_target(TargetColor::Bt2020Pq)
+    .with_range(ColorRange::Full);
+
+// The encoder declares exactly what the shader wrote.
+let encode_config = EncodeConfig::h265(1920, 1080)
+    .with_color_description(config.color_description());
 
 let mut converter = ColorConverter::new(context.clone(), config)?;
-// converter.convert(input_image, output_buffer)?;
+let mut encoder = Encoder::new(context, encode_config)?;
+// converter.convert(input_image, layout, encoder.input_image())?;
 ```
 
 ## Benchmarking
