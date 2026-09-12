@@ -1,7 +1,14 @@
-//! Example: Verify all encoding combinations
+//! Verify every encoding combination the encoder claims to support.
 //!
-//! Verifies H.264/H.265/AV1, 8-bit/10-bit, YUV420/YUV444 combinations.
-//! Runs PSNR analysis for each combination.
+//! Runs H.264/H.265/AV1 across 8-bit/10-bit and YUV420/YUV444, decodes each
+//! result with ffmpeg, and checks the PSNR against the source. Combinations the
+//! device does not support are reported and skipped.
+//!
+//! Ignored by default: requires a Vulkan Video device and ffmpeg. Run with
+//! `cargo test -- --ignored`.
+
+#[allow(dead_code)]
+mod common;
 
 use pixelforge::{
     Codec, EncodeBitDepth, EncodeConfig, Encoder, InputImage, PixelFormat, RateControlMode,
@@ -9,15 +16,19 @@ use pixelforge::{
 };
 use std::fs::File;
 use std::io::{Read, Write};
-use std::path::Path;
 use std::process::Command;
 use tracing_subscriber::{Layer, layer::SubscriberExt, util::SubscriberInitExt};
 
 const WIDTH: u32 = 320;
 const HEIGHT: u32 = 240;
 const FRAMES: u32 = 30;
+/// PSNR floor for a combination that actually ran. Observed values are 58+ dB;
+/// this only catches a genuine breakage, not implementation differences.
+const MIN_PSNR: f64 = 30.0;
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+#[test]
+#[ignore = "requires a Vulkan Video device and ffmpeg"]
+fn verify_all() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize tracing.
     tracing_subscriber::registry()
         .with(
@@ -30,10 +41,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Ensure test data exists (dimensions encoded in filename to avoid stale data
     // when switching between branches with different WIDTH/HEIGHT constants).
-    let yuv420_path = format!("testdata/test_frames_{}x{}_yuv420p.yuv", WIDTH, HEIGHT);
-    let yuv444_path = format!("testdata/test_frames_{}x{}_yuv444p.yuv", WIDTH, HEIGHT);
-    ensure_test_data("yuv420p", &yuv420_path)?;
-    ensure_test_data("yuv444p", &yuv444_path)?;
+    let yuv420_path = format!("testdata/test_frames_{WIDTH}x{HEIGHT}_yuv420p.yuv");
+    let yuv444_path = format!("testdata/test_frames_{WIDTH}x{HEIGHT}_yuv444p.yuv");
+    common::ensure_test_data(WIDTH, HEIGHT, "yuv420p", &yuv420_path)?;
+    common::ensure_test_data(WIDTH, HEIGHT, "yuv444p", &yuv444_path)?;
+
+    let dir = common::scratch_dir("verify_all");
 
     let combinations = [
         (Codec::H264, EncodeBitDepth::Eight, PixelFormat::Yuv420),
@@ -55,57 +68,42 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .enable_validation(true) // Enable validation for debugging
         .build()?;
 
+    let mut ran = 0usize;
     for (codec, depth, format) in combinations {
-        println!("Testing {:?} {:?} {:?}...", codec, depth, format);
+        println!("Testing {codec:?} {depth:?} {format:?}...");
 
         if !context.supports_encode(codec) {
-            println!("  Skipping: Codec not supported");
+            println!("  Skipping: codec not supported");
             continue;
         }
 
-        // TODO: Check if specific format/depth is supported?
-        // The context.supports_encode only checks codec presence.
-        // We'll try to create the encoder and see if it fails.
-
-        let result = run_test(&context, codec, depth, format);
-        match result {
-            Ok(psnr) => println!("  PASS: PSNR = {:.2} dB", psnr),
-            Err(e) => println!("  FAIL: {}", e),
+        // `supports_encode` only checks the codec, not the profile and format,
+        // so an encoder-creation failure with NOT_SUPPORTED means this device
+        // does not expose that combination.
+        match run_test(&context, &dir, codec, depth, format) {
+            Ok(psnr) => {
+                assert!(
+                    psnr >= MIN_PSNR,
+                    "{codec:?} {depth:?} {format:?}: PSNR {psnr:.2} dB below the {MIN_PSNR} dB floor"
+                );
+                println!("  PASS: PSNR = {psnr:.2} dB");
+                ran += 1;
+            }
+            Err(e) if e.to_string().contains("NOT_SUPPORTED") => {
+                println!("  SKIP: unsupported on this device: {e}");
+            }
+            Err(e) => return Err(format!("{codec:?} {depth:?} {format:?}: {e}").into()),
         }
         println!("------------------------------------------------");
     }
 
-    Ok(())
-}
-
-fn ensure_test_data(pix_fmt: &str, path: &str) -> Result<(), Box<dyn std::error::Error>> {
-    if Path::new(path).exists() {
-        return Ok(());
-    }
-    println!("Generating {}...", path);
-    let status = Command::new("ffmpeg")
-        .args([
-            "-f",
-            "lavfi",
-            "-i",
-            &format!("testsrc=duration=1:size={}x{}:rate=30", WIDTH, HEIGHT),
-            "-pix_fmt",
-            pix_fmt,
-            "-f",
-            "rawvideo",
-            "-y",
-            path,
-        ])
-        .output()?;
-
-    if !status.status.success() {
-        return Err(format!("Failed to generate test data: {:?}", status).into());
-    }
+    assert!(ran > 0, "no encoding combination ran on this device");
     Ok(())
 }
 
 fn run_test(
     context: &pixelforge::VideoContext,
+    dir: &std::path::Path,
     codec: Codec,
     depth: EncodeBitDepth,
     format: PixelFormat,
@@ -113,8 +111,16 @@ fn run_test(
     // AV1 uses .obu extension for raw OBU streams (with temporal delimiters).
     // H.264/H.265 use .bin for raw Annex B bitstreams.
     let output_ext = if codec == Codec::AV1 { "obu" } else { "bin" };
-    let output_filename = format!("output_{:?}_{:?}_{:?}.{}", codec, depth, format, output_ext);
-    let decoded_filename = format!("decoded_{:?}_{:?}_{:?}.yuv", codec, depth, format);
+    let output_filename = dir
+        .join(format!(
+            "output_{codec:?}_{depth:?}_{format:?}.{output_ext}"
+        ))
+        .to_string_lossy()
+        .into_owned();
+    let decoded_filename = dir
+        .join(format!("decoded_{codec:?}_{depth:?}_{format:?}.yuv"))
+        .to_string_lossy()
+        .into_owned();
 
     // 1. Encode
     {

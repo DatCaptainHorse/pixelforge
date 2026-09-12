@@ -1,8 +1,12 @@
-//! Example: Encoding Benchmarks
+//! Benchmark: Encoding timings and throughput.
 //!
-//! Demonstrates returning of encoding statistics for benchmarking or other needs.
-//! Loads raw YUV420 frames from `testdata/test_frames_1080p.yuv` in 1920 x 1080 resolution at 60 FPS.
-//! Tests all supported codecs and tuning modes.
+//! Reports the GPU, frame-latency and wall-latency statistics the encoder
+//! returns for every packet, plus compression ratio, across all codecs and
+//! tuning modes. Loads raw YUV420 frames from `testdata/test_frames_1080p.yuv`
+//! (1920x1080, 60 FPS).
+//!
+//! Run with:
+//!   cargo bench --bench encode
 
 use pixelforge::{
     Codec, EncodeBitDepth, EncodeConfig, Encoder, EncoderTuningMode, InputImage, PixelFormat,
@@ -52,11 +56,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         yuv_data.len()
     );
 
-    // Create video context.
-    let context = VideoContextBuilder::new()
-        .app_name("Encode Bench Example")
+    // Create video context. A machine without a usable device skips rather than
+    // failing, so `cargo test --all-targets`/`cargo bench` stay green on CI.
+    let context = match VideoContextBuilder::new()
+        .app_name("Encode Bench")
         .enable_validation(cfg!(debug_assertions))
-        .build()?;
+        .build()
+    {
+        Ok(context) => context,
+        Err(e) => {
+            eprintln!("skipping encode bench: no usable Vulkan device ({e})");
+            return Ok(());
+        }
+    };
 
     // Define codecs and tuning modes to test.
     let codecs = [Codec::H264, Codec::H265, Codec::AV1];

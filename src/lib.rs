@@ -213,7 +213,7 @@
 //! Run the encode latency benchmark with:
 //!
 //! ```text
-//! cargo run --example encode_bench
+//! cargo bench --bench encode
 //! ```
 //!
 //! # Examples
@@ -224,20 +224,27 @@
 //! # Query codec capabilities
 //! cargo run --example query_capabilities
 //!
-//! # H.264 decoding to raw YUV
-//! cargo run --example decode_h264 -- input.264 output.yuv
+//! # Decode H.264 to raw YUV
+//! cargo run --example decode -- input.264 output.yuv
 //!
-//! # H.264 encoding example
-//! cargo run --example encode_h264
+//! # Decode on a caller-created Vulkan device
+//! cargo run --example decode_adopted -- input.264 output.yuv
 //!
-//! # H.265 encoding example
-//! cargo run --example encode_h265
+//! # Encode, choosing the codec (h264, h265 or av1)
+//! cargo run --example encode -- h265
 //!
-//! # AV1 encoding example
-//! cargo run --example encode_av1
+//! # Sample decoded frames through a ycbcr conversion (RGBA output)
+//! cargo run --example sample_frame -- input.264 out.rgba
 //!
-//! # Verify all codecs and formats
-//! cargo run --example verify_all
+//! # Sample decoded frames through per-plane views (NV12 output)
+//! cargo run --example sample_planes -- input.264 out.yuv
+//! ```
+//!
+//! Correctness checks that need a video device and ffmpeg are integration
+//! tests, ignored by default:
+//!
+//! ```text
+//! cargo test -- --ignored
 //! ```
 //!
 //! # Shader Development

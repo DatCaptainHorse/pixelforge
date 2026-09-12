@@ -26,14 +26,15 @@ use std::fs::File;
 use std::io::Write;
 
 use ash::vk::{self, TaggedStructure as _};
-use pixelforge::decoder::{DecodeConfig, DecodeStatus, DecodedFrame, Decoder, FramePoll};
+use pixelforge::decoder::{DecodeConfig, DecodedFrame, Decoder};
 use pixelforge::encoder::Codec;
 use pixelforge::vulkan::{VideoContext, VideoContextBuilder};
 
-const SHADER: &[u8] = include_bytes!("shader/sample_frame.spv");
+#[allow(dead_code)]
+mod common;
+use common::decode_stream;
 
-/// Bytes handed to the decoder per call, standing in for a network read.
-const CHUNK_SIZE: usize = 64 * 1024;
+const SHADER: &[u8] = include_bytes!("shader/sample_frame.spv");
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
@@ -77,39 +78,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut count = 0usize;
     let start = std::time::Instant::now();
 
-    let consume = |frame: &DecodedFrame,
-                   sampler: &mut Option<Sampler>,
-                   output: &mut Option<File>,
-                   count: &mut usize|
-     -> Result<(), Box<dyn std::error::Error>> {
-        let sampler = match sampler {
+    decode_stream(&mut decoder, &stream, |frame| {
+        let sampler = match &mut sampler {
             Some(s) => s,
-            none => none.insert(Sampler::new(&context, consumer_family, frame)?),
+            none => none.insert(Sampler::new(&context, consumer_family, &frame)?),
         };
-        let rgba = sampler.sample(frame)?;
+        let rgba = sampler.sample(&frame)?;
         if let Some(file) = output.as_mut() {
             file.write_all(&rgba)?;
         }
-        *count += 1;
+        count += 1;
         Ok(())
-    };
-
-    for (i, chunk) in stream.chunks(CHUNK_SIZE).enumerate() {
-        match decoder.decode(chunk, i as u64)? {
-            DecodeStatus::Decoded | DecodeStatus::Buffered => {}
-            // Joining mid-stream, or recovering from loss. A live client would
-            // ask the sender for an IDR here and carry on; the decoder picks up
-            // by itself once one arrives.
-            DecodeStatus::NeedsKeyframe => continue,
-        }
-        while let FramePoll::Frame(frame) = decoder.try_next_frame()? {
-            consume(&frame, &mut sampler, &mut output, &mut count)?;
-        }
-    }
-    decoder.finish()?;
-    while let Some(frame) = pollster::block_on(decoder.next_frame())? {
-        consume(&frame, &mut sampler, &mut output, &mut count)?;
-    }
+    })?;
 
     let elapsed = start.elapsed();
     println!(

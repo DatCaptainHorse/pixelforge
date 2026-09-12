@@ -1,7 +1,7 @@
 //! Decode an H.264 Annex B stream to raw YUV.
 //!
 //! Usage:
-//!   cargo run --example decode_h264 -- input.264 [output.yuv]
+//!   cargo run --example decode -- input.264 [output.yuv]
 //!
 //! Produces the same layout as `ffmpeg -i input.264 -pix_fmt nv12 out.yuv`,
 //! so the output can be compared directly:
@@ -10,25 +10,21 @@
 //!   cmp reference.yuv output.yuv
 
 use std::fs::File;
-use std::io::Write;
 
 #[allow(dead_code)]
 mod common;
-use common::Readback;
+use common::{Readback, decode_stream, write_nv12};
 
-use pixelforge::decoder::{DecodeConfig, DecodeStatus, DecodedFrame, Decoder, FramePoll};
+use pixelforge::decoder::{DecodeConfig, Decoder};
 use pixelforge::encoder::Codec;
 use pixelforge::vulkan::VideoContextBuilder;
-
-/// Bytes handed to the decoder per call, standing in for a network read.
-const CHUNK_SIZE: usize = 64 * 1024;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
 
     let mut args = std::env::args().skip(1);
     let input_path = args.next().unwrap_or_else(|| {
-        eprintln!("usage: decode_h264 <input.264> [output.yuv]");
+        eprintln!("usage: decode <input.264> [output.yuv]");
         std::process::exit(1);
     });
     let output_path = args.next();
@@ -80,18 +76,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut last_info: Option<(u32, u32, i32, bool)> = None;
     let mut last_generation: Option<u64> = None;
 
-    let consume = |frame: DecodedFrame,
-                   output: &mut Option<File>,
-                   readback: &mut Option<Readback>,
-                   frame_count: &mut usize,
-                   last_info: &mut Option<(u32, u32, i32, bool)>,
-                   last_generation: &mut Option<u64>|
-     -> Result<(), Box<dyn std::error::Error>> {
-        if let (Some(file), Some(readback)) = (output.as_mut(), readback.as_mut()) {
-            let data = readback.read(&frame)?;
-            file.write_all(&data.y)?;
-            file.write_all(&data.uv)?;
-        }
+    // One thread drives both halves: feed a chunk, then take whatever has
+    // become ready. `Pending` means the GPU is still working on frames in
+    // flight, not that there are none, so they are collected on a later pass.
+    // A renderer would instead `split()` the decoder and await `next_frame` on
+    // its own thread, which is what the `Decoder::split` docs show.
+    // `common::decode_stream` owns that loop.
+    decode_stream(&mut decoder, &stream, |frame| {
+        write_nv12(&frame, &mut readback, &mut output)?;
         // A rebuilt session means a new set of images, so anything caching
         // per-image state has to notice. Reporting it here is what makes the
         // field visible in an example rather than only in the docs.
@@ -103,61 +95,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 frame_count
             );
         }
-        *last_generation = Some(frame.generation);
-        *last_info = Some((
+        last_generation = Some(frame.generation);
+        last_info = Some((
             frame.width,
             frame.height,
             frame.display_order,
             frame.is_keyframe,
         ));
-        *frame_count += 1;
+        frame_count += 1;
         // Dropping the frame here is what hands its DPB slot back. Holding on
         // to frames is what pushes the decoder onto the copying path.
         Ok(())
-    };
-
-    // One thread drives both halves: feed a chunk, then take whatever has
-    // become ready. `Pending` means the GPU is still working on frames in
-    // flight, not that there are none, so they are collected on a later pass.
-    // A renderer would instead `split()` the decoder and await `next_frame` on
-    // its own thread, which is what the `Decoder::split` docs show.
-    //
-    // A file is a raw byte stream that can cut anywhere, so let the decoder do
-    // the framing and feed it in fixed-size chunks, the way a socket delivers
-    // one.
-    for (i, chunk) in stream.chunks(CHUNK_SIZE).enumerate() {
-        match decoder.decode(chunk, i as u64)? {
-            DecodeStatus::Decoded | DecodeStatus::Buffered => {}
-            // Joining mid-stream, or recovering from loss. A live client would
-            // ask the sender for an IDR here and carry on; the decoder picks up
-            // by itself once one arrives.
-            DecodeStatus::NeedsKeyframe => continue,
-        }
-        while let FramePoll::Frame(frame) = decoder.try_next_frame()? {
-            consume(
-                frame,
-                &mut output,
-                &mut readback,
-                &mut frame_count,
-                &mut last_info,
-                &mut last_generation,
-            )?;
-        }
-    }
-
-    // End of stream: decodes the trailing picture nothing followed, emits the
-    // frames held back for reordering, and closes the source.
-    decoder.finish()?;
-    while let Some(frame) = pollster::block_on(decoder.next_frame())? {
-        consume(
-            frame,
-            &mut output,
-            &mut readback,
-            &mut frame_count,
-            &mut last_info,
-            &mut last_generation,
-        )?;
-    }
+    })?;
     let decode_time = start.elapsed();
 
     println!(

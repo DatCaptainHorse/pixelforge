@@ -11,20 +11,16 @@
 //!   ffmpeg -i input.264 -pix_fmt nv12 reference.yuv
 
 use std::fs::File;
-use std::io::Write;
 
 use ash::vk;
 use ash::vk::TaggedStructure;
 #[allow(dead_code)]
 mod common;
-use common::Readback;
+use common::{Readback, decode_stream, write_nv12};
 
-use pixelforge::decoder::{DecodeConfig, Decoder, FramePoll};
+use pixelforge::decoder::{DecodeConfig, Decoder};
 use pixelforge::encoder::Codec;
 use pixelforge::vulkan::VideoContextBuilder;
-
-/// Bytes handed to the decoder per call, standing in for a network read.
-const CHUNK_SIZE: usize = 64 * 1024;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
@@ -132,34 +128,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut decoder = Decoder::new(context, DecodeConfig::h264().with_byte_stream())?;
     let mut count = 0usize;
 
-    let write = |frame: &pixelforge::decoder::DecodedFrame,
-                 readback: &mut Option<Readback>,
-                 output: &mut Option<File>,
-                 count: &mut usize|
-     -> Result<(), Box<dyn std::error::Error>> {
-        if let (Some(file), Some(readback)) = (output.as_mut(), readback.as_mut()) {
-            let data = readback.read(frame)?;
-            file.write_all(&data.y)?;
-            file.write_all(&data.uv)?;
-        }
-        *count += 1;
+    decode_stream(&mut decoder, &stream, |frame| {
+        write_nv12(&frame, &mut readback, &mut output)?;
+        count += 1;
         Ok(())
-    };
-
-    // Feed a chunk, then take whatever has become ready; `Pending` means the
-    // GPU is still working, so those frames are collected on a later pass.
-    for (i, chunk) in stream.chunks(CHUNK_SIZE).enumerate() {
-        let _ = decoder.decode(chunk, i as u64)?;
-        while let FramePoll::Frame(frame) = decoder.try_next_frame()? {
-            write(&frame, &mut readback, &mut output, &mut count)?;
-        }
-    }
-    // End of stream: decodes the trailing picture, emits what reordering held
-    // back, and closes the source.
-    decoder.finish()?;
-    while let Some(frame) = pollster::block_on(decoder.next_frame())? {
-        write(&frame, &mut readback, &mut output, &mut count)?;
-    }
+    })?;
     println!("Decoded {} frames on the adopted device", count);
 
     // The context borrowed the device, so everything holding Vulkan objects has

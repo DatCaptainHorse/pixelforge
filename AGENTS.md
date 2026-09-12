@@ -7,8 +7,10 @@ Pixelforge is a Rust library for video encoding and decoding using Vulkan Video.
 ```bash
 cargo build
 cargo test
-cargo run --example encode_h264
-cargo run --example decode_h264 -- input.264 output.yuv
+cargo test -- --ignored        # device + ffmpeg tests, ignored by default
+cargo bench --bench encode
+cargo run --example encode -- h264
+cargo run --example decode -- input.264 output.yuv
 ```
 
 Decoding on Intel Arc under Mesa needs the video queues enabled explicitly:
@@ -29,7 +31,7 @@ Do not edit `README.md` directly; update the doc comments in `src/lib.rs` instea
 To verify the quality of the encoded videos, run:
 
 ```bash
-cargo run --example encode_h265 \
+cargo run --example encode -- h265 \
     && rm -f decoded.yuv \
     && ffmpeg -hide_banner -loglevel error -y -i output.h265 -pix_fmt yuv420p -f rawvideo decoded.yuv \
     && ffmpeg -hide_banner -loglevel info -s 320x240 -pix_fmt yuv420p -f rawvideo -i testdata/test_frames.yuv -s 320x240 -pix_fmt yuv420p -f rawvideo -i decoded.yuv -lavfi psnr -f null -
@@ -39,7 +41,7 @@ To verify decoding, decode a stream and compare against ffmpeg's software
 decoder, which should be byte-identical:
 
 ```bash
-cargo run --example decode_h264 -- tests/data/bframes.264 out.yuv \
+cargo run --example decode -- tests/data/bframes.264 out.yuv \
     && ffmpeg -hide_banner -loglevel error -y -i tests/data/bframes.264 -pix_fmt nv12 ref.yuv \
     && cmp ref.yuv out.yuv && echo "decode matches ffmpeg"
 ```
@@ -50,7 +52,7 @@ with no copy. Where it does not, they are copied into private images. Force the
 copying path to exercise it on hardware that would otherwise never take it:
 
 ```bash
-PIXELFORGE_NO_UNIFIED_LAYOUTS=1 cargo run --example decode_h264 -- \
+PIXELFORGE_NO_UNIFIED_LAYOUTS=1 cargo run --example decode -- \
     tests/data/bframes.264 out.yuv && cmp ref.yuv out.yuv
 ```
 
@@ -98,7 +100,7 @@ own hazards, so build one and check it:
 ffmpeg -f lavfi -i testsrc2=size=320x240:rate=30:duration=1 -c:v libx264 -bf 2 -f h264 a.264
 ffmpeg -f lavfi -i testsrc2=size=640x480:rate=30:duration=1 -c:v libx264 -bf 2 -f h264 b.264
 cat a.264 b.264 > switch.264
-cargo run --example decode_h264 -- switch.264 out.yuv
+cargo run --example decode -- switch.264 out.yuv
 ```
 
 Sixty frames, thirty at each size, and one `generation N -> N+1` line at the
@@ -125,6 +127,9 @@ nothing if the layer is missing.
 ## Project Structure
 - `src/` - Library source code
 - `examples/` - Usage examples for encoding and decoding
+- `tests/` - Integration tests; the device + ffmpeg checks are `#[ignore]`d and
+  run with `cargo test -- --ignored`
+- `benches/` - The encode timing/throughput benchmark (`cargo bench`)
 - `testdata/` - Test input files (note: `test_frames.yuv` is a git-LFS pointer;
   generate frames locally if LFS content is unavailable)
 - `tests/data/` - Small H.264 streams used by the decoder tests

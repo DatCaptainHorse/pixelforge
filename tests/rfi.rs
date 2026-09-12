@@ -1,4 +1,4 @@
-//! Example / verification: Reference Frame Invalidation (RFI)
+//! Reference Frame Invalidation (RFI) verification.
 //!
 //! Encodes a stream and, partway through, simulates packet loss by calling
 //! [`Encoder::invalidate_reference_frames`] for the two most recent references.
@@ -12,6 +12,12 @@
 //!  - ffmpeg must decode the whole stream with high PSNR (proving the encoder's
 //!    reference re-signaling — H.264 MMCO, H.265 RPS, AV1 ref mapping — keeps the
 //!    decoder's DPB in sync with the encoder's).
+//!
+//! Ignored by default: requires a Vulkan Video device and ffmpeg. Run with
+//! `cargo test -- --ignored`.
+
+#[allow(dead_code)]
+mod common;
 
 use pixelforge::{
     Codec, EncodeBitDepth, EncodeConfig, Encoder, InputImage, PixelFormat, RateControlMode,
@@ -33,7 +39,9 @@ const INVALIDATE_COUNT: u64 = 2;
 /// PSNR below this means the decoder desynced from the encoder after recovery.
 const MIN_PSNR: f64 = 30.0;
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+#[test]
+#[ignore = "requires a Vulkan Video device and ffmpeg"]
+fn rfi() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -44,42 +52,51 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("PixelForge Reference Frame Invalidation verification\n");
 
     let input_path = format!("testdata/test_frames_{WIDTH}x{HEIGHT}_yuv420p.yuv");
-    ensure_test_data("yuv420p", &input_path)?;
+    common::ensure_test_data(WIDTH, HEIGHT, "yuv420p", &input_path)?;
+
+    let dir = common::scratch_dir("rfi");
 
     let context = VideoContextBuilder::new()
         .app_name("RFI Verification")
         .enable_validation(cfg!(debug_assertions))
         .build()?;
 
-    let mut any_failure = false;
+    let mut failures = Vec::new();
     for codec in [Codec::H264, Codec::H265, Codec::AV1] {
         if !context.supports_encode(codec) {
             println!("{codec:?}: skipped (encode not supported)");
             continue;
         }
-        match run_codec(&context, codec, &input_path) {
+        match run_codec(&context, &dir, codec, &input_path) {
             Ok(()) => {}
             Err(e) => {
                 println!("{codec:?}: FAIL: {e}");
-                any_failure = true;
+                failures.push(format!("{codec:?}: {e}"));
             }
         }
     }
 
-    if any_failure {
-        std::process::exit(1);
+    if !failures.is_empty() {
+        return Err(format!("RFI verification failed: {}", failures.join("; ")).into());
     }
     Ok(())
 }
 
 fn run_codec(
     context: &pixelforge::VideoContext,
+    dir: &std::path::Path,
     codec: Codec,
     input_path: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let ext = if codec == Codec::AV1 { "obu" } else { "bin" };
-    let output_filename = format!("output_rfi_{codec:?}.{ext}");
-    let decoded_filename = format!("decoded_rfi_{codec:?}.yuv");
+    let output_filename = dir
+        .join(format!("output_rfi_{codec:?}.{ext}"))
+        .to_string_lossy()
+        .into_owned();
+    let decoded_filename = dir
+        .join(format!("decoded_rfi_{codec:?}.yuv"))
+        .to_string_lossy()
+        .into_owned();
 
     let config = match codec {
         Codec::H264 => EncodeConfig::h264(WIDTH, HEIGHT),
@@ -243,29 +260,4 @@ fn decode_and_psnr(
     let rest = &stderr[pos + 8..];
     let end = rest.find(' ').unwrap_or(rest.len());
     Ok(rest[..end].parse()?)
-}
-
-fn ensure_test_data(pix_fmt: &str, path: &str) -> Result<(), Box<dyn std::error::Error>> {
-    if std::path::Path::new(path).exists() {
-        return Ok(());
-    }
-    println!("Generating {path}...");
-    let status = Command::new("ffmpeg")
-        .args([
-            "-f",
-            "lavfi",
-            "-i",
-            &format!("testsrc=duration=1:size={WIDTH}x{HEIGHT}:rate=30"),
-            "-pix_fmt",
-            pix_fmt,
-            "-f",
-            "rawvideo",
-            "-y",
-            path,
-        ])
-        .output()?;
-    if !status.status.success() {
-        return Err(format!("failed to generate test data: {status:?}").into());
-    }
-    Ok(())
 }

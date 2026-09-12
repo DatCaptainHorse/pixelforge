@@ -27,16 +27,16 @@
 
 #[allow(dead_code)]
 mod common;
+use common::decode_stream;
 
 use ash::vk::{self, TaggedStructure as _};
-use pixelforge::decoder::{DecodeConfig, DecodeStatus, DecodedFrame, Decoder, FramePoll};
+use pixelforge::decoder::{DecodeConfig, DecodedFrame, Decoder};
 use pixelforge::encoder::Codec;
 use pixelforge::vulkan::{VideoContext, VideoContextBuilder};
 use std::fs::File;
 use std::io::Write;
 
 const SHADER: &[u8] = include_bytes!("shader/sample_planes.spv");
-const CHUNK_SIZE: usize = 64 * 1024;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
@@ -73,11 +73,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut count = 0usize;
     let start = std::time::Instant::now();
 
-    let consume = |frame: &DecodedFrame,
-                   planes: &mut Option<PlaneReader>,
-                   output: &mut Option<File>,
-                   count: &mut usize|
-     -> Result<(), Box<dyn std::error::Error>> {
+    decode_stream(&mut decoder, &stream, |frame| {
         if !frame.plane_views {
             return Err(
                 "this device does not allow per-plane views of decoded pictures; \
@@ -85,32 +81,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .into(),
             );
         }
-        let reader = match planes {
+        let reader = match &mut planes {
             Some(p) => p,
-            none => none.insert(PlaneReader::new(&context, consumer_family, frame)?),
+            none => none.insert(PlaneReader::new(&context, consumer_family, &frame)?),
         };
-        let (y, uv) = reader.read(frame)?;
+        let (y, uv) = reader.read(&frame)?;
         if let Some(file) = output.as_mut() {
             file.write_all(&y)?;
             file.write_all(&uv)?;
         }
-        *count += 1;
+        count += 1;
         Ok(())
-    };
-
-    for (i, chunk) in stream.chunks(CHUNK_SIZE).enumerate() {
-        match decoder.decode(chunk, i as u64)? {
-            DecodeStatus::Decoded | DecodeStatus::Buffered => {}
-            DecodeStatus::NeedsKeyframe => continue,
-        }
-        while let FramePoll::Frame(frame) = decoder.try_next_frame()? {
-            consume(&frame, &mut planes, &mut output, &mut count)?;
-        }
-    }
-    decoder.finish()?;
-    while let Some(frame) = pollster::block_on(decoder.next_frame())? {
-        consume(&frame, &mut planes, &mut output, &mut count)?;
-    }
+    })?;
 
     let elapsed = start.elapsed();
     println!(

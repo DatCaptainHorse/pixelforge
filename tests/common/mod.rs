@@ -1,10 +1,11 @@
-//! Reading a decoded frame back to the CPU.
+//! Reading a decoded frame back to the CPU, plus the integration tests'
+//! fixtures and scratch space.
 //!
 //! pixelforge hands out a GPU image and stops there: it has no readback path of
 //! its own, because a renderer sharing the device does not want one, and a
 //! consumer that does want one knows better than the library where the pixels
 //! should end up. This is that consumer's side of the deal, shared by the
-//! examples that write raw YUV to a file.
+//! tests that write raw YUV to a file.
 //!
 //! Two details are worth copying into real code:
 //!
@@ -367,4 +368,47 @@ impl Drop for Readback {
             self.device.destroy_command_pool(self.pool, None);
         }
     }
+}
+
+/// A scratch directory for one test, under Cargo's target temp dir so
+/// `cargo clean` removes it. Created if missing.
+pub fn scratch_dir(name: &str) -> std::path::PathBuf {
+    let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join(name);
+    std::fs::create_dir_all(&dir).expect("create scratch dir");
+    dir
+}
+
+/// Generate a raw YUV fixture with ffmpeg if it is not already present.
+pub fn ensure_test_data(
+    width: u32,
+    height: u32,
+    pix_fmt: &str,
+    path: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if std::path::Path::new(path).exists() {
+        return Ok(());
+    }
+    println!("Generating {path}...");
+    let status = std::process::Command::new("ffmpeg")
+        .args([
+            "-f",
+            "lavfi",
+            "-i",
+            &format!("testsrc=duration=1:size={width}x{height}:rate=30"),
+            "-pix_fmt",
+            pix_fmt,
+            "-f",
+            "rawvideo",
+            "-y",
+            path,
+        ])
+        .output()?;
+    if !status.status.success() {
+        return Err(format!(
+            "failed to generate test data: {}",
+            String::from_utf8_lossy(&status.stderr)
+        )
+        .into());
+    }
+    Ok(())
 }

@@ -1,7 +1,13 @@
-//! Example: H.265/HEVC Video Encoding
+//! Encode raw YUV420 frames to H.264, H.265 or AV1.
 //!
-//! Demonstrates H.265 video encoding using PixelForge with Vulkan Video.
-//! Loads raw YUV444 frames from `testdata/test_frames_yuv444.yuv`.
+//! Demonstrates encoding with PixelForge using Vulkan Video. Loads raw YUV420
+//! frames from `testdata/test_frames.yuv` and writes the bitstream to
+//! `output.h264`, `output.h265` or `output.av1` depending on the codec.
+//!
+//! Usage:
+//!   cargo run --example encode -- [h264|h265|av1]
+//!
+//! The codec defaults to `h264`.
 
 use pixelforge::{
     Codec, EncodeBitDepth, EncodeConfig, Encoder, InputImage, PixelFormat, RateControlMode,
@@ -27,7 +33,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .init();
 
-    println!("PixelForge H.265 Encode Example\n");
+    // Pick the codec. H.265 asks for an explicit format; the others take the
+    // default, which is also YUV420.
+    let codec_arg = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "h264".to_string());
+    let (codec, config, output_name) = match codec_arg.as_str() {
+        "h264" => (
+            Codec::H264,
+            EncodeConfig::h264(WIDTH, HEIGHT),
+            "output.h264",
+        ),
+        "h265" => (
+            Codec::H265,
+            EncodeConfig::h265(WIDTH, HEIGHT).with_pixel_format(PixelFormat::Yuv420),
+            "output.h265",
+        ),
+        "av1" => (Codec::AV1, EncodeConfig::av1(WIDTH, HEIGHT), "output.av1"),
+        other => {
+            eprintln!("unknown codec '{other}', expected one of: h264, h265, av1");
+            std::process::exit(1);
+        }
+    };
+
+    println!("PixelForge {codec:?} Encode Example ({output_name})\n");
 
     // Load test frames.
     let test_path = Path::new(TEST_FRAMES_PATH);
@@ -42,7 +71,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut yuv_data = Vec::new();
     File::open(test_path)?.read_to_end(&mut yuv_data)?;
 
-    // YUV420: Y + U + V = 1.5 planes, each WIDTH * HEIGHT bytes
     let frame_size = (WIDTH * HEIGHT * 3 / 2) as usize;
     let num_frames = yuv_data.len() / frame_size;
     println!(
@@ -52,45 +80,40 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Create video context.
     let context = VideoContextBuilder::new()
-        .app_name("H265 Encode Example")
+        .app_name("Encode Example")
         .enable_validation(cfg!(debug_assertions))
-        .require_encode(Codec::H265)
+        .require_encode(codec)
         .build()?;
 
-    if !context.supports_encode(Codec::H265) {
-        eprintln!("H.265 encode not supported");
+    if !context.supports_encode(codec) {
+        eprintln!("{codec:?} encode not supported");
         return Ok(());
     }
 
     // Configure encoder.
-    let config = EncodeConfig::h265(WIDTH, HEIGHT)
+    let config = config
         .with_rate_control(RateControlMode::Cqp)
         .with_quality_level(26)
         .with_frame_rate(30, 1)
         .with_gop_size(30)
-        .with_b_frames(0)
-        .with_pixel_format(PixelFormat::Yuv420);
+        .with_b_frames(0);
 
     println!(
-        "Config: {:?}, QP={}, GOP={}, B-frames={}, pixel_format={:?}\n",
-        config.rate_control_mode,
-        config.quality_level,
-        config.gop_size,
-        config.b_frame_count,
-        config.pixel_format
+        "Config: {:?}, QP={}, GOP={}, B-frames={}\n",
+        config.rate_control_mode, config.quality_level, config.gop_size, config.b_frame_count
     );
 
     // Create input image for uploading frames.
     let mut input_image = InputImage::new(
         context.clone(),
-        Codec::H265,
+        codec,
         WIDTH,
         HEIGHT,
         EncodeBitDepth::Eight,
         PixelFormat::Yuv420,
     )?;
     let mut encoder = Encoder::new(context, config)?;
-    let mut output = File::create("output.h265")?;
+    let mut output = File::create(output_name)?;
     let mut total_bytes = 0;
 
     // Each `encode()` returns a future that resolves with that frame's packet.
@@ -137,7 +160,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let ratio = (num_frames * frame_size) as f64 / total_bytes as f64;
     println!("\nEncoded {num_frames} frames, {total_bytes} bytes, {ratio:.1}:1 compression");
-    println!("Output: output.h265");
+    println!("Output: {output_name}");
 
     Ok(())
 }
