@@ -135,28 +135,28 @@ vec3 rgb_to_yuv(vec3 rgb) {
 // --- 8-bit quantization ---
 
 uint q8_y(float y) {
-    if (params.full_range == 0u) return uint(clamp(y * 219.0 + 16.0, 0.0, 255.0));
-    return uint(clamp(y * 255.0, 0.0, 255.0));
+    if (params.full_range == 0u) return uint(round(clamp(y * 219.0 + 16.0, 0.0, 255.0)));
+    return uint(round(clamp(y * 255.0, 0.0, 255.0)));
 }
 
 uint q8_c(float c) {
-    if (params.full_range == 0u) return uint(clamp((c - 0.5) * 224.0 + 128.0, 0.0, 255.0));
-    return uint(clamp(c * 255.0, 0.0, 255.0));
+    if (params.full_range == 0u) return uint(round(clamp((c - 0.5) * 224.0 + 128.0, 0.0, 255.0)));
+    return uint(round(clamp(c * 255.0, 0.0, 255.0)));
 }
 
 // --- 10-bit quantization (P010 layout: value in upper 10 bits of 16-bit word) ---
 
 uint q10_y(float y) {
     uint val;
-    if (params.full_range == 0u) val = uint(clamp(y * 876.0 + 64.0, 0.0, 1023.0));
-    else val = uint(clamp(y * 1023.0, 0.0, 1023.0));
+    if (params.full_range == 0u) val = uint(round(clamp(y * 876.0 + 64.0, 0.0, 1023.0)));
+    else val = uint(round(clamp(y * 1023.0, 0.0, 1023.0)));
     return (val << 6u) & 0xFFC0u;
 }
 
 uint q10_c(float c) {
     uint val;
-    if (params.full_range == 0u) val = uint(clamp((c - 0.5) * 896.0 + 512.0, 0.0, 1023.0));
-    else val = uint(clamp(c * 1023.0, 0.0, 1023.0));
+    if (params.full_range == 0u) val = uint(round(clamp((c - 0.5) * 896.0 + 512.0, 0.0, 1023.0)));
+    else val = uint(round(clamp(c * 1023.0, 0.0, 1023.0)));
     return (val << 6u) & 0xFFC0u;
 }
 
