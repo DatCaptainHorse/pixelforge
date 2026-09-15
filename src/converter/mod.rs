@@ -11,6 +11,7 @@ mod pipeline;
 use crate::error::{PixelForgeError, Result};
 use crate::vulkan::VideoContext;
 use ash::vk;
+use ash::vk::Handle;
 use tracing::debug;
 
 /// Color space for RGB→YUV conversion matrix selection.
@@ -237,6 +238,21 @@ pub struct ColorConverter {
     command_pool: vk::CommandPool,
     command_buffer: vk::CommandBuffer,
     fence: vk::Fence,
+
+    /// Timestamp queries bracketing the compute work, or null where the compute
+    /// queue family reports `timestampValidBits == 0`.
+    ///
+    /// The conversion runs on the same shader cores the caller renders with, so
+    /// what it costs there is the number that matters to a caller sharing the
+    /// GPU — and `convert` returning quickly says nothing about it, because the
+    /// wall time it already logged is submit plus wait plus execution, and on a
+    /// busy GPU the wait dominates.
+    timestamp_query_pool: vk::QueryPool,
+    /// Nanoseconds per device tick, from `VkPhysicalDeviceLimits`.
+    timestamp_period: f32,
+    /// GPU nanoseconds the last conversion took, once one has completed and the
+    /// device could report it.
+    last_gpu_time_ns: Option<u64>,
 }
 
 impl ColorConverter {
@@ -582,6 +598,19 @@ impl ColorConverter {
                 .begin_command_buffer(self.command_buffer, &begin_info)
                 .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
 
+            // Bracket everything the command buffer does, barriers included:
+            // the layout transitions are part of what the conversion costs the
+            // GPU, and on an imported DMA-BUF the acquire is not free.
+            if !self.timestamp_query_pool.is_null() {
+                device.cmd_reset_query_pool(self.command_buffer, self.timestamp_query_pool, 0, 2);
+                device.cmd_write_timestamp(
+                    self.command_buffer,
+                    vk::PipelineStageFlags::TOP_OF_PIPE,
+                    self.timestamp_query_pool,
+                    0,
+                );
+            }
+
             // --- Phase 1: Transition source image for shader read ---
 
             // For external memory (DMA-BUF) imports with EXCLUSIVE sharing,
@@ -867,6 +896,15 @@ impl ColorConverter {
                 &[target_barrier_to_encode, src_barrier_back],
             );
 
+            if !self.timestamp_query_pool.is_null() {
+                device.cmd_write_timestamp(
+                    self.command_buffer,
+                    vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                    self.timestamp_query_pool,
+                    1,
+                );
+            }
+
             device
                 .end_command_buffer(self.command_buffer)
                 .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
@@ -890,10 +928,60 @@ impl ColorConverter {
                 .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
         }
 
+        // After the fence, so the results are there and `WAIT` returns at once.
+        self.last_gpu_time_ns = self.read_gpu_time();
+
         let elapsed = start.elapsed();
-        debug!("ColorConverter::convert() took {:?}", elapsed);
+        match self.last_gpu_time_ns {
+            Some(gpu_ns) => debug!(
+                "ColorConverter::convert() took {:?} wall, {:.3}ms on the GPU",
+                elapsed,
+                gpu_ns as f64 / 1.0e6
+            ),
+            None => debug!("ColorConverter::convert() took {:?} wall", elapsed),
+        }
 
         Ok(())
+    }
+
+    /// Read the bracketing timestamps back and turn them into nanoseconds.
+    ///
+    /// `None` rather than an error on failure: a missing timing number must
+    /// never fail a conversion that otherwise succeeded.
+    fn read_gpu_time(&self) -> Option<u64> {
+        if self.timestamp_query_pool.is_null() {
+            return None;
+        }
+        let mut ticks = [0u64; 2];
+        unsafe {
+            self.context
+                .device()
+                .get_query_pool_results(
+                    self.timestamp_query_pool,
+                    0,
+                    &mut ticks,
+                    vk::QueryResultFlags::WAIT | vk::QueryResultFlags::TYPE_64,
+                )
+                .ok()?
+        };
+        // The device counter can wrap, and a wrapped pair reads as a huge
+        // interval rather than as an error. Drop it instead of reporting it.
+        let elapsed_ticks = ticks[1].checked_sub(ticks[0])?;
+        Some((elapsed_ticks as f64 * f64::from(self.timestamp_period)) as u64)
+    }
+
+    /// GPU time the last [`Self::convert`] took, in nanoseconds.
+    ///
+    /// `None` before the first conversion, and on devices whose compute queue
+    /// family does not support timestamp queries.
+    ///
+    /// This is execution time on the shader cores, not the wall time `convert`
+    /// took to return — those differ by the submit and the fence wait, and the
+    /// wait is the larger of the two whenever the GPU is busy with something
+    /// else. A caller sharing the GPU with a renderer wants this one: it is the
+    /// share of the frame the conversion is actually taking from it.
+    pub fn last_gpu_time_ns(&self) -> Option<u64> {
+        self.last_gpu_time_ns
     }
 
     /// Get or create an ImageView for the source image.
@@ -960,6 +1048,11 @@ impl Drop for ColorConverter {
             // Destroy command resources.
             device.destroy_fence(self.fence, None);
             device.destroy_command_pool(self.command_pool, None);
+
+            // Null where the compute queue family cannot report timestamps.
+            if !self.timestamp_query_pool.is_null() {
+                device.destroy_query_pool(self.timestamp_query_pool, None);
+            }
         }
     }
 }

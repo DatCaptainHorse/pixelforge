@@ -254,6 +254,33 @@ pub fn create_converter(
     let fence = unsafe { device.create_fence(&fence_info, None) }
         .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
 
+    // Timestamps bracketing the conversion, where the compute queue family can
+    // report them. A family with `timestampValidBits == 0` makes
+    // `vkCmdWriteTimestamp` illegal on it, so the pool stays null there and the
+    // recording path skips the writes. A failure to create it is not a reason
+    // to fail the converter: the timing is diagnostic and the conversion is
+    // not.
+    let timestamp_query_pool = if context.compute_timestamps_supported() {
+        let info = vk::QueryPoolCreateInfo::default()
+            .query_type(vk::QueryType::TIMESTAMP)
+            .query_count(2);
+        match unsafe { device.create_query_pool(&info, None) } {
+            Ok(pool) => pool,
+            Err(e) => {
+                tracing::warn!("converter timestamp pool: {e}; GPU timing unavailable");
+                vk::QueryPool::null()
+            }
+        }
+    } else {
+        tracing::info!(
+            "Compute queue family {} reports timestampValidBits=0; \
+             converter GPU timing disabled",
+            context.compute_queue_family()
+        );
+        vk::QueryPool::null()
+    };
+    let timestamp_period = context.device_properties().limits.timestamp_period;
+
     Ok(ColorConverter {
         context,
         config,
@@ -269,6 +296,9 @@ pub fn create_converter(
         command_pool,
         command_buffer,
         fence,
+        timestamp_query_pool,
+        timestamp_period,
+        last_gpu_time_ns: None,
         // Descriptor buffer fields.
         descriptor_buffer,
         descriptor_buffer_memory,

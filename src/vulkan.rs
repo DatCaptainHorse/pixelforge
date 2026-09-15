@@ -400,6 +400,7 @@ struct VideoContextInner {
     device: ash::Device,
     video_encode_queue_family: Option<u32>,
     video_encode_timestamp_valid_bits: u32,
+    compute_timestamp_valid_bits: u32,
     video_encode_queue: Option<vk::Queue>,
     video_decode_queue_family: Option<u32>,
     video_decode_queue: Option<vk::Queue>,
@@ -472,6 +473,18 @@ impl VideoContext {
     /// (VUID-vkCmdWriteTimestamp-timestampValidBits-00829).
     pub(crate) fn encode_timestamps_supported(&self) -> bool {
         self.inner.video_encode_timestamp_valid_bits > 0
+    }
+
+    /// Whether the selected compute queue family supports timestamp queries.
+    ///
+    /// Same caveat as the encode queue: a family reporting
+    /// `timestampValidBits == 0` makes `vkCmdWriteTimestamp` illegal on it
+    /// (VUID-vkCmdWriteTimestamp-timestampValidBits-00829), so the converter
+    /// has to check rather than assume. A graphics+compute family reports
+    /// non-zero on every driver seen so far, but a dedicated compute family
+    /// need not.
+    pub(crate) fn compute_timestamps_supported(&self) -> bool {
+        self.inner.compute_timestamp_valid_bits > 0
     }
 
     pub(crate) fn video_decode_queue_family(&self) -> Option<u32> {
@@ -657,6 +670,7 @@ impl VideoContext {
         let mut selected_device_exts = None;
         let mut video_encode_queue_family = None;
         let mut video_encode_timestamp_valid_bits = 0u32;
+        let mut compute_timestamp_valid_bits = 0u32;
         let mut video_decode_queue_family = None;
         let mut transfer_queue_family = u32::MAX;
         let mut compute_queue_family = u32::MAX;
@@ -689,6 +703,7 @@ impl VideoContext {
             let mut transfer_q = u32::MAX;
             let mut transfer_score = -1i32;
             let mut compute_q = u32::MAX;
+            let mut compute_ts_bits = 0u32;
 
             for (idx, props) in queue_families.iter().enumerate() {
                 debug!(
@@ -741,6 +756,7 @@ impl VideoContext {
                 // Check for compute queue (prefer dedicated compute, otherwise graphics+compute).
                 if flags.contains(vk::QueueFlags::COMPUTE) && compute_q == u32::MAX {
                     compute_q = idx as u32;
+                    compute_ts_bits = props.timestamp_valid_bits;
                     debug!("Found compute queue at family {}", idx);
                 }
             }
@@ -835,6 +851,7 @@ impl VideoContext {
                     encode_queue.unwrap_or(0)
                 };
                 compute_queue_family = compute_q;
+                compute_timestamp_valid_bits = compute_ts_bits;
                 supported_encode_codecs = encode_codecs;
                 supported_decode_codecs = decode_codecs;
                 info!("Selected device: {}", device_name);
@@ -1143,6 +1160,7 @@ impl VideoContext {
                 device,
                 video_encode_queue_family,
                 video_encode_timestamp_valid_bits,
+                compute_timestamp_valid_bits,
                 video_encode_queue,
                 video_decode_queue_family,
                 video_decode_queue,
@@ -1220,6 +1238,7 @@ impl VideoContext {
                 device,
                 video_encode_queue_family: None,
                 video_encode_timestamp_valid_bits: 0u32,
+                compute_timestamp_valid_bits: 0u32,
                 video_encode_queue: None,
                 video_decode_queue_family: Some(families.decode),
                 video_decode_queue: Some(video_decode_queue),
