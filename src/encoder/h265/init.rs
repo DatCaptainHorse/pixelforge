@@ -78,6 +78,10 @@ impl H265 {
             .push(&mut encode_caps)
             .push(&mut h265_caps);
         let caps = query_video_caps(&context, &profile_info, &mut capabilities)?;
+        crate::encoder::codec::warn_unsupported_rate_control(
+            &config,
+            encode_caps.rate_control_modes,
+        );
 
         // Scale the bitstream buffer by resolution so a single frame can't overflow (matches AV1).
         let bitstream_buffer_size = MIN_BITSTREAM_BUFFER_SIZE

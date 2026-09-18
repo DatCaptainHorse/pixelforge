@@ -55,6 +55,16 @@ pub(crate) struct EncoderCommon {
     pub input_frame_num: u64,
     /// Monotonic encode-order counter (decode order / DTS; `0` => first frame).
     pub encode_frame_num: u64,
+    /// Set when the rate control state in `config` no longer matches what the
+    /// video session was last told, so the next recorded frame re-issues it
+    /// through a coding-control command.
+    ///
+    /// Rate control is session state, not per-frame state: changing
+    /// `config.target_bitrate` alone would leave the value chained to
+    /// `vkCmdBeginVideoCodingKHR` disagreeing with the session, which is
+    /// undefined rather than merely ineffective. The flag is what makes a live
+    /// retune a state change instead of a lie.
+    pub rate_control_dirty: bool,
 
     pub dpb_images: Vec<vk::Image>,
     pub dpb_image_memories: Vec<vk::DeviceMemory>,
@@ -204,6 +214,55 @@ pub(crate) struct RateControlPlan {
     /// QP/q-index: the configured quality level for CQP/Disabled, otherwise the
     /// codec's default starting point for the bitrate controller.
     pub qp: u32,
+    /// Inclusive QP/q-index bounds to hand the encoder, on the codec's own
+    /// scale, or `None` to leave the rate controller unconstrained.
+    ///
+    /// CQP pins both ends to the requested QP -- that is what constant-QP
+    /// means. A bitrate mode gets whatever the caller asked for and, by
+    /// default, nothing: **a QP floor under a bitrate target is a floor on how
+    /// few bits a frame may spend, so any target below what that quality costs
+    /// is unreachable.** H.264 used to hardcode a floor of 18 here and H.265
+    /// one of 26, which made a CBR target under roughly 8-10 Mbps at 1080p
+    /// impossible to hit; the encoder ignored it and emitted what QP 18 cost.
+    /// AV1 never had the bug -- it already disabled its bounds under a bitrate
+    /// mode, and this is the other two brought in line with it.
+    pub qp_bounds: Option<(u32, u32)>,
+}
+
+/// Warn when the device cannot do the rate control the caller asked for.
+///
+/// Vulkan does not fail an encode for this: the session is created, frames come
+/// out, and the target bitrate is quietly ignored -- which is the worst possible
+/// shape for the failure, because everything downstream reports success while
+/// the stream ignores its budget. Intel's ANV advertises `DISABLED` alone and
+/// `maxBitrate = 0`, so every CBR encode on it is really constant-QP wearing a
+/// bitrate's name, and nothing said so.
+pub(crate) fn rate_control_is_supported(
+    mode: RateControlMode,
+    supported: vk::VideoEncodeRateControlModeFlagsKHR,
+) -> bool {
+    let wanted = match mode {
+        RateControlMode::Cbr => vk::VideoEncodeRateControlModeFlagsKHR::CBR,
+        RateControlMode::Vbr => vk::VideoEncodeRateControlModeFlagsKHR::VBR,
+        // Both map to DISABLED, which every implementation must offer.
+        RateControlMode::Cqp | RateControlMode::Disabled => return true,
+    };
+    supported.contains(wanted)
+}
+
+pub(crate) fn warn_unsupported_rate_control(
+    config: &EncodeConfig,
+    supported: vk::VideoEncodeRateControlModeFlagsKHR,
+) {
+    if !rate_control_is_supported(config.rate_control_mode, supported) {
+        tracing::warn!(
+            "device does not support {:?} rate control (it offers {supported:?}); \
+             the {} bps target will be ignored and the stream will be encoded at \
+             a constant quality instead",
+            config.rate_control_mode,
+            config.target_bitrate,
+        );
+    }
 }
 
 impl RateControlPlan {
@@ -214,19 +273,35 @@ impl RateControlPlan {
                 average_bitrate: 0,
                 max_bitrate: 0,
                 qp: config.quality_level,
+                qp_bounds: Some((config.quality_level, config.quality_level)),
             },
             RateControlMode::Cbr => Self {
                 mode: vk::VideoEncodeRateControlModeFlagsKHR::CBR,
                 average_bitrate: config.target_bitrate,
                 max_bitrate: config.target_bitrate,
                 qp: controller_default_qp,
+                qp_bounds: config.qp_bounds,
             },
             RateControlMode::Vbr => Self {
                 mode: vk::VideoEncodeRateControlModeFlagsKHR::VBR,
                 average_bitrate: config.target_bitrate,
                 max_bitrate: config.max_bitrate,
                 qp: controller_default_qp,
+                qp_bounds: config.qp_bounds,
             },
+        }
+    }
+
+    /// The bounds as `(use_bounds, min, max)`, ready for the `use_min_qp` /
+    /// `min_qp` pair every codec's rate-control layer info wants.
+    ///
+    /// Returning the flag alongside the values is what stops the two drifting:
+    /// H.265 set `min_qp` and `max_qp` without ever setting `use_min_qp`, so
+    /// its bounds were written into the struct and ignored by the driver.
+    pub fn qp_bound_fields(&self) -> (bool, i32, i32) {
+        match self.qp_bounds {
+            Some((min, max)) => (true, min as i32, max as i32),
+            None => (false, 0, 0),
         }
     }
 
@@ -356,6 +431,37 @@ impl<C: VideoCodec> CodecEncoder<C> {
         {
             self.common.gop.request_idr();
         }
+    }
+
+    /// Retarget a bitrate-controlled encode, live.
+    ///
+    /// Takes effect on the next recorded frame and costs nothing else: no
+    /// session reset, no encoder rebuild, **and no forced IDR**. That last part
+    /// is the point. A caller adapting to a congested path would otherwise emit
+    /// a keyframe every time it adjusted -- the largest frame there is, onto the
+    /// path least able to carry it -- and the adaptation would cost more than it
+    /// saved.
+    ///
+    /// # Errors
+    /// If the encode is not under a bitrate mode. Under
+    /// [`RateControlMode::Cqp`] or [`RateControlMode::Disabled`] there is no
+    /// bitrate to retarget, and silently accepting one would leave the caller
+    /// believing it had changed something.
+    pub fn set_target_bitrate(&mut self, bits_per_second: u32) -> Result<()> {
+        match self.common.config.rate_control_mode {
+            RateControlMode::Cbr | RateControlMode::Vbr => {}
+            mode => {
+                return Err(PixelForgeError::InvalidInput(format!(
+                    "set_target_bitrate needs a bitrate rate-control mode, this encode is {mode:?}"
+                )));
+            }
+        }
+        if self.common.config.target_bitrate == bits_per_second {
+            return Ok(());
+        }
+        self.common.config.target_bitrate = bits_per_second;
+        self.common.rate_control_dirty = true;
+        Ok(())
     }
 
     /// Rebuild session parameters with a new color description; the next frame is
@@ -702,6 +808,7 @@ pub(crate) fn build_encoder_common(req: &CommonInitRequest) -> Result<CommonInit
         gop,
         input_frame_num: 0,
         encode_frame_num: 0,
+        rate_control_dirty: false,
         dpb_images,
         dpb_image_memories,
         dpb_image_views,
@@ -719,4 +826,43 @@ pub(crate) fn build_encoder_common(req: &CommonInitRequest) -> Result<CommonInit
         common,
         active_reference_count: max_active_reference_pictures as u32,
     })
+}
+
+#[cfg(test)]
+mod rate_control_support_tests {
+    use super::*;
+
+    const NONE: vk::VideoEncodeRateControlModeFlagsKHR =
+        vk::VideoEncodeRateControlModeFlagsKHR::DISABLED;
+
+    #[test]
+    fn a_device_offering_only_disabled_cannot_do_bitrates() {
+        // Intel's ANV reports exactly this, and every CBR encode on it silently
+        // became constant-QP.
+        assert!(!rate_control_is_supported(RateControlMode::Cbr, NONE));
+        assert!(!rate_control_is_supported(RateControlMode::Vbr, NONE));
+    }
+
+    #[test]
+    fn constant_qp_always_works() {
+        // DISABLED is mandatory, so these must never warn -- a spurious warning
+        // on every CQP encode would teach people to ignore the real one.
+        assert!(rate_control_is_supported(RateControlMode::Cqp, NONE));
+        assert!(rate_control_is_supported(RateControlMode::Disabled, NONE));
+    }
+
+    #[test]
+    fn a_device_offering_the_mode_is_accepted() {
+        let both = vk::VideoEncodeRateControlModeFlagsKHR::CBR
+            | vk::VideoEncodeRateControlModeFlagsKHR::VBR;
+        assert!(rate_control_is_supported(RateControlMode::Cbr, both));
+        assert!(rate_control_is_supported(RateControlMode::Vbr, both));
+    }
+
+    #[test]
+    fn offering_one_bitrate_mode_does_not_imply_the_other() {
+        let cbr_only = vk::VideoEncodeRateControlModeFlagsKHR::CBR;
+        assert!(rate_control_is_supported(RateControlMode::Cbr, cbr_only));
+        assert!(!rate_control_is_supported(RateControlMode::Vbr, cbr_only));
+    }
 }

@@ -317,6 +317,18 @@ pub struct EncodeConfig {
     pub max_bitrate: u32,
     /// Quality level for CQP mode (QP value).
     pub quality_level: u32,
+    /// Inclusive QP bounds to constrain a *bitrate-controlled* encode to, on
+    /// the codec's own scale -- 0..=51 for H.264 and H.265, the 0..=255
+    /// q-index for AV1.
+    ///
+    /// `None`, the default, leaves the rate controller unconstrained, which is
+    /// what a caller asking for a bitrate almost always wants: a floor on QP is
+    /// a floor on how few bits a frame may use, so a target below what that
+    /// quality costs becomes unreachable and the encoder silently overshoots.
+    ///
+    /// Ignored under [`RateControlMode::Cqp`] and [`RateControlMode::Disabled`],
+    /// where [`quality_level`](Self::quality_level) pins the QP exactly.
+    pub qp_bounds: Option<(u32, u32)>,
     /// Frame rate numerator.
     pub frame_rate_numerator: u32,
     /// Frame rate denominator.
@@ -364,6 +376,7 @@ impl EncodeConfig {
             target_bitrate: DEFAULT_TARGET_BITRATE,
             max_bitrate: DEFAULT_MAX_BITRATE,
             quality_level: DEFAULT_H264_QP,
+            qp_bounds: None,
             frame_rate_numerator: DEFAULT_FRAME_RATE,
             frame_rate_denominator: 1,
             gop_size: DEFAULT_GOP_SIZE,
@@ -392,6 +405,7 @@ impl EncodeConfig {
             target_bitrate: DEFAULT_TARGET_BITRATE,
             max_bitrate: DEFAULT_MAX_BITRATE,
             quality_level: DEFAULT_H265_QP,
+            qp_bounds: None,
             frame_rate_numerator: DEFAULT_FRAME_RATE,
             frame_rate_denominator: 1,
             gop_size: DEFAULT_GOP_SIZE,
@@ -420,6 +434,7 @@ impl EncodeConfig {
             target_bitrate: DEFAULT_TARGET_BITRATE,
             max_bitrate: DEFAULT_MAX_BITRATE,
             quality_level: 128, // AV1 uses 0-255 QP range
+            qp_bounds: None,
             frame_rate_numerator: DEFAULT_FRAME_RATE,
             frame_rate_denominator: 1,
             gop_size: DEFAULT_GOP_SIZE,
@@ -490,6 +505,18 @@ impl EncodeConfig {
     }
 
     /// Set the maximum bitrate.
+    /// Constrain a bitrate-controlled encode to an inclusive QP range, on the
+    /// codec's own scale. See [`qp_bounds`](Self::qp_bounds) -- the default of
+    /// no bounds is right for nearly every caller.
+    ///
+    /// # Panics
+    /// If `min` is greater than `max`.
+    pub fn with_qp_bounds(mut self, min: u32, max: u32) -> Self {
+        assert!(min <= max, "qp bounds must be ordered, got {min}..={max}");
+        self.qp_bounds = Some((min, max));
+        self
+    }
+
     pub fn with_max_bitrate(mut self, bitrate: u32) -> Self {
         self.max_bitrate = bitrate;
         self
@@ -575,6 +602,7 @@ trait EncoderApi: Send {
     fn flush(&mut self) -> Result<()>;
     fn request_idr(&mut self);
     fn invalidate_reference_frames(&mut self, first_lost_display_order: u64);
+    fn set_target_bitrate(&mut self, bits_per_second: u32) -> Result<()>;
     fn set_color_description(&mut self, desc: ColorDescription) -> Result<()>;
 }
 
@@ -593,6 +621,9 @@ impl<C: codec::VideoCodec> EncoderApi for codec::CodecEncoder<C> {
     }
     fn invalidate_reference_frames(&mut self, first_lost_display_order: u64) {
         codec::CodecEncoder::invalidate_reference_frames(self, first_lost_display_order)
+    }
+    fn set_target_bitrate(&mut self, bits_per_second: u32) -> Result<()> {
+        codec::CodecEncoder::set_target_bitrate(self, bits_per_second)
     }
     fn set_color_description(&mut self, desc: ColorDescription) -> Result<()> {
         codec::CodecEncoder::set_color_description(self, desc)
@@ -703,6 +734,23 @@ impl Encoder {
         self.0.invalidate_reference_frames(first_lost_display_order)
     }
 
+    /// Retarget a bitrate-controlled encode, live.
+    ///
+    /// Takes effect on the next encoded frame. No session reset, no rebuild,
+    /// and **no forced IDR** -- which is what makes it usable as the actuator
+    /// of a congestion-control loop. A caller that had to rebuild the encoder
+    /// to change bitrate would emit a keyframe on every adjustment, and a
+    /// keyframe is the largest frame there is: the adaptation would cost more
+    /// than it saved, on exactly the path least able to afford it.
+    ///
+    /// # Errors
+    /// If this encode is not under [`RateControlMode::Cbr`] or
+    /// [`RateControlMode::Vbr`]. Constant-QP has no bitrate to retarget, and
+    /// accepting the call anyway would leave a caller believing otherwise.
+    pub fn set_target_bitrate(&mut self, bits_per_second: u32) -> Result<()> {
+        self.0.set_target_bitrate(bits_per_second)
+    }
+
     /// Update the color description (VUI parameters) for the encoder.
     ///
     /// This recreates the video session parameters with an updated SPS/VPS/sequence
@@ -799,6 +847,95 @@ mod tests {
     }
 
     // RateControlMode tests.
+    /// What a bitrate target is allowed to do to QP.
+    ///
+    /// These exist because of a real failure: H.264 hardcoded `min_qp = 18`
+    /// under CBR, so a 1080p session asking for 1000 kbps got roughly ten times
+    /// that -- the encoder could not go above QP 18 no matter what the target
+    /// said, and emitted whatever that quality cost. The bug was invisible at
+    /// the 10 Mbps default, where the floor never bound, and appeared only when
+    /// someone tried to turn the bitrate down.
+    mod qp_bound_tests {
+        use super::*;
+        use crate::encoder::codec::RateControlPlan;
+
+        #[test]
+        fn a_bitrate_target_is_unconstrained_by_default() {
+            // The whole bug in one assertion: nothing may put a floor under QP
+            // unless the caller asked for one, because a QP floor is a floor on
+            // how few bits a frame may spend.
+            for mode in [RateControlMode::Cbr, RateControlMode::Vbr] {
+                let config = EncodeConfig::h264(1920, 1080)
+                    .with_rate_control(mode)
+                    .with_target_bitrate(1_000_000);
+                let plan = RateControlPlan::new(&config, 26);
+                assert_eq!(
+                    plan.qp_bounds, None,
+                    "{mode:?} put bounds on a bitrate target"
+                );
+                assert_eq!(plan.qp_bound_fields(), (false, 0, 0));
+            }
+        }
+
+        #[test]
+        fn every_codec_answers_the_same_way() {
+            // H.264, H.265 and AV1 each used to decide this for themselves, and
+            // each decided differently: a floor of 18, an inert floor of 26, and
+            // no floor at all.
+            for config in [
+                EncodeConfig::h264(1920, 1080),
+                EncodeConfig::h265(1920, 1080),
+                EncodeConfig::av1(1920, 1080),
+            ] {
+                let config = config
+                    .with_rate_control(RateControlMode::Cbr)
+                    .with_target_bitrate(1_000_000);
+                assert_eq!(RateControlPlan::new(&config, 26).qp_bounds, None);
+            }
+        }
+
+        #[test]
+        fn bounds_are_used_when_the_caller_asks_for_them() {
+            let config = EncodeConfig::h264(1920, 1080)
+                .with_rate_control(RateControlMode::Cbr)
+                .with_target_bitrate(1_000_000)
+                .with_qp_bounds(20, 45);
+            let plan = RateControlPlan::new(&config, 26);
+            assert_eq!(plan.qp_bounds, Some((20, 45)));
+            assert_eq!(plan.qp_bound_fields(), (true, 20, 45));
+        }
+
+        #[test]
+        fn constant_qp_still_pins_both_ends() {
+            // The flag matters as much as the values: H.265 wrote min_qp and
+            // max_qp without ever setting use_min_qp, so even CQP's own QP was
+            // handed to the driver and ignored.
+            for mode in [RateControlMode::Cqp, RateControlMode::Disabled] {
+                let config = EncodeConfig::h264(1920, 1080)
+                    .with_rate_control(mode)
+                    .with_quality_level(31);
+                let plan = RateControlPlan::new(&config, 26);
+                assert_eq!(plan.qp_bounds, Some((31, 31)));
+                assert_eq!(plan.qp_bound_fields(), (true, 31, 31));
+            }
+        }
+
+        #[test]
+        fn constant_qp_ignores_bounds_meant_for_a_bitrate_target() {
+            let config = EncodeConfig::h264(1920, 1080)
+                .with_rate_control(RateControlMode::Cqp)
+                .with_quality_level(31)
+                .with_qp_bounds(10, 20);
+            assert_eq!(RateControlPlan::new(&config, 26).qp_bounds, Some((31, 31)));
+        }
+
+        #[test]
+        #[should_panic(expected = "qp bounds must be ordered")]
+        fn bounds_the_wrong_way_round_are_refused() {
+            let _ = EncodeConfig::h264(1920, 1080).with_qp_bounds(40, 20);
+        }
+    }
+
     mod rate_control_tests {
         use super::*;
 

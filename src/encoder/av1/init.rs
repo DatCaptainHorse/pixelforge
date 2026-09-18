@@ -66,6 +66,10 @@ impl Av1 {
             .push(&mut encode_caps)
             .push(&mut av1_caps);
         let caps = query_video_caps(&context, &profile_info, &mut capabilities)?;
+        crate::encoder::codec::warn_unsupported_rate_control(
+            &config,
+            encode_caps.rate_control_modes,
+        );
 
         let init = build_encoder_common(&CommonInitRequest {
             context: &context,
