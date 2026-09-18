@@ -25,11 +25,18 @@ use tracing::debug;
 #[repr(u32)]
 pub enum ColorSpec {
     /// Ordinary SDR content, the usual desktop and game output.
+    ///
+    /// sRGB and BT.709 cover the same colours and differ only in the curve
+    /// applied to them, which is why the linear one below is named for BT.709
+    /// rather than for sRGB.
     Srgb = 0,
-    /// scRGB: like `Srgb` but in linear light. What a
-    /// `VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT` swapchain gives you.
+    /// scRGB: the same colours as `Srgb`, in linear light.
+    ///
+    /// Values above 1.0 are allowed and mean brighter than SDR white, which is
+    /// how this carries HDR. What a `VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT`
+    /// swapchain gives you.
     Bt709Linear = 1,
-    /// Linear light in the wide HDR gamut.
+    /// Like `Bt709Linear`, but with the wider HDR colours.
     Bt2020Linear = 2,
     /// HDR10: wide gamut, PQ encoded. What a
     /// `VK_COLOR_SPACE_HDR10_ST2084_EXT` swapchain gives you.
