@@ -404,8 +404,7 @@ impl H265 {
         }
 
         // Rate control.
-        let qp_min = if rc.is_disabled() { rc.qp as i32 } else { 26 };
-        let qp_max = if rc.is_disabled() { rc.qp as i32 } else { 51 };
+        let (use_qp_bounds, qp_min, qp_max) = rc.qp_bound_fields();
         let min_qp = vk::VideoEncodeH265QpKHR {
             qp_i: qp_min,
             qp_p: qp_min,
@@ -416,8 +415,12 @@ impl H265 {
             qp_p: qp_max,
             qp_b: qp_max,
         };
+        // The `use_*` flags were missing here, so these two were written into
+        // the struct and never read -- CQP's own QP among them.
         let mut h265_rc_layer_info = vk::VideoEncodeH265RateControlLayerInfoKHR::default()
+            .use_min_qp(use_qp_bounds)
             .min_qp(min_qp)
+            .use_max_qp(use_qp_bounds)
             .max_qp(max_qp);
         let rc_layer_info = vk::VideoEncodeRateControlLayerInfoKHR::default()
             .average_bitrate(rc.average_bitrate as u64)
@@ -442,8 +445,20 @@ impl H265 {
         // Reset and write start timestamp
         reset_start_timestamp(common.device(), command_buffer, timestamp_query_pool);
 
+        // Rate control is session state. A live retune sets `rate_control_dirty`
+        // rather than reaching into the chained struct, because a value chained
+        // to begin-coding that disagrees with the session is undefined rather
+        // than merely ignored -- so the new state is established the only way it
+        // can be, through a coding-control command.
+        //
+        // When one is coming, begin-coding is left without the rate control
+        // struct, exactly as the first frame leaves it: the two must not both
+        // carry it, since ash links pNext chains in place and one struct cannot
+        // be in two of them.
         let is_first_frame = plan.is_first_frame();
-        let begin_coding_info = if is_first_frame {
+        let rate_control_dirty = common.rate_control_dirty;
+        let sets_rate_control = is_first_frame || rate_control_dirty;
+        let begin_coding_info = if sets_rate_control {
             vk::VideoBeginCodingInfoKHR::default()
                 .video_session(common.session)
                 .video_session_parameters(common.session_params)
@@ -465,24 +480,29 @@ impl H265 {
             );
         }
 
-        if is_first_frame {
+        if sets_rate_control {
             let mut quality_level_info =
                 vk::VideoEncodeQualityLevelInfoKHR::default().quality_level(0);
-            let control_info = vk::VideoCodingControlInfoKHR::default()
-                .flags(
+            let mut control_info = vk::VideoCodingControlInfoKHR::default()
+                .flags(if is_first_frame {
                     vk::VideoCodingControlFlagsKHR::RESET
                         | vk::VideoCodingControlFlagsKHR::ENCODE_RATE_CONTROL
-                        | vk::VideoCodingControlFlagsKHR::ENCODE_QUALITY_LEVEL,
-                )
+                        | vk::VideoCodingControlFlagsKHR::ENCODE_QUALITY_LEVEL
+                } else {
+                    vk::VideoCodingControlFlagsKHR::ENCODE_RATE_CONTROL
+                })
                 .push(&mut rc_info)
-                .push(&mut h265_rc_info)
-                .push(&mut quality_level_info);
+                .push(&mut h265_rc_info);
+            if is_first_frame {
+                control_info = control_info.push(&mut quality_level_info);
+            }
             unsafe {
                 (common.video_queue_fn.fp().cmd_control_video_coding_khr)(
                     command_buffer,
                     &control_info,
                 );
             }
+            common.rate_control_dirty = false;
         }
 
         let encode_info = vk::VideoEncodeInfoKHR::default()
