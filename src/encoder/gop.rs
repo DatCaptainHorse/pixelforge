@@ -111,6 +111,22 @@ impl GopStructure {
         Self::new(gop_size, 0, gop_size)
     }
 
+    /// Change how often an IDR is scheduled, without disturbing the stream.
+    ///
+    /// `None` stops periodic IDRs entirely: the first frame remains one and
+    /// nothing after it is, until something asks. That is the mode intra-refresh
+    /// wants, and it is also what a congestion controller wants when keyframes
+    /// are the thing overwhelming the path.
+    ///
+    /// Counters are deliberately left alone. Resetting them would renumber the
+    /// stream mid-flight, which is a decoder desync, and the point of changing
+    /// this at runtime is to not disturb anything.
+    pub fn set_gop_size(&mut self, gop_size: Option<u32>) {
+        let size = gop_size.unwrap_or(0);
+        self.gop_size = size.max(1);
+        self.idr_period = size;
+    }
+
     /// Set max frame_num (2^(log2_max_frame_num_minus4+4)).
     pub fn set_max_frame_num(&mut self, log2_max_frame_num_minus4: u8) {
         self.max_frame_num = 1 << (log2_max_frame_num_minus4 + 4);
@@ -230,5 +246,53 @@ mod tests {
         let pos = gop.get_next_frame();
         assert_eq!(pos.frame_type, GopFrameType::Idr);
         assert_eq!(pos.frame_index, 30);
+    }
+}
+
+#[cfg(test)]
+mod set_gop_size_tests {
+    use super::*;
+
+    /// Which frame indices came out as IDRs over `n` frames.
+    fn idrs(gop: &mut GopStructure, n: u64) -> Vec<u64> {
+        (0..n)
+            .filter_map(|_| {
+                let p = gop.get_next_frame();
+                p.frame_type.is_intra().then_some(p.frame_index)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn none_stops_periodic_idrs() {
+        let mut gop = GopStructure::new_ip_only(10);
+        assert_eq!(idrs(&mut gop, 20), vec![0, 10]);
+        gop.set_gop_size(None);
+        // Nothing periodic from here on. The stream keeps running; it simply
+        // stops spending a keyframe every ten frames.
+        assert_eq!(idrs(&mut gop, 60), Vec::<u64>::new());
+    }
+
+    #[test]
+    fn a_new_period_takes_effect_without_renumbering() {
+        let mut gop = GopStructure::new_ip_only(10);
+        let _ = idrs(&mut gop, 15);
+        let before = gop.total_frames();
+        gop.set_gop_size(Some(5));
+        // The counter is untouched -- renumbering mid-stream would desync a
+        // decoder, which is the opposite of what a live change is for.
+        assert_eq!(gop.total_frames(), before);
+        assert_eq!(idrs(&mut gop, 15), vec![15, 20, 25]);
+    }
+
+    #[test]
+    fn an_explicit_request_still_works_with_no_period() {
+        // Turning periodic IDRs off must not turn keyframes off: a client that
+        // cannot decode still has to be able to ask for one.
+        let mut gop = GopStructure::new_ip_only(10);
+        gop.set_gop_size(None);
+        let _ = idrs(&mut gop, 5);
+        gop.request_idr();
+        assert_eq!(idrs(&mut gop, 3).len(), 1);
     }
 }
