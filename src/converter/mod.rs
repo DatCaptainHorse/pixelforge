@@ -14,55 +14,39 @@ use crate::vulkan::VideoContext;
 use ash::vk;
 use tracing::debug;
 
-/// A colour space: its primaries, its transfer function, and, where that
-/// transfer function is relative rather than absolute, what luminance a sample
-/// value of 1.0 stands for.
+/// A colour space, used for both ends of a conversion:
+/// [`ColorConverterConfig::source`] for the input and
+/// [`ColorConverterConfig::target`] for the encoded output.
 ///
-/// One type describes both ends of a conversion. Which end a given value is
-/// describing comes from the slot it sits in,
-/// [`ColorConverterConfig::source`] or [`ColorConverterConfig::target`], not
-/// from the value itself, so nothing here needs renaming if conversion ever
-/// runs the other way.
-///
-/// Not every space can be a target. An encoded stream has to be something a
-/// decoder can be told about, and there are no VUI code points for linear
-/// light, so [`ColorSpec::Bt709Linear`] and [`ColorSpec::Bt2020Linear`] are
-/// source-only. [`ColorSpec::is_encodable`] is the check, and
-/// [`ColorConverter::new`] applies it.
-///
-/// Each space knows the luminance its sample value of 1.0 represents, see
-/// [`ColorSpec::reference_white_nits`]. That only matters on the way to an
-/// absolute transfer function, so it is read only when the target is
-/// [`ColorSpec::Bt2020Pq`], and only from the source.
+/// The two linear spaces can only be an input. Video files have no way to say
+/// "linear", so nothing could be decoded correctly; see
+/// [`ColorSpec::is_encodable`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u32)]
 pub enum ColorSpec {
-    /// BT.709 primaries, sRGB transfer function. Ordinary SDR desktop content.
+    /// Ordinary SDR content, the usual desktop and game output.
     Srgb = 0,
-    /// BT.709 primaries, linear light. This is scRGB, what a
-    /// `VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT` swapchain produces.
+    /// scRGB: like `Srgb` but in linear light. What a
+    /// `VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT` swapchain gives you.
     Bt709Linear = 1,
-    /// BT.2020 primaries, linear light.
+    /// Linear light in the wide HDR gamut.
     Bt2020Linear = 2,
-    /// BT.2020 primaries, PQ (ST 2084) transfer function. Already HDR-encoded,
-    /// as a `VK_COLOR_SPACE_HDR10_ST2084_EXT` surface or a gamescope PQ
-    /// surface is.
+    /// HDR10: wide gamut, PQ encoded. What a
+    /// `VK_COLOR_SPACE_HDR10_ST2084_EXT` swapchain gives you.
     Bt2020Pq = 3,
 }
 
 impl ColorSpec {
-    /// The luminance a sample value of 1.0 represents in this space, in nits,
-    /// where that is a meaningful question to ask.
+    /// How bright this space's white is, in nits.
     ///
-    /// This is the standard figure for the space, not a setting: 203 nits for
-    /// the SDR-referred spaces per ITU-R BT.2408, and 80 for scRGB per IEC
-    /// 61966-2-2. The 80 is why `Bt709Linear` is worth having as its own
-    /// variant: reading an `EXTENDED_SRGB_LINEAR_EXT` swapchain at the 203 that
-    /// SDR content wants maps its white about two and a half times too bright.
+    /// Only used when encoding to HDR, which needs real brightness values
+    /// rather than the relative ones SDR content carries. Getting it wrong
+    /// makes the picture too bright or too dim, so the spaces differ here:
+    /// scRGB defines its white as 80 nits, the others use 203.
     ///
-    /// `None` for [`ColorSpec::Bt2020Pq`], PQ being absolute already.
-    /// [`ColorConverterConfig::with_reference_white_nits`] overrides it for a
-    /// conversion that needs a different figure.
+    /// `None` for `Bt2020Pq`, which already carries real brightness values.
+    /// Override it with
+    /// [`ColorConverterConfig::with_reference_white_nits`].
     pub fn reference_white_nits(&self) -> Option<f32> {
         match self {
             Self::Srgb | Self::Bt2020Linear => Some(203.0),
@@ -71,28 +55,23 @@ impl ColorSpec {
         }
     }
 
-    /// Whether a stream can be declared to be in this space.
+    /// Whether video can be encoded in this space.
     ///
-    /// H.273 has code points for primaries, transfer characteristics and
-    /// matrix coefficients; it has none for linear light. The two linear specs
-    /// are therefore source-only.
+    /// False for the two linear spaces: a video file has no way to record that
+    /// it holds linear light, so a player would get it wrong.
     pub fn is_encodable(&self) -> bool {
         matches!(self, Self::Srgb | Self::Bt2020Pq)
     }
 
-    /// How a decoder should be told about a stream in this space, if it can be
-    /// told at all.
+    /// What to tell a player about video in this space.
     ///
-    /// `None` exactly when [`Self::is_encodable`] is false. The range is not
-    /// part of a colour space here, so this leaves it at the
-    /// [`ColorDescription`] default; [`ColorConverterConfig::color_description`]
-    /// is what fills it in.
+    /// `None` when [`Self::is_encodable`] is false. The range is set
+    /// separately, by [`ColorConverterConfig::color_description`].
     pub fn color_description(&self) -> Option<ColorDescription> {
         match self {
-            // The VUI says BT.709 transfer characteristics for SDR. sRGB's
-            // curve differs from BT.709's only in the toe, and every decoder
-            // and display treats the pair interchangeably; H.273's separate
-            // sRGB code point (13) is not what encoders emit here.
+            // sRGB and BT.709 differ slightly in their curves, but video
+            // always labels this case BT.709 and players treat the two the
+            // same, so labelling it anything else would be surprising.
             Self::Srgb => Some(ColorDescription::bt709()),
             Self::Bt2020Pq => Some(ColorDescription::bt2020_pq()),
             Self::Bt709Linear | Self::Bt2020Linear => None,
@@ -228,13 +207,8 @@ impl OutputFormat {
 
 /// Configuration for the color converter.
 ///
-/// The colour side of this is deliberately two decisions rather than one:
-/// [`source`](Self::source) says what the input pixels are, and
-/// [`target`](Self::target) says what the encoded stream should be. Both are a
-/// [`ColorSpec`], since they are the same kind of thing; only the slot says
-/// which end is which. Only the target is a property of the output, which is
-/// why [`color_description`](Self::color_description) can derive the encoder's
-/// declaration from it with nothing left to guess.
+/// Colour is two decisions: [`source`](Self::source) for what the input pixels
+/// are, [`target`](Self::target) for what the encoded stream should be.
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub struct ColorConverterConfig {
@@ -248,24 +222,18 @@ pub struct ColorConverterConfig {
     pub output_format: OutputFormat,
     /// What the input pixels already are.
     pub source: ColorSpec,
-    /// What the encoded stream should be. Also decides the YUV matrix.
+    /// What the encoded stream should be. Also picks the YUV matrix.
     ///
-    /// Must satisfy [`ColorSpec::is_encodable`]; [`ColorConverter::new`]
-    /// rejects the rest.
+    /// Must be a space video can be encoded in, see
+    /// [`ColorSpec::is_encodable`].
     pub target: ColorSpec,
-    /// Luminance that a source sample value of 1.0 represents, in nits,
-    /// overriding [`ColorSpec::reference_white_nits`].
-    ///
-    /// `None`, the default, takes the standard figure for the source space,
-    /// which is what almost every caller wants. Only read on the way to
-    /// [`ColorSpec::Bt2020Pq`], where the PQ encode needs an absolute
-    /// reference; ignored otherwise.
+    /// How bright the source's white is, in nits, overriding the source
+    /// space's default. Only used when encoding to HDR.
     pub reference_white_nits: Option<f32>,
-    /// Quantization range the shader writes.
+    /// Whether the shader writes full or limited range.
     ///
-    /// Pass [`color_description`](Self::color_description) to the encoder and
-    /// this reaches the stream's VUI as well, which it has to: full-range
-    /// samples tagged as limited get expanded a second time on playback.
+    /// The stream has to say the same thing, which is what
+    /// [`color_description`](Self::color_description) is for.
     pub range: ColorRange,
 }
 
@@ -292,34 +260,32 @@ impl ColorConverterConfig {
         }
     }
 
-    /// Override the luminance a source sample value of 1.0 represents.
+    /// Override how bright the source's white is, in nits.
     ///
-    /// Rarely needed: [`ColorSpec::reference_white_nits`] already gives the
-    /// standard figure for each space, and picking the wrong one is a visible
-    /// brightness error rather than a subtle one.
+    /// Rarely needed; each space already has a sensible default, see
+    /// [`ColorSpec::reference_white_nits`].
     pub fn with_reference_white_nits(mut self, nits: f32) -> Self {
         self.reference_white_nits = Some(nits);
         self
     }
 
-    /// The reference white this conversion will actually use.
+    /// The value the shader gets: the override, or the source's default.
     fn effective_reference_white_nits(&self) -> f32 {
         self.reference_white_nits
             .or_else(|| self.source.reference_white_nits())
             .unwrap_or(0.0)
     }
 
-    /// The description of what this conversion actually produces, for
+    /// What to tell the encoder about the colours this conversion produces,
+    /// for
     /// [`EncodeConfig::with_color_description`](crate::EncodeConfig::with_color_description).
     ///
-    /// Derived from [`target`](Self::target) and [`range`](Self::range), so the
-    /// encoder's VUI cannot end up describing a different signal from the one
-    /// the shader wrote.
+    /// Taken from [`target`](Self::target) and [`range`](Self::range), so the
+    /// stream cannot end up describing something the shader did not write.
     ///
-    /// `None` when the target is not a space a stream can be declared to be in,
-    /// which [`ColorConverter::new`] refuses to build anyway. Given a converter
-    /// that exists, [`ColorConverter::color_description`] answers the same
-    /// question without the `Option`.
+    /// `None` when the target is one [`ColorConverter::new`] would reject
+    /// anyway. [`ColorConverter::color_description`] gives the same answer
+    /// without the `Option`.
     ///
     /// ```no_run
     /// use pixelforge::{
@@ -356,13 +322,11 @@ impl ColorConverterConfig {
     /// implemented, and is rejected rather than silently passed through.
     fn conversion_supported(&self) -> bool {
         match self.target {
-            // Every source reaches PQ: decode what needs decoding, hop the
-            // gamut if it is not already BT.2020, encode PQ.
+            // Anything can be converted to HDR.
             ColorSpec::Bt2020Pq => true,
-            // Only something already SDR-encoded reaches an SDR target.
-            // Anything else would need a forward gamma encode or tone mapping.
+            // Converting to SDR would need tone mapping or a gamma curve.
             ColorSpec::Srgb => matches!(self.source, ColorSpec::Srgb),
-            // Not encodable at all; see `ColorSpec::is_encodable`.
+            // Cannot be encoded at all, see `ColorSpec::is_encodable`.
             ColorSpec::Bt709Linear | ColorSpec::Bt2020Linear => false,
         }
     }
@@ -370,10 +334,10 @@ impl ColorConverterConfig {
     /// Error explaining why [`Self::conversion_supported`] said no.
     fn unsupported_conversion(&self) -> PixelForgeError {
         let reason = if !self.target.is_encodable() {
-            "no decoder can be told a stream is in linear light, so that space is source-only"
+            "video cannot be encoded in a linear space, so it can only be a source"
         } else {
-            "reaching an SDR target from a linear or PQ source would need a forward gamma \
-             encode or tone mapping, and the conversion shader does neither"
+            "converting to SDR would need tone mapping or a gamma curve applied, \
+             which the shader does not do"
         };
         PixelForgeError::InvalidInput(format!(
             "no conversion from {:?} to {:?}: {reason}",
@@ -451,12 +415,11 @@ impl ColorConverter {
         &self.context
     }
 
-    /// What this converter's output should be declared as, for
+    /// What to tell the encoder about the colours this converter produces, for
     /// [`EncodeConfig::with_color_description`](crate::EncodeConfig::with_color_description).
     ///
-    /// The same as [`ColorConverterConfig::color_description`], minus the
-    /// `Option`: a converter only exists if its target is encodable, so the
-    /// answer is always there.
+    /// [`ColorConverterConfig::color_description`] without the `Option`: this
+    /// converter exists, so its target was already checked.
     pub fn color_description(&self) -> ColorDescription {
         self.config
             .color_description()
@@ -1286,8 +1249,7 @@ mod tests {
         assert!(ColorSpec::Srgb.is_encodable());
         assert!(ColorSpec::Bt2020Pq.is_encodable());
 
-        // There are no VUI code points for linear light, so these are
-        // source-only and say so.
+        // Linear light cannot be encoded, and these say so.
         for spec in [ColorSpec::Bt709Linear, ColorSpec::Bt2020Linear] {
             assert!(!spec.is_encodable(), "{spec:?}");
             assert_eq!(spec.color_description(), None, "{spec:?}");
@@ -1296,8 +1258,8 @@ mod tests {
 
     #[test]
     fn scrgb_white_is_not_the_srgb_reference() {
-        // IEC 61966-2-2 puts scRGB 1.0 at 80 cd/m²; BT.2408 puts SDR white at
-        // 203. Taking the 203 for scRGB is the mistake this pairing prevents.
+        // scRGB's white is 80 nits, not the 203 the other spaces use. Using
+        // 203 for it makes HDR output far too bright.
         assert_eq!(ColorSpec::Bt709Linear.reference_white_nits(), Some(80.0));
         assert_eq!(ColorSpec::Srgb.reference_white_nits(), Some(203.0));
         assert_eq!(ColorSpec::Bt2020Linear.reference_white_nits(), Some(203.0));
@@ -1305,7 +1267,7 @@ mod tests {
 
     #[test]
     fn pq_has_no_reference_white() {
-        // PQ is absolute, so there is no such quantity to ask about.
+        // Already carries real brightness values, so there is nothing to ask.
         assert_eq!(ColorSpec::Bt2020Pq.reference_white_nits(), None);
     }
 

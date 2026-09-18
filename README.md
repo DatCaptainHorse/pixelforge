@@ -187,41 +187,33 @@ CPU is the consumer's job; `examples/common` shows one way.
 
 PixelForge includes a GPU compute shader for converting RGB input to YUV
 output. The source color describes the input. The target color describes the stream.
-Both are a [`ColorSpec`]; which end one describes comes from the slot it is
-in, not from the value.
+Both are a [`ColorSpec`].
 
-| `ColorSpec` | Space | Usable as a target |
-|-------------|-------|--------------------|
-| `Srgb` | BT.709 primaries, sRGB transfer. Ordinary SDR content. | yes, declared as BT.709 |
-| `Bt709Linear` | Linear BT.709. This is scRGB, from an `EXTENDED_SRGB_LINEAR_EXT` swapchain. | no |
-| `Bt2020Linear` | Linear BT.2020. | no |
-| `Bt2020Pq` | BT.2020 primaries, PQ transfer. HDR10. | yes |
+| `ColorSpec` | | Can be a target |
+|-------------|-|-----------------|
+| `Srgb` | Ordinary SDR content | yes |
+| `Bt709Linear` | scRGB, from an `EXTENDED_SRGB_LINEAR_EXT` swapchain | no |
+| `Bt2020Linear` | Linear light, wide gamut | no |
+| `Bt2020Pq` | HDR10, from an `HDR10_ST2084_EXT` swapchain | yes |
 
-The two linear specs are source-only because H.273 has no code points for
-linear light, so a decoder cannot be told a stream is in one.
-[`ColorSpec::is_encodable`] is the question, and [`ColorConverter::new`]
-refuses the rest.
+The linear spaces cannot be a target, because a video file has no way to
+record that it holds linear light. Any source can be converted to
+`Bt2020Pq`. Only `Srgb` can be converted to `Srgb`; the others would need
+tone mapping or a gamma curve applied, which the shader does not do.
+[`ColorConverter::new`] rejects the combinations it cannot do.
 
-Each space knows the luminance a sample value of 1.0 represents, see
-[`ColorSpec::reference_white_nits`]: 203 nits for the SDR-referred spaces
-per ITU-R BT.2408, and 80 for scRGB per IEC 61966-2-2. It is read from the
-source only, and only on the way to `Bt2020Pq`, where the PQ encode needs an
-absolute reference. A conversion that needs a different figure overrides it
-with [`ColorConverterConfig::with_reference_white_nits`].
-
-Every source reaches `Bt2020Pq`. Only `Srgb` reaches an SDR target, because
-the others would need a forward gamma encode or tone mapping; those pairings
-are rejected rather than quietly passed through.
+Encoding to HDR needs to know how bright the source's white is, since HDR
+carries real brightness values and SDR does not. Each space has a sensible
+default, see [`ColorSpec::reference_white_nits`], overridable with
+[`ColorConverterConfig::with_reference_white_nits`].
 
 Supported input formats: BGRx, RGBx, BGRA, RGBA, ABGR2101010 (10-bit packed), RGBA16F (FP16).
 Supported output formats: NV12 (8-bit), I420 (8-bit), YUV444 (8-bit), P010 (10-bit), YUV444P10 (10-bit).
 
-Because the target and the range fully determine the stream's colour
-signalling, [`ColorConverter::color_description`] derives the encoder's VUI
-declaration from the conversion itself. Use it rather than declaring the
-same thing twice: full-range samples tagged as limited are expanded a second
-time on playback, and the API cannot catch that if the two are set
-independently.
+Pass [`ColorConverter::color_description`] to the encoder rather than
+describing the colours a second time by hand. The two have to agree: if the
+converter writes full-range pixels and the stream says limited, players
+stretch the range again and the picture comes out wrong.
 
 ```rust
 use pixelforge::{

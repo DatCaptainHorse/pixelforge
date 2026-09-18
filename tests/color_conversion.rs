@@ -1,26 +1,22 @@
-//! What the colour converter writes, checked against a model of itself.
+//! What the colour converter writes, checked against the same maths on the CPU.
 //!
-//! Two things are hard to see by looking at a picture and easy to see by
-//! computing the same thing twice. Both are checked here, off one synthetic
-//! frame and one readback path.
+//! Colour bugs here do not look like failures. They look like a normal picture
+//! that is slightly too dark, or the wrong shade. So rather than eyeball it,
+//! these tests compute what each conversion should produce and compare.
 //!
-//! **Quantization.** The shader turns floating-point YUV into integer code
-//! values. Truncating instead of rounding is not a visible failure, it is a
-//! uniform half-code darkening, so each sample is scored against two
-//! hypotheses: that the shader rounds, and that it truncates. A correct shader
-//! matches the rounding prediction and shows a mean signed error near zero.
+//! **Quantization.** The shader turns floating-point YUV into integer values.
+//! If it truncates instead of rounding, every pixel comes out up to one step
+//! too dark. Each sample is scored against both possibilities.
 //!
-//! **Conversion paths.** A [`ColorSpec`] pair selects which shader stages run:
-//! an sRGB decode, a BT.709 to BT.2020 gamut hop, a PQ encode, or none of them
-//! for a passthrough. Getting one wrong produces a plausible picture in the
-//! wrong colour, so the pipeline is reimplemented on the CPU stage for stage,
-//! with the stages selected from the source and target rather than from the
-//! shader's branches, and compared sample by sample.
+//! **Conversion paths.** Which [`ColorSpec`] pair you pick decides which steps
+//! the shader runs: an sRGB decode, a gamut conversion, a PQ encode, or none of
+//! them. The same steps are redone on the CPU, picked from the source and
+//! target rather than from the shader's branches, so a wrong branch shows up as
+//! a large disagreement.
 //!
-//! Luma only. It is one sample per pixel, whereas NV12 and P010 chroma is a 2x2
-//! average, which would fold averaging error into the measurement. The frame is
-//! deliberately not grey, because grey converts to exact code values under
-//! BT.709 and cannot tell any of these hypotheses apart.
+//! Luma only, since chroma is averaged over 2x2 blocks and that averaging would
+//! muddy the comparison. The test frame is deliberately not grey: grey converts
+//! to exact values and would hide the very errors being looked for.
 //!
 //! Ignored by default: requires a Vulkan Video device. Run with
 //! `cargo test -- --ignored`.
@@ -582,13 +578,11 @@ fn unsupported_conversions_are_refused() -> Result<(), Box<dyn std::error::Error
     let context = context()?;
 
     let refused = [
-        // An SDR target from something not already SDR-encoded: would need a
-        // forward gamma encode, or tone mapping from PQ.
+        // Converting to SDR: would need a gamma curve, or tone mapping.
         (ColorSpec::Bt709Linear, ColorSpec::Srgb),
         (ColorSpec::Bt2020Linear, ColorSpec::Srgb),
         (ColorSpec::Bt2020Pq, ColorSpec::Srgb),
-        // A target no decoder can be told about: linear light has no VUI code
-        // points, so those specs are source-only.
+        // Video cannot be encoded in a linear space.
         (ColorSpec::Srgb, ColorSpec::Bt709Linear),
         (ColorSpec::Srgb, ColorSpec::Bt2020Linear),
     ];
