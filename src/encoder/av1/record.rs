@@ -278,23 +278,25 @@ impl Av1 {
             av1_picture_info = av1_picture_info.constant_q_index(qp);
         }
 
-        let mut av1_rc_layer_info = vk::VideoEncodeAV1RateControlLayerInfoKHR::default();
-        if rc.is_disabled() {
-            let q_index = vk::VideoEncodeAV1QIndexKHR {
-                intra_q_index: qp,
-                predictive_q_index: qp,
-                bipredictive_q_index: qp,
-            };
-            av1_rc_layer_info = av1_rc_layer_info
-                .use_min_q_index(true)
-                .min_q_index(q_index)
-                .use_max_q_index(true)
-                .max_q_index(q_index);
-        } else {
-            av1_rc_layer_info = av1_rc_layer_info
-                .use_min_q_index(false)
-                .use_max_q_index(false);
-        }
+        // AV1 already did the right thing here -- bounds under CQP, none under a
+        // bitrate mode. This is the same behaviour expressed through the shared
+        // plan, so the three codecs answer the question in one place.
+        let (use_q_bounds, q_lo, q_hi) = rc.qp_bound_fields();
+        let min_q_index = vk::VideoEncodeAV1QIndexKHR {
+            intra_q_index: q_lo as u32,
+            predictive_q_index: q_lo as u32,
+            bipredictive_q_index: q_lo as u32,
+        };
+        let max_q_index = vk::VideoEncodeAV1QIndexKHR {
+            intra_q_index: q_hi as u32,
+            predictive_q_index: q_hi as u32,
+            bipredictive_q_index: q_hi as u32,
+        };
+        let mut av1_rc_layer_info = vk::VideoEncodeAV1RateControlLayerInfoKHR::default()
+            .use_min_q_index(use_q_bounds)
+            .min_q_index(min_q_index)
+            .use_max_q_index(use_q_bounds)
+            .max_q_index(max_q_index);
 
         let rc_layer_info = vk::VideoEncodeRateControlLayerInfoKHR::default()
             .average_bitrate(rc.average_bitrate as u64)
@@ -325,6 +327,11 @@ impl Av1 {
 
         let is_first_frame = plan.is_first_frame();
         let should_reset_coding_state = is_first_frame || (is_key_frame && !rc.is_disabled());
+        // A live retune needs the rate control state re-established too, but not
+        // a reset: resetting drops the DPB, which costs a keyframe. See
+        // `EncoderCommon::rate_control_dirty`.
+        let rate_control_dirty = common.rate_control_dirty;
+        let sets_rate_control = should_reset_coding_state || rate_control_dirty;
         // Clamp GOP values to at least 1; a value of 0 is undefined in
         // Vulkan and causes undefined behavior on some drivers (RADV).
         let gop_frames = common.config.gop_size.max(1);
@@ -340,7 +347,11 @@ impl Av1 {
         // Ash links pNext chains in place, so each command needs its own extension structs.
         let mut begin_rc_info = rc_info;
         let mut begin_av1_rc_info = av1_rc_info;
-        let begin_coding_info = if is_first_frame {
+        // A dirty frame carries values the session has not been told yet, so they
+        // stay out of begin-coding until the control command below establishes
+        // them. A keyframe reset re-sends what the session already holds, so it
+        // keeps chaining them as it always has.
+        let begin_coding_info = if is_first_frame || rate_control_dirty {
             vk::VideoBeginCodingInfoKHR::default()
                 .video_session(common.session)
                 .video_session_parameters(common.session_params)
@@ -361,23 +372,28 @@ impl Av1 {
                 .cmd_begin_video_coding(command_buffer, &begin_coding_info);
         }
 
-        if should_reset_coding_state {
+        if sets_rate_control {
             let mut quality_level_info =
                 vk::VideoEncodeQualityLevelInfoKHR::default().quality_level(0);
-            let control_info = vk::VideoCodingControlInfoKHR::default()
-                .flags(
+            let mut control_info = vk::VideoCodingControlInfoKHR::default()
+                .flags(if should_reset_coding_state {
                     vk::VideoCodingControlFlagsKHR::RESET
                         | vk::VideoCodingControlFlagsKHR::ENCODE_RATE_CONTROL
-                        | vk::VideoCodingControlFlagsKHR::ENCODE_QUALITY_LEVEL,
-                )
+                        | vk::VideoCodingControlFlagsKHR::ENCODE_QUALITY_LEVEL
+                } else {
+                    vk::VideoCodingControlFlagsKHR::ENCODE_RATE_CONTROL
+                })
                 .push(&mut rc_info)
-                .push(&mut av1_rc_info)
-                .push(&mut quality_level_info);
+                .push(&mut av1_rc_info);
+            if should_reset_coding_state {
+                control_info = control_info.push(&mut quality_level_info);
+            }
             unsafe {
                 common
                     .video_queue_fn
                     .cmd_control_video_coding(command_buffer, &control_info);
             }
+            common.rate_control_dirty = false;
         }
 
         let src_picture_resource = vk::VideoPictureResourceInfoKHR::default()

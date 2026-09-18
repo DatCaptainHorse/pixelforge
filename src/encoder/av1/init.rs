@@ -76,6 +76,10 @@ impl Av1 {
         }
         let caps = query_video_caps(&context, &profile_info, &mut capabilities)?;
         let rgb_caps = config.rgb_input.map(|_| RgbConversionCaps::from(&rgb_caps));
+        crate::encoder::codec::warn_unsupported_rate_control(
+            &config,
+            encode_caps.rate_control_modes,
+        );
 
         let init = build_encoder_common(&CommonInitRequest {
             context: &context,
