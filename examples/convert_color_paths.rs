@@ -1,7 +1,7 @@
 //! Example: Check every conversion path against a model of itself
 //!
-//! [`ColorConverterConfig`] takes two colour decisions: a [`SourceColor`] for
-//! what the input pixels already are, and a [`TargetColor`] for what the
+//! [`ColorConverterConfig`] takes two colour decisions: a [`ColorSpec`] for
+//! what the input pixels already are, and a [`ColorSpec`] for what the
 //! encoded stream should be. Between them they select which of the shader's
 //! stages run: an sRGB decode, a BT.709 to BT.2020 gamut hop, a PQ encode, or
 //! none of them for a passthrough.
@@ -13,8 +13,8 @@
 //! from the source and target rather than from the shader's branches, so a
 //! branch taken wrongly shows up as a large disagreement.
 //!
-//! It also asserts the refusals. Only [`SourceColor::Srgb`] can reach
-//! [`TargetColor::Bt709`]; a linear or PQ source would need a forward gamma
+//! It also asserts the refusals. Only [`ColorSpec::Srgb`] can reach
+//! [`ColorSpec::srgb()`]; a linear or PQ source would need a forward gamma
 //! encode or tone mapping, and the converter rejects those pairs rather than
 //! passing the samples through and mislabelling them.
 //!
@@ -27,8 +27,8 @@
 
 use ash::vk;
 use pixelforge::{
-    Codec, ColorConverter, ColorConverterConfig, ColorRange, EncodeBitDepth, EncodeConfig, Encoder,
-    InputFormat, OutputFormat, RateControlMode, SourceColor, TargetColor, VideoContext,
+    Codec, ColorConverter, ColorConverterConfig, ColorRange, ColorSpec, EncodeBitDepth,
+    EncodeConfig, Encoder, InputFormat, OutputFormat, RateControlMode, VideoContext,
     VideoContextBuilder,
 };
 
@@ -91,8 +91,8 @@ fn linear_to_pq(l: f32) -> f32 {
 /// luma, then its code value. Mirrors `read_rgb` and `rgb_to_yuv`.
 fn expected_code(
     rgb: [u8; 3],
-    source: SourceColor,
-    target: TargetColor,
+    source: ColorSpec,
+    target: ColorSpec,
     ten_bit: bool,
     full: bool,
 ) -> f32 {
@@ -101,15 +101,15 @@ fn expected_code(
         rgb[1] as f32 / 255.0,
         rgb[2] as f32 / 255.0,
     ];
-    if target == TargetColor::Bt2020Pq && source != SourceColor::Bt2020Pq {
-        if matches!(source, SourceColor::Srgb { .. }) {
+    if target == ColorSpec::Bt2020Pq && source != ColorSpec::Bt2020Pq {
+        if matches!(source, ColorSpec::Srgb { .. }) {
             v = [
                 srgb_to_linear(v[0]),
                 srgb_to_linear(v[1]),
                 srgb_to_linear(v[2]),
             ];
         }
-        if !matches!(source, SourceColor::Bt2020Linear { .. }) {
+        if !matches!(source, ColorSpec::Bt2020Linear { .. }) {
             v = bt709_to_bt2020(v);
         }
         let nits = source.reference_white_nits().unwrap();
@@ -119,7 +119,7 @@ fn expected_code(
             linear_to_pq(v[2] * (nits / 10000.0)),
         ];
     }
-    let y = if target == TargetColor::Bt2020Pq {
+    let y = if target == ColorSpec::Bt2020Pq {
         0.2627f32 * v[0] + 0.6780f32 * v[1] + 0.0593f32 * v[2]
     } else {
         0.2126f32 * v[0] + 0.7152f32 * v[1] + 0.0722f32 * v[2]
@@ -353,17 +353,22 @@ fn check(
     context: &VideoContext,
     src: &SrcImage,
     encoder: &Encoder,
-    source: SourceColor,
-    target: TargetColor,
+    source: ColorSpec,
+    target: ColorSpec,
     output_format: OutputFormat,
 ) -> Result<bool, Box<dyn std::error::Error>> {
     let ten_bit = output_format.bytes_per_sample() == 2;
-    let config = ColorConverterConfig::new(WIDTH, HEIGHT, InputFormat::BGRA, output_format)
-        .with_source(source)
-        .with_target(target)
-        .with_range(ColorRange::Full);
-    let description = config.color_description();
+    let config = ColorConverterConfig::new(
+        WIDTH,
+        HEIGHT,
+        InputFormat::BGRA,
+        output_format,
+        source,
+        target,
+        ColorRange::Full,
+    );
     let mut converter = ColorConverter::new(context.clone(), config)?;
+    let description = converter.color_description();
     converter.convert(
         src.image,
         vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
@@ -423,11 +428,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
 
     let supported = [
-        (SourceColor::srgb(), TargetColor::Bt709),
-        (SourceColor::srgb(), TargetColor::Bt2020Pq),
-        (SourceColor::scrgb(), TargetColor::Bt2020Pq),
-        (SourceColor::bt2020_linear(), TargetColor::Bt2020Pq),
-        (SourceColor::bt2020_pq(), TargetColor::Bt2020Pq),
+        (ColorSpec::srgb(), ColorSpec::srgb()),
+        (ColorSpec::srgb(), ColorSpec::Bt2020Pq),
+        (ColorSpec::scrgb(), ColorSpec::Bt2020Pq),
+        (ColorSpec::bt2020_linear(), ColorSpec::Bt2020Pq),
+        (ColorSpec::bt2020_pq(), ColorSpec::Bt2020Pq),
     ];
     let mut all_ok = true;
     for (source, target) in supported {
@@ -450,21 +455,39 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     println!("\n--- these must be refused ---");
-    for source in [
-        SourceColor::scrgb(),
-        SourceColor::bt2020_linear(),
-        SourceColor::bt2020_pq(),
-    ] {
-        let config =
-            ColorConverterConfig::new(WIDTH, HEIGHT, InputFormat::BGRA, OutputFormat::NV12)
-                .with_source(source)
-                .with_target(TargetColor::Bt709);
+    let refused = [
+        // An SDR target from something not already SDR-encoded: would need a
+        // forward gamma encode, or tone mapping from PQ.
+        (ColorSpec::scrgb(), ColorSpec::srgb()),
+        (ColorSpec::bt2020_linear(), ColorSpec::srgb()),
+        (ColorSpec::bt2020_pq(), ColorSpec::srgb()),
+        // A target no decoder can be told about: linear light has no VUI code
+        // points, so these specs are source-only.
+        (ColorSpec::srgb(), ColorSpec::scrgb()),
+        (ColorSpec::srgb(), ColorSpec::bt2020_linear()),
+    ];
+    for (source, target) in refused {
+        // The description has to be absent for exactly the unencodable ones.
+        let config = ColorConverterConfig::new(
+            WIDTH,
+            HEIGHT,
+            InputFormat::BGRA,
+            OutputFormat::NV12,
+            source,
+            target,
+            ColorRange::Full,
+        );
+        let described = config.color_description().is_some();
+        if described != target.is_encodable() {
+            println!("{target:?}: color_description() and is_encodable() disagree");
+            all_ok = false;
+        }
         match ColorConverter::new(context.clone(), config) {
             Ok(_) => {
-                println!("{source:?} -> Bt709: ACCEPTED, should not be");
+                println!("{source:?} -> {target:?}: ACCEPTED, should not be");
                 all_ok = false;
             }
-            Err(e) => println!("{source:?} -> Bt709: refused ({e})"),
+            Err(e) => println!("{source:?} -> {target:?}: refused ({e})"),
         }
     }
 

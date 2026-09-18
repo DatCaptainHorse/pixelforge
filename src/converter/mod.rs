@@ -14,19 +14,28 @@ use crate::vulkan::VideoContext;
 use ash::vk;
 use tracing::debug;
 
-/// What the source pixels already are.
+/// A colour space: its primaries, its transfer function, and, where that
+/// transfer function is relative rather than absolute, what luminance a sample
+/// value of 1.0 stands for.
 ///
-/// This describes the *input* to the conversion: its primaries, its transfer
-/// function, and, where the transfer function is relative rather than
-/// absolute, what luminance a sample value of 1.0 stands for. It says nothing
-/// about what the encoded stream will be; that is [`TargetColor`].
+/// One type describes both ends of a conversion. Which end a given value is
+/// describing comes from the slot it sits in,
+/// [`ColorConverterConfig::source`] or [`ColorConverterConfig::target`], not
+/// from the value itself, so nothing here needs renaming if conversion ever
+/// runs the other way.
+///
+/// Not every space can be a target. An encoded stream has to be something a
+/// decoder can be told about, and there are no VUI code points for linear
+/// light, so [`ColorSpec::Bt709Linear`] and [`ColorSpec::Bt2020Linear`] are
+/// source-only. [`ColorSpec::is_encodable`] is the check, and
+/// [`ColorConverter::new`] applies it.
 ///
 /// The reference white only matters on the way to an absolute transfer
-/// function, so it is carried by the relative sources and read only when the
-/// target is [`TargetColor::Bt2020Pq`]. [`SourceColor::Bt2020Pq`] has none:
-/// PQ is already absolute.
+/// function, so it is read only when the target is [`ColorSpec::Bt2020Pq`],
+/// and a spec used as a target ignores its own. [`ColorSpec::Bt2020Pq`] has
+/// none at all: PQ is already absolute.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub enum SourceColor {
+pub enum ColorSpec {
     /// BT.709 primaries, sRGB transfer function. Ordinary SDR desktop content.
     Srgb {
         /// Luminance that a sample value of 1.0 represents, in nits.
@@ -49,14 +58,7 @@ pub enum SourceColor {
     Bt2020Pq,
 }
 
-impl Default for SourceColor {
-    /// [`SourceColor::srgb`].
-    fn default() -> Self {
-        Self::srgb()
-    }
-}
-
-impl SourceColor {
+impl ColorSpec {
     /// sRGB content at the 203 nit reference white of ITU-R BT.2408.
     pub fn srgb() -> Self {
         Self::Srgb {
@@ -89,7 +91,7 @@ impl SourceColor {
 
     /// Override the luminance that a sample value of 1.0 represents.
     ///
-    /// No effect on [`SourceColor::Bt2020Pq`], which is already absolute.
+    /// No effect on [`ColorSpec::Bt2020Pq`], which is already absolute.
     pub fn with_reference_white_nits(self, nits: f32) -> Self {
         match self {
             Self::Srgb { .. } => Self::Srgb {
@@ -122,6 +124,34 @@ impl SourceColor {
         }
     }
 
+    /// Whether a stream can be declared to be in this space.
+    ///
+    /// H.273 has code points for primaries, transfer characteristics and
+    /// matrix coefficients; it has none for linear light. The two linear specs
+    /// are therefore source-only.
+    pub fn is_encodable(&self) -> bool {
+        matches!(self, Self::Srgb { .. } | Self::Bt2020Pq)
+    }
+
+    /// How a decoder should be told about a stream in this space, if it can be
+    /// told at all.
+    ///
+    /// `None` exactly when [`Self::is_encodable`] is false. The range is not
+    /// part of a colour space here, so this leaves it at the
+    /// [`ColorDescription`] default; [`ColorConverterConfig::color_description`]
+    /// is what fills it in.
+    pub fn color_description(&self) -> Option<ColorDescription> {
+        match self {
+            // The VUI says BT.709 transfer characteristics for SDR. sRGB's
+            // curve differs from BT.709's only in the toe, and every decoder
+            // and display treats the pair interchangeably; H.273's separate
+            // sRGB code point (13) is not what encoders emit here.
+            Self::Srgb { .. } => Some(ColorDescription::bt709()),
+            Self::Bt2020Pq => Some(ColorDescription::bt2020_pq()),
+            Self::Bt709Linear { .. } | Self::Bt2020Linear { .. } => None,
+        }
+    }
+
     /// Discriminant handed to the shader.
     fn shader_id(&self) -> u32 {
         match self {
@@ -133,26 +163,10 @@ impl SourceColor {
     }
 }
 
-/// What the encoded stream is.
-///
-/// Each variant fixes all three of the primaries, the transfer function and
-/// the YUV matrix, which is what lets [`ColorConverterConfig::color_description`]
-/// hand the encoder a complete and truthful declaration.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum TargetColor {
-    /// BT.709 primaries, BT.709 transfer function, BT.709 NCL matrix. SDR.
-    #[default]
-    Bt709,
-    /// BT.2020 primaries, PQ (ST 2084) transfer function, BT.2020 NCL matrix.
-    /// This is HDR10.
-    Bt2020Pq,
-}
-
 /// Luma and chroma quantization range.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ColorRange {
     /// Studio range: luma 16..235, chroma 16..240 at 8-bit.
-    #[default]
     Limited,
     /// Full range: 0..255 at 8-bit.
     Full,
@@ -183,14 +197,11 @@ pub enum InputFormat {
     /// RGBA16F (64-bit, 16-bit float per channel).
     /// Maps to DRM_FORMAT_ABGR16161616F / VK_FORMAT_R16G16B16A16_SFLOAT.
     ///
-    /// The converter treats FP16 data the same as other formats: passthrough
-    /// for `ColorSpace::Bt709` / `Bt2020`, sRGB→BT.2020+PQ conversion for
-    /// `ColorSpace::SrgbToBt2020Pq`, and scRGB-linear→BT.2020+PQ for
-    /// `ColorSpace::Bt709LinearToBt2020Pq` (the natural pairing for FP16 input
-    /// from an `EXTENDED_SRGB_LINEAR_EXT` swapchain). No linear→PQ transfer
-    /// function is applied automatically; if the source is PQ-encoded
-    /// (e.g. via the gamescope WSI layer), use `ColorSpace::Bt2020` for
-    /// passthrough.
+    /// The converter treats FP16 data the same as other formats: the
+    /// [`ColorSpec`] says what the samples mean, not the pixel format.
+    /// [`ColorSpec::scrgb`] is the natural pairing for FP16 from an
+    /// `EXTENDED_SRGB_LINEAR_EXT` swapchain; FP16 that is already PQ-encoded
+    /// (via the gamescope WSI layer, say) is [`ColorSpec::Bt2020Pq`].
     RGBA16F,
 }
 
@@ -282,9 +293,10 @@ impl OutputFormat {
 ///
 /// The colour side of this is deliberately two decisions rather than one:
 /// [`source`](Self::source) says what the input pixels are, and
-/// [`target`](Self::target) says what the encoded stream should be. Only the
-/// target is a property of the output, which is why
-/// [`color_description`](Self::color_description) can derive the encoder's
+/// [`target`](Self::target) says what the encoded stream should be. Both are a
+/// [`ColorSpec`], since they are the same kind of thing; only the slot says
+/// which end is which. Only the target is a property of the output, which is
+/// why [`color_description`](Self::color_description) can derive the encoder's
 /// declaration from it with nothing left to guess.
 #[derive(Clone, Debug)]
 #[non_exhaustive]
@@ -298,9 +310,12 @@ pub struct ColorConverterConfig {
     /// Output YUV format.
     pub output_format: OutputFormat,
     /// What the input pixels already are.
-    pub source: SourceColor,
+    pub source: ColorSpec,
     /// What the encoded stream should be. Also decides the YUV matrix.
-    pub target: TargetColor,
+    ///
+    /// Must satisfy [`ColorSpec::is_encodable`]; [`ColorConverter::new`]
+    /// rejects the rest.
+    pub target: ColorSpec,
     /// Quantization range the shader writes.
     ///
     /// Pass [`color_description`](Self::color_description) to the encoder and
@@ -310,32 +325,35 @@ pub struct ColorConverterConfig {
 }
 
 impl ColorConverterConfig {
-    /// Create a new configuration: sRGB in, SDR BT.709 out, limited range.
+    /// Create a new configuration.
     pub fn new(
         width: u32,
         height: u32,
         input_format: InputFormat,
         output_format: OutputFormat,
+        source_color: ColorSpec,
+        target_color: ColorSpec,
+        color_range: ColorRange,
     ) -> Self {
         Self {
             width,
             height,
             input_format,
             output_format,
-            source: SourceColor::default(),
-            target: TargetColor::default(),
-            range: ColorRange::default(),
+            source: source_color,
+            target: target_color,
+            range: color_range,
         }
     }
 
     /// Set what the input pixels already are.
-    pub fn with_source(mut self, source: SourceColor) -> Self {
+    pub fn with_source(mut self, source: ColorSpec) -> Self {
         self.source = source;
         self
     }
 
     /// Set what the encoded stream should be.
-    pub fn with_target(mut self, target: TargetColor) -> Self {
+    pub fn with_target(mut self, target: ColorSpec) -> Self {
         self.target = target;
         self
     }
@@ -351,28 +369,40 @@ impl ColorConverterConfig {
     ///
     /// Derived from [`target`](Self::target) and [`range`](Self::range), so the
     /// encoder's VUI cannot end up describing a different signal from the one
-    /// the shader wrote:
+    /// the shader wrote.
+    ///
+    /// `None` when the target is not a space a stream can be declared to be in,
+    /// which [`ColorConverter::new`] refuses to build anyway. Given a converter
+    /// that exists, [`ColorConverter::color_description`] answers the same
+    /// question without the `Option`.
     ///
     /// ```no_run
     /// use pixelforge::{
-    ///     ColorConverterConfig, ColorRange, EncodeConfig, InputFormat, OutputFormat,
-    ///     SourceColor, TargetColor,
+    ///     ColorConverterConfig, ColorRange, ColorSpec, EncodeConfig, InputFormat, OutputFormat,
     /// };
     ///
-    /// let conv = ColorConverterConfig::new(1920, 1080, InputFormat::BGRA, OutputFormat::P010)
-    ///     .with_source(SourceColor::scrgb())
-    ///     .with_target(TargetColor::Bt2020Pq)
-    ///     .with_range(ColorRange::Full);
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let conv = ColorConverterConfig::new(
+    ///     1920,
+    ///     1080,
+    ///     InputFormat::BGRA,
+    ///     OutputFormat::P010,
+    ///     ColorSpec::scrgb(),
+    ///     ColorSpec::Bt2020Pq,
+    ///     ColorRange::Full,
+    /// );
     ///
     /// let enc = EncodeConfig::h265(1920, 1080)
-    ///     .with_color_description(conv.color_description());
+    ///     .with_color_description(conv.color_description().expect("PQ is encodable"));
+    /// # Ok(())
+    /// # }
     /// ```
-    pub fn color_description(&self) -> ColorDescription {
-        let description = match self.target {
-            TargetColor::Bt709 => ColorDescription::bt709(),
-            TargetColor::Bt2020Pq => ColorDescription::bt2020_pq(),
-        };
-        description.with_full_range(self.range.is_full())
+    pub fn color_description(&self) -> Option<ColorDescription> {
+        Some(
+            self.target
+                .color_description()?
+                .with_full_range(self.range.is_full()),
+        )
     }
 
     /// Whether the shader can get from this source to this target.
@@ -380,34 +410,29 @@ impl ColorConverterConfig {
     /// Anything that would need tone mapping or a forward gamma encode is not
     /// implemented, and is rejected rather than silently passed through.
     fn conversion_supported(&self) -> bool {
-        match (self.source, self.target) {
-            // Already encoded for the target: write it through.
-            (SourceColor::Srgb { .. }, TargetColor::Bt709) => true,
-            (SourceColor::Bt2020Pq, TargetColor::Bt2020Pq) => true,
-            // Encode to PQ, with a gamut hop for the BT.709 sources.
-            (SourceColor::Srgb { .. }, TargetColor::Bt2020Pq) => true,
-            (SourceColor::Bt709Linear { .. }, TargetColor::Bt2020Pq) => true,
-            (SourceColor::Bt2020Linear { .. }, TargetColor::Bt2020Pq) => true,
-            // Would need an SDR gamma encode.
-            (SourceColor::Bt709Linear { .. }, TargetColor::Bt709) => false,
-            (SourceColor::Bt2020Linear { .. }, TargetColor::Bt709) => false,
-            // Would need tone mapping.
-            (SourceColor::Bt2020Pq, TargetColor::Bt709) => false,
+        match self.target {
+            // Every source reaches PQ: decode what needs decoding, hop the
+            // gamut if it is not already BT.2020, encode PQ.
+            ColorSpec::Bt2020Pq => true,
+            // Only something already SDR-encoded reaches an SDR target.
+            // Anything else would need a forward gamma encode or tone mapping.
+            ColorSpec::Srgb { .. } => matches!(self.source, ColorSpec::Srgb { .. }),
+            // Not encodable at all; see `ColorSpec::is_encodable`.
+            ColorSpec::Bt709Linear { .. } | ColorSpec::Bt2020Linear { .. } => false,
         }
     }
 
     /// Error explaining why [`Self::conversion_supported`] said no.
     fn unsupported_conversion(&self) -> PixelForgeError {
+        let reason = if !self.target.is_encodable() {
+            "no decoder can be told a stream is in linear light, so that space is source-only"
+        } else {
+            "reaching an SDR target from a linear or PQ source would need a forward gamma \
+             encode or tone mapping, and the conversion shader does neither"
+        };
         PixelForgeError::InvalidInput(format!(
-            "no conversion from {:?} to {:?}: {}",
-            self.source,
-            self.target,
-            match self.target {
-                TargetColor::Bt709 =>
-                    "encoding SDR from a linear or PQ source would need \
-                     a gamma encode or tone mapping, neither of which the shader does",
-                TargetColor::Bt2020Pq => "unreachable",
-            }
+            "no conversion from {:?} to {:?}: {reason}",
+            self.source, self.target
         ))
     }
 }
@@ -481,6 +506,18 @@ impl ColorConverter {
         &self.context
     }
 
+    /// What this converter's output should be declared as, for
+    /// [`EncodeConfig::with_color_description`](crate::EncodeConfig::with_color_description).
+    ///
+    /// The same as [`ColorConverterConfig::color_description`], minus the
+    /// `Option`: a converter only exists if its target is encodable, so the
+    /// answer is always there.
+    pub fn color_description(&self) -> ColorDescription {
+        self.config
+            .color_description()
+            .expect("a converter cannot be built with a target that has no description")
+    }
+
     /// Get the converter configuration.
     pub fn config(&self) -> &ColorConverterConfig {
         &self.config
@@ -501,7 +538,7 @@ impl ColorConverter {
     ///
     /// Returns an error, and leaves the converter untouched, if the new source
     /// cannot reach the configured target.
-    pub fn set_source(&mut self, source: SourceColor) -> Result<()> {
+    pub fn set_source(&mut self, source: ColorSpec) -> Result<()> {
         let candidate = ColorConverterConfig {
             source,
             ..self.config.clone()
@@ -519,11 +556,15 @@ impl ColorConverter {
     /// since the target is passed via push constants.
     ///
     /// Returns an error, and leaves the converter untouched, if the configured
-    /// source cannot reach the new target. Callers that pass
-    /// [`ColorConverterConfig::color_description`] to the encoder need to
-    /// re-declare it after this: the target is half of what that derives from,
-    /// and an encoder's session parameters were fixed when it was built.
-    pub fn set_target(&mut self, target: TargetColor) -> Result<()> {
+    /// source cannot reach the new target.
+    ///
+    /// The target is half of what [`ColorConverterConfig::color_description`]
+    /// derives from, so an encoder told about the old one is now describing the
+    /// wrong signal. Pass the new description to
+    /// [`Encoder::set_color_description`](crate::Encoder::set_color_description),
+    /// which rebuilds the session parameters and makes the next frame an IDR
+    /// carrying the updated header.
+    pub fn set_target(&mut self, target: ColorSpec) -> Result<()> {
         let candidate = ColorConverterConfig {
             target,
             ..self.config.clone()
@@ -538,8 +579,9 @@ impl ColorConverter {
     /// Change the quantization range for subsequent conversions.
     ///
     /// Takes effect on the next `convert()` without recreating the pipeline,
-    /// since the range is passed via push constants. The same re-declaration
-    /// caveat as [`Self::set_target`] applies.
+    /// since the range is passed via push constants. The range is the other
+    /// half of [`ColorConverterConfig::color_description`], so the same
+    /// re-declaration as [`Self::set_target`] applies.
     pub fn set_range(&mut self, range: ColorRange) {
         self.config.range = range;
     }
@@ -1002,7 +1044,7 @@ impl ColorConverter {
                 self.config.input_format as u32,
                 self.config.output_format as u32,
                 self.config.source.shader_id(),
-                self.config.target as u32,
+                self.config.target.shader_id(),
                 self.config.range.is_full() as u32,
                 self.config
                     .source
@@ -1270,35 +1312,55 @@ mod tests {
     }
 
     // ========================
-    // SourceColor / TargetColor / ColorRange tests.
+    // ColorSpec / ColorSpec / ColorRange tests.
     // ========================
 
     #[test]
-    fn source_discriminants_match_the_shader() {
-        // The shader's SOURCE_* defines.
-        assert_eq!(SourceColor::srgb().shader_id(), 0);
-        assert_eq!(SourceColor::scrgb().shader_id(), 1);
-        assert_eq!(SourceColor::bt2020_linear().shader_id(), 2);
-        assert_eq!(SourceColor::bt2020_pq().shader_id(), 3);
+    fn spec_discriminants_match_the_shader() {
+        // The shader's SPEC_* defines. One set, used for both push constants.
+        assert_eq!(ColorSpec::srgb().shader_id(), 0);
+        assert_eq!(ColorSpec::scrgb().shader_id(), 1);
+        assert_eq!(ColorSpec::bt2020_linear().shader_id(), 2);
+        assert_eq!(ColorSpec::bt2020_pq().shader_id(), 3);
     }
 
     #[test]
-    fn target_and_range_discriminants_match_the_shader() {
-        // The shader's TARGET_* defines, and its `range == 0u` test.
-        assert_eq!(TargetColor::Bt709 as u32, 0);
-        assert_eq!(TargetColor::Bt2020Pq as u32, 1);
+    fn range_matches_the_shader() {
+        // The shader's `range == 0u` test.
         assert!(!ColorRange::Limited.is_full());
         assert!(ColorRange::Full.is_full());
+    }
+
+    #[test]
+    fn only_encodable_specs_describe_a_stream() {
+        // A decoder can be told about these two.
+        assert_eq!(
+            ColorSpec::srgb().color_description(),
+            Some(ColorDescription::bt709())
+        );
+        assert_eq!(
+            ColorSpec::bt2020_pq().color_description(),
+            Some(ColorDescription::bt2020_pq())
+        );
+        assert!(ColorSpec::srgb().is_encodable());
+        assert!(ColorSpec::bt2020_pq().is_encodable());
+
+        // There are no VUI code points for linear light, so these are
+        // source-only and say so.
+        for spec in [ColorSpec::scrgb(), ColorSpec::bt2020_linear()] {
+            assert!(!spec.is_encodable(), "{spec:?}");
+            assert_eq!(spec.color_description(), None, "{spec:?}");
+        }
     }
 
     #[test]
     fn scrgb_white_is_not_the_srgb_reference() {
         // IEC 61966-2-2 puts scRGB 1.0 at 80 cd/m²; BT.2408 puts SDR white at
         // 203. Taking the 203 for scRGB is the mistake this pairing prevents.
-        assert_eq!(SourceColor::scrgb().reference_white_nits(), Some(80.0));
-        assert_eq!(SourceColor::srgb().reference_white_nits(), Some(203.0));
+        assert_eq!(ColorSpec::scrgb().reference_white_nits(), Some(80.0));
+        assert_eq!(ColorSpec::srgb().reference_white_nits(), Some(203.0));
         assert_eq!(
-            SourceColor::bt2020_linear().reference_white_nits(),
+            ColorSpec::bt2020_linear().reference_white_nits(),
             Some(203.0)
         );
     }
@@ -1307,16 +1369,16 @@ mod tests {
     fn pq_source_has_no_reference_white_to_set() {
         // PQ is absolute, so there is no such quantity, and overriding it is
         // a no-op rather than a silently stored value.
-        assert_eq!(SourceColor::bt2020_pq().reference_white_nits(), None);
-        let overridden = SourceColor::bt2020_pq().with_reference_white_nits(500.0);
-        assert_eq!(overridden, SourceColor::Bt2020Pq);
+        assert_eq!(ColorSpec::bt2020_pq().reference_white_nits(), None);
+        let overridden = ColorSpec::bt2020_pq().with_reference_white_nits(500.0);
+        assert_eq!(overridden, ColorSpec::Bt2020Pq);
         assert_eq!(overridden.reference_white_nits(), None);
     }
 
     #[test]
     fn reference_white_override_keeps_the_source_kind() {
-        let source = SourceColor::scrgb().with_reference_white_nits(203.0);
-        assert_eq!(source.shader_id(), SourceColor::scrgb().shader_id());
+        let source = ColorSpec::scrgb().with_reference_white_nits(203.0);
+        assert_eq!(source.shader_id(), ColorSpec::scrgb().shader_id());
         assert_eq!(source.reference_white_nits(), Some(203.0));
     }
 
@@ -1324,19 +1386,29 @@ mod tests {
     // color_description() tests.
     // ========================
 
-    fn config_for(target: TargetColor, range: ColorRange) -> ColorConverterConfig {
-        ColorConverterConfig::new(64, 64, InputFormat::BGRA, OutputFormat::NV12)
-            .with_target(target)
-            .with_range(range)
+    fn config_for(target: ColorSpec, range: ColorRange) -> ColorConverterConfig {
+        ColorConverterConfig::new(
+            64,
+            64,
+            InputFormat::BGRA,
+            OutputFormat::NV12,
+            ColorSpec::srgb(),
+            target,
+            range,
+        )
     }
 
     #[test]
     fn description_follows_the_target() {
-        let sdr = config_for(TargetColor::Bt709, ColorRange::Limited).color_description();
+        let sdr = config_for(ColorSpec::srgb(), ColorRange::Limited)
+            .color_description()
+            .expect("sRGB is encodable");
         assert_eq!(sdr, ColorDescription::bt709());
         assert!(!sdr.is_hdr());
 
-        let hdr = config_for(TargetColor::Bt2020Pq, ColorRange::Limited).color_description();
+        let hdr = config_for(ColorSpec::Bt2020Pq, ColorRange::Limited)
+            .color_description()
+            .expect("PQ is encodable");
         assert_eq!(hdr, ColorDescription::bt2020_pq());
         assert!(hdr.is_hdr());
     }
@@ -1345,11 +1417,14 @@ mod tests {
     fn description_follows_the_range() {
         // The drift this whole split exists to prevent: what the shader
         // quantizes to and what the VUI claims are now one decision.
-        for target in [TargetColor::Bt709, TargetColor::Bt2020Pq] {
+        for target in [ColorSpec::srgb(), ColorSpec::Bt2020Pq] {
             for range in [ColorRange::Limited, ColorRange::Full] {
                 let config = config_for(target, range);
                 assert_eq!(
-                    config.color_description().full_range,
+                    config
+                        .color_description()
+                        .expect("both targets are encodable")
+                        .full_range,
                     config.range.is_full(),
                     "{target:?} / {range:?}"
                 );
@@ -1361,12 +1436,18 @@ mod tests {
     fn description_ignores_the_source() {
         // The source says nothing about the encoded stream, so it must not
         // reach the declaration.
-        let base = ColorConverterConfig::new(64, 64, InputFormat::BGRA, OutputFormat::P010)
-            .with_target(TargetColor::Bt2020Pq)
-            .with_range(ColorRange::Full);
-        let from_srgb = base.clone().with_source(SourceColor::srgb());
-        let from_scrgb = base.clone().with_source(SourceColor::scrgb());
-        let from_pq = base.with_source(SourceColor::bt2020_pq());
+        let base = ColorConverterConfig::new(
+            64,
+            64,
+            InputFormat::BGRA,
+            OutputFormat::P010,
+            ColorSpec::srgb(),
+            ColorSpec::Bt2020Pq,
+            ColorRange::Full,
+        );
+        let from_srgb = base.clone().with_source(ColorSpec::srgb());
+        let from_scrgb = base.clone().with_source(ColorSpec::scrgb());
+        let from_pq = base.with_source(ColorSpec::bt2020_pq());
         assert_eq!(
             from_srgb.color_description(),
             from_scrgb.color_description()
@@ -1381,12 +1462,12 @@ mod tests {
     #[test]
     fn every_source_can_reach_pq() {
         for source in [
-            SourceColor::srgb(),
-            SourceColor::scrgb(),
-            SourceColor::bt2020_linear(),
-            SourceColor::bt2020_pq(),
+            ColorSpec::srgb(),
+            ColorSpec::scrgb(),
+            ColorSpec::bt2020_linear(),
+            ColorSpec::bt2020_pq(),
         ] {
-            let config = config_for(TargetColor::Bt2020Pq, ColorRange::Full).with_source(source);
+            let config = config_for(ColorSpec::Bt2020Pq, ColorRange::Full).with_source(source);
             assert!(config.conversion_supported(), "{source:?}");
         }
     }
@@ -1395,16 +1476,15 @@ mod tests {
     fn only_srgb_can_reach_sdr() {
         // Everything else would need a forward gamma encode or tone mapping,
         // and the shader does neither. Rejected beats silently passed through.
-        let ok =
-            config_for(TargetColor::Bt709, ColorRange::Limited).with_source(SourceColor::srgb());
+        let ok = config_for(ColorSpec::srgb(), ColorRange::Limited).with_source(ColorSpec::srgb());
         assert!(ok.conversion_supported());
 
         for source in [
-            SourceColor::scrgb(),
-            SourceColor::bt2020_linear(),
-            SourceColor::bt2020_pq(),
+            ColorSpec::scrgb(),
+            ColorSpec::bt2020_linear(),
+            ColorSpec::bt2020_pq(),
         ] {
-            let config = config_for(TargetColor::Bt709, ColorRange::Limited).with_source(source);
+            let config = config_for(ColorSpec::srgb(), ColorRange::Limited).with_source(source);
             assert!(!config.conversion_supported(), "{source:?}");
         }
     }
@@ -1489,22 +1569,36 @@ mod tests {
 
     #[test]
     fn test_config_clone() {
-        let config = ColorConverterConfig::new(1920, 1080, InputFormat::BGRx, OutputFormat::NV12)
-            .with_range(ColorRange::Full);
+        let config = ColorConverterConfig::new(
+            1920,
+            1080,
+            InputFormat::BGRx,
+            OutputFormat::NV12,
+            ColorSpec::srgb(),
+            ColorSpec::srgb(),
+            ColorRange::Full,
+        );
 
         let cloned = config.clone();
         assert_eq!(cloned.width, 1920);
         assert_eq!(cloned.height, 1080);
         assert_eq!(cloned.input_format, InputFormat::BGRx);
         assert_eq!(cloned.output_format, OutputFormat::NV12);
-        assert_eq!(cloned.target, TargetColor::Bt709);
+        assert_eq!(cloned.target, ColorSpec::srgb());
         assert!(cloned.range.is_full());
     }
 
     #[test]
     fn test_config_debug() {
-        let config = ColorConverterConfig::new(640, 480, InputFormat::RGBA, OutputFormat::I420)
-            .with_range(ColorRange::Full);
+        let config = ColorConverterConfig::new(
+            640,
+            480,
+            InputFormat::RGBA,
+            OutputFormat::I420,
+            ColorSpec::srgb(),
+            ColorSpec::srgb(),
+            ColorRange::Full,
+        );
 
         let debug_str = format!("{:?}", config);
         assert!(debug_str.contains("640"));
@@ -1538,8 +1632,15 @@ mod tests {
             return;
         };
 
-        let config = ColorConverterConfig::new(64, 64, InputFormat::BGRx, OutputFormat::NV12)
-            .with_range(ColorRange::Full);
+        let config = ColorConverterConfig::new(
+            64,
+            64,
+            InputFormat::BGRx,
+            OutputFormat::NV12,
+            ColorSpec::srgb(),
+            ColorSpec::srgb(),
+            ColorRange::Full,
+        );
 
         let result = ColorConverter::new(context, config);
         assert!(
@@ -1566,8 +1667,15 @@ mod tests {
 
         for input_format in &input_formats {
             for output_format in &output_formats {
-                let config = ColorConverterConfig::new(32, 32, *input_format, *output_format)
-                    .with_range(ColorRange::Full);
+                let config = ColorConverterConfig::new(
+                    32,
+                    32,
+                    *input_format,
+                    *output_format,
+                    ColorSpec::srgb(),
+                    ColorSpec::srgb(),
+                    ColorRange::Full,
+                );
 
                 let result = ColorConverter::new(context.clone(), config);
                 assert!(
