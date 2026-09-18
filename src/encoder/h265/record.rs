@@ -404,6 +404,7 @@ impl H265 {
         }
 
         // Rate control.
+        let gop_length = crate::encoder::codec::advisory_gop_length(common.config.gop_size);
         let (use_qp_bounds, qp_min, qp_max) = rc.qp_bound_fields();
         let min_qp = vk::VideoEncodeH265QpKHR {
             qp_i: qp_min,
@@ -431,8 +432,8 @@ impl H265 {
         let rc_layers = [rc_layer_info];
 
         let mut h265_rc_info = vk::VideoEncodeH265RateControlInfoKHR::default()
-            .gop_frame_count(common.config.gop_size)
-            .idr_period(common.config.gop_size)
+            .gop_frame_count(gop_length)
+            .idr_period(gop_length)
             .consecutive_b_frame_count(common.config.b_frame_count);
         let mut rc_info = vk::VideoEncodeRateControlInfoKHR::default().rate_control_mode(rc.mode);
         if !rc.is_disabled() {
