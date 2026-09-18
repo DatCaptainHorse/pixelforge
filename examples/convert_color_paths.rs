@@ -14,7 +14,7 @@
 //! branch taken wrongly shows up as a large disagreement.
 //!
 //! It also asserts the refusals. Only [`ColorSpec::Srgb`] can reach
-//! [`ColorSpec::srgb()`]; a linear or PQ source would need a forward gamma
+//! [`ColorSpec::Srgb`]; a linear or PQ source would need a forward gamma
 //! encode or tone mapping, and the converter rejects those pairs rather than
 //! passing the samples through and mislabelling them.
 //!
@@ -102,14 +102,14 @@ fn expected_code(
         rgb[2] as f32 / 255.0,
     ];
     if target == ColorSpec::Bt2020Pq && source != ColorSpec::Bt2020Pq {
-        if matches!(source, ColorSpec::Srgb { .. }) {
+        if matches!(source, ColorSpec::Srgb) {
             v = [
                 srgb_to_linear(v[0]),
                 srgb_to_linear(v[1]),
                 srgb_to_linear(v[2]),
             ];
         }
-        if !matches!(source, ColorSpec::Bt2020Linear { .. }) {
+        if !matches!(source, ColorSpec::Bt2020Linear) {
             v = bt709_to_bt2020(v);
         }
         let nits = source.reference_white_nits().unwrap();
@@ -428,11 +428,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
 
     let supported = [
-        (ColorSpec::srgb(), ColorSpec::srgb()),
-        (ColorSpec::srgb(), ColorSpec::Bt2020Pq),
-        (ColorSpec::scrgb(), ColorSpec::Bt2020Pq),
-        (ColorSpec::bt2020_linear(), ColorSpec::Bt2020Pq),
-        (ColorSpec::bt2020_pq(), ColorSpec::Bt2020Pq),
+        (ColorSpec::Srgb, ColorSpec::Srgb),
+        (ColorSpec::Srgb, ColorSpec::Bt2020Pq),
+        (ColorSpec::Bt709Linear, ColorSpec::Bt2020Pq),
+        (ColorSpec::Bt2020Linear, ColorSpec::Bt2020Pq),
+        (ColorSpec::Bt2020Pq, ColorSpec::Bt2020Pq),
     ];
     let mut all_ok = true;
     for (source, target) in supported {
@@ -458,13 +458,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let refused = [
         // An SDR target from something not already SDR-encoded: would need a
         // forward gamma encode, or tone mapping from PQ.
-        (ColorSpec::scrgb(), ColorSpec::srgb()),
-        (ColorSpec::bt2020_linear(), ColorSpec::srgb()),
-        (ColorSpec::bt2020_pq(), ColorSpec::srgb()),
+        (ColorSpec::Bt709Linear, ColorSpec::Srgb),
+        (ColorSpec::Bt2020Linear, ColorSpec::Srgb),
+        (ColorSpec::Bt2020Pq, ColorSpec::Srgb),
         // A target no decoder can be told about: linear light has no VUI code
         // points, so these specs are source-only.
-        (ColorSpec::srgb(), ColorSpec::scrgb()),
-        (ColorSpec::srgb(), ColorSpec::bt2020_linear()),
+        (ColorSpec::Srgb, ColorSpec::Bt709Linear),
+        (ColorSpec::Srgb, ColorSpec::Bt2020Linear),
     ];
     for (source, target) in refused {
         // The description has to be absent for exactly the unencodable ones.

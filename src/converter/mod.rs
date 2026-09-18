@@ -30,96 +30,43 @@ use tracing::debug;
 /// source-only. [`ColorSpec::is_encodable`] is the check, and
 /// [`ColorConverter::new`] applies it.
 ///
-/// The reference white only matters on the way to an absolute transfer
-/// function, so it is read only when the target is [`ColorSpec::Bt2020Pq`],
-/// and a spec used as a target ignores its own. [`ColorSpec::Bt2020Pq`] has
-/// none at all: PQ is already absolute.
-#[derive(Debug, Clone, Copy, PartialEq)]
+/// Each space knows the luminance its sample value of 1.0 represents, see
+/// [`ColorSpec::reference_white_nits`]. That only matters on the way to an
+/// absolute transfer function, so it is read only when the target is
+/// [`ColorSpec::Bt2020Pq`], and only from the source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u32)]
 pub enum ColorSpec {
     /// BT.709 primaries, sRGB transfer function. Ordinary SDR desktop content.
-    Srgb {
-        /// Luminance that a sample value of 1.0 represents, in nits.
-        reference_white_nits: f32,
-    },
+    Srgb = 0,
     /// BT.709 primaries, linear light. This is scRGB, what a
     /// `VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT` swapchain produces.
-    Bt709Linear {
-        /// Luminance that a sample value of 1.0 represents, in nits.
-        reference_white_nits: f32,
-    },
+    Bt709Linear = 1,
     /// BT.2020 primaries, linear light.
-    Bt2020Linear {
-        /// Luminance that a sample value of 1.0 represents, in nits.
-        reference_white_nits: f32,
-    },
+    Bt2020Linear = 2,
     /// BT.2020 primaries, PQ (ST 2084) transfer function. Already HDR-encoded,
     /// as a `VK_COLOR_SPACE_HDR10_ST2084_EXT` surface or a gamescope PQ
     /// surface is.
-    Bt2020Pq,
+    Bt2020Pq = 3,
 }
 
 impl ColorSpec {
-    /// sRGB content at the 203 nit reference white of ITU-R BT.2408.
-    pub fn srgb() -> Self {
-        Self::Srgb {
-            reference_white_nits: 203.0,
-        }
-    }
-
-    /// scRGB: linear BT.709 where 1.0 is 80 cd/m², per IEC 61966-2-2.
+    /// The luminance a sample value of 1.0 represents in this space, in nits,
+    /// where that is a meaningful question to ask.
     ///
-    /// This is the pairing for an `EXTENDED_SRGB_LINEAR_EXT` swapchain, and
-    /// the 80 is why: taking the 203 that SDR content wants would map scRGB
-    /// white about two and a half times too bright.
-    pub fn scrgb() -> Self {
-        Self::Bt709Linear {
-            reference_white_nits: 80.0,
-        }
-    }
-
-    /// Linear BT.2020 at the 203 nit reference white of ITU-R BT.2408.
-    pub fn bt2020_linear() -> Self {
-        Self::Bt2020Linear {
-            reference_white_nits: 203.0,
-        }
-    }
-
-    /// Already PQ-encoded BT.2020.
-    pub fn bt2020_pq() -> Self {
-        Self::Bt2020Pq
-    }
-
-    /// Override the luminance that a sample value of 1.0 represents.
+    /// This is the standard figure for the space, not a setting: 203 nits for
+    /// the SDR-referred spaces per ITU-R BT.2408, and 80 for scRGB per IEC
+    /// 61966-2-2. The 80 is why `Bt709Linear` is worth having as its own
+    /// variant: reading an `EXTENDED_SRGB_LINEAR_EXT` swapchain at the 203 that
+    /// SDR content wants maps its white about two and a half times too bright.
     ///
-    /// No effect on [`ColorSpec::Bt2020Pq`], which is already absolute.
-    pub fn with_reference_white_nits(self, nits: f32) -> Self {
-        match self {
-            Self::Srgb { .. } => Self::Srgb {
-                reference_white_nits: nits,
-            },
-            Self::Bt709Linear { .. } => Self::Bt709Linear {
-                reference_white_nits: nits,
-            },
-            Self::Bt2020Linear { .. } => Self::Bt2020Linear {
-                reference_white_nits: nits,
-            },
-            Self::Bt2020Pq => Self::Bt2020Pq,
-        }
-    }
-
-    /// The luminance a sample value of 1.0 represents, where that is a
-    /// meaningful question to ask.
+    /// `None` for [`ColorSpec::Bt2020Pq`], PQ being absolute already.
+    /// [`ColorConverterConfig::with_reference_white_nits`] overrides it for a
+    /// conversion that needs a different figure.
     pub fn reference_white_nits(&self) -> Option<f32> {
-        match *self {
-            Self::Srgb {
-                reference_white_nits,
-            }
-            | Self::Bt709Linear {
-                reference_white_nits,
-            }
-            | Self::Bt2020Linear {
-                reference_white_nits,
-            } => Some(reference_white_nits),
+        match self {
+            Self::Srgb | Self::Bt2020Linear => Some(203.0),
+            Self::Bt709Linear => Some(80.0),
             Self::Bt2020Pq => None,
         }
     }
@@ -130,7 +77,7 @@ impl ColorSpec {
     /// matrix coefficients; it has none for linear light. The two linear specs
     /// are therefore source-only.
     pub fn is_encodable(&self) -> bool {
-        matches!(self, Self::Srgb { .. } | Self::Bt2020Pq)
+        matches!(self, Self::Srgb | Self::Bt2020Pq)
     }
 
     /// How a decoder should be told about a stream in this space, if it can be
@@ -146,19 +93,9 @@ impl ColorSpec {
             // curve differs from BT.709's only in the toe, and every decoder
             // and display treats the pair interchangeably; H.273's separate
             // sRGB code point (13) is not what encoders emit here.
-            Self::Srgb { .. } => Some(ColorDescription::bt709()),
+            Self::Srgb => Some(ColorDescription::bt709()),
             Self::Bt2020Pq => Some(ColorDescription::bt2020_pq()),
-            Self::Bt709Linear { .. } | Self::Bt2020Linear { .. } => None,
-        }
-    }
-
-    /// Discriminant handed to the shader.
-    fn shader_id(&self) -> u32 {
-        match self {
-            Self::Srgb { .. } => 0,
-            Self::Bt709Linear { .. } => 1,
-            Self::Bt2020Linear { .. } => 2,
-            Self::Bt2020Pq => 3,
+            Self::Bt709Linear | Self::Bt2020Linear => None,
         }
     }
 }
@@ -199,7 +136,7 @@ pub enum InputFormat {
     ///
     /// The converter treats FP16 data the same as other formats: the
     /// [`ColorSpec`] says what the samples mean, not the pixel format.
-    /// [`ColorSpec::scrgb`] is the natural pairing for FP16 from an
+    /// [`ColorSpec::Bt709Linear`] is the natural pairing for FP16 from an
     /// `EXTENDED_SRGB_LINEAR_EXT` swapchain; FP16 that is already PQ-encoded
     /// (via the gamescope WSI layer, say) is [`ColorSpec::Bt2020Pq`].
     RGBA16F,
@@ -316,6 +253,14 @@ pub struct ColorConverterConfig {
     /// Must satisfy [`ColorSpec::is_encodable`]; [`ColorConverter::new`]
     /// rejects the rest.
     pub target: ColorSpec,
+    /// Luminance that a source sample value of 1.0 represents, in nits,
+    /// overriding [`ColorSpec::reference_white_nits`].
+    ///
+    /// `None`, the default, takes the standard figure for the source space,
+    /// which is what almost every caller wants. Only read on the way to
+    /// [`ColorSpec::Bt2020Pq`], where the PQ encode needs an absolute
+    /// reference; ignored otherwise.
+    pub reference_white_nits: Option<f32>,
     /// Quantization range the shader writes.
     ///
     /// Pass [`color_description`](Self::color_description) to the encoder and
@@ -343,6 +288,7 @@ impl ColorConverterConfig {
             source: source_color,
             target: target_color,
             range: color_range,
+            reference_white_nits: None,
         }
     }
 
@@ -356,6 +302,23 @@ impl ColorConverterConfig {
     pub fn with_target(mut self, target: ColorSpec) -> Self {
         self.target = target;
         self
+    }
+
+    /// Override the luminance a source sample value of 1.0 represents.
+    ///
+    /// Rarely needed: [`ColorSpec::reference_white_nits`] already gives the
+    /// standard figure for each space, and picking the wrong one is a visible
+    /// brightness error rather than a subtle one.
+    pub fn with_reference_white_nits(mut self, nits: f32) -> Self {
+        self.reference_white_nits = Some(nits);
+        self
+    }
+
+    /// The reference white this conversion will actually use.
+    fn effective_reference_white_nits(&self) -> f32 {
+        self.reference_white_nits
+            .or_else(|| self.source.reference_white_nits())
+            .unwrap_or(0.0)
     }
 
     /// Set the quantization range.
@@ -387,7 +350,7 @@ impl ColorConverterConfig {
     ///     1080,
     ///     InputFormat::BGRA,
     ///     OutputFormat::P010,
-    ///     ColorSpec::scrgb(),
+    ///     ColorSpec::Bt709Linear,
     ///     ColorSpec::Bt2020Pq,
     ///     ColorRange::Full,
     /// );
@@ -416,9 +379,9 @@ impl ColorConverterConfig {
             ColorSpec::Bt2020Pq => true,
             // Only something already SDR-encoded reaches an SDR target.
             // Anything else would need a forward gamma encode or tone mapping.
-            ColorSpec::Srgb { .. } => matches!(self.source, ColorSpec::Srgb { .. }),
+            ColorSpec::Srgb => matches!(self.source, ColorSpec::Srgb),
             // Not encodable at all; see `ColorSpec::is_encodable`.
-            ColorSpec::Bt709Linear { .. } | ColorSpec::Bt2020Linear { .. } => false,
+            ColorSpec::Bt709Linear | ColorSpec::Bt2020Linear => false,
         }
     }
 
@@ -1043,14 +1006,10 @@ impl ColorConverter {
                 self.config.height,
                 self.config.input_format as u32,
                 self.config.output_format as u32,
-                self.config.source.shader_id(),
-                self.config.target.shader_id(),
+                self.config.source as u32,
+                self.config.target as u32,
                 self.config.range.is_full() as u32,
-                self.config
-                    .source
-                    .reference_white_nits()
-                    .unwrap_or(0.0)
-                    .to_bits(),
+                self.config.effective_reference_white_nits().to_bits(),
             ];
             let push_constants_bytes: &[u8] = std::slice::from_raw_parts(
                 push_constants.as_ptr() as *const u8,
@@ -1318,10 +1277,10 @@ mod tests {
     #[test]
     fn spec_discriminants_match_the_shader() {
         // The shader's SPEC_* defines. One set, used for both push constants.
-        assert_eq!(ColorSpec::srgb().shader_id(), 0);
-        assert_eq!(ColorSpec::scrgb().shader_id(), 1);
-        assert_eq!(ColorSpec::bt2020_linear().shader_id(), 2);
-        assert_eq!(ColorSpec::bt2020_pq().shader_id(), 3);
+        assert_eq!(ColorSpec::Srgb as u32, 0);
+        assert_eq!(ColorSpec::Bt709Linear as u32, 1);
+        assert_eq!(ColorSpec::Bt2020Linear as u32, 2);
+        assert_eq!(ColorSpec::Bt2020Pq as u32, 3);
     }
 
     #[test]
@@ -1335,19 +1294,19 @@ mod tests {
     fn only_encodable_specs_describe_a_stream() {
         // A decoder can be told about these two.
         assert_eq!(
-            ColorSpec::srgb().color_description(),
+            ColorSpec::Srgb.color_description(),
             Some(ColorDescription::bt709())
         );
         assert_eq!(
-            ColorSpec::bt2020_pq().color_description(),
+            ColorSpec::Bt2020Pq.color_description(),
             Some(ColorDescription::bt2020_pq())
         );
-        assert!(ColorSpec::srgb().is_encodable());
-        assert!(ColorSpec::bt2020_pq().is_encodable());
+        assert!(ColorSpec::Srgb.is_encodable());
+        assert!(ColorSpec::Bt2020Pq.is_encodable());
 
         // There are no VUI code points for linear light, so these are
         // source-only and say so.
-        for spec in [ColorSpec::scrgb(), ColorSpec::bt2020_linear()] {
+        for spec in [ColorSpec::Bt709Linear, ColorSpec::Bt2020Linear] {
             assert!(!spec.is_encodable(), "{spec:?}");
             assert_eq!(spec.color_description(), None, "{spec:?}");
         }
@@ -1357,29 +1316,53 @@ mod tests {
     fn scrgb_white_is_not_the_srgb_reference() {
         // IEC 61966-2-2 puts scRGB 1.0 at 80 cd/m²; BT.2408 puts SDR white at
         // 203. Taking the 203 for scRGB is the mistake this pairing prevents.
-        assert_eq!(ColorSpec::scrgb().reference_white_nits(), Some(80.0));
-        assert_eq!(ColorSpec::srgb().reference_white_nits(), Some(203.0));
-        assert_eq!(
-            ColorSpec::bt2020_linear().reference_white_nits(),
-            Some(203.0)
+        assert_eq!(ColorSpec::Bt709Linear.reference_white_nits(), Some(80.0));
+        assert_eq!(ColorSpec::Srgb.reference_white_nits(), Some(203.0));
+        assert_eq!(ColorSpec::Bt2020Linear.reference_white_nits(), Some(203.0));
+    }
+
+    #[test]
+    fn pq_has_no_reference_white() {
+        // PQ is absolute, so there is no such quantity to ask about.
+        assert_eq!(ColorSpec::Bt2020Pq.reference_white_nits(), None);
+    }
+
+    #[test]
+    fn the_override_replaces_the_standard_figure() {
+        let base = ColorConverterConfig::new(
+            64,
+            64,
+            InputFormat::BGRA,
+            OutputFormat::P010,
+            ColorSpec::Bt709Linear,
+            ColorSpec::Bt2020Pq,
+            ColorRange::Full,
         );
+        // Unset, the source's own figure is what the shader gets.
+        assert_eq!(base.reference_white_nits, None);
+        assert_eq!(base.effective_reference_white_nits(), 80.0);
+
+        let overridden = base.clone().with_reference_white_nits(203.0);
+        assert_eq!(overridden.effective_reference_white_nits(), 203.0);
+        // The space itself is untouched; the override lives on the conversion.
+        assert_eq!(overridden.source, ColorSpec::Bt709Linear);
+        assert_eq!(overridden.source.reference_white_nits(), Some(80.0));
     }
 
     #[test]
-    fn pq_source_has_no_reference_white_to_set() {
-        // PQ is absolute, so there is no such quantity, and overriding it is
-        // a no-op rather than a silently stored value.
-        assert_eq!(ColorSpec::bt2020_pq().reference_white_nits(), None);
-        let overridden = ColorSpec::bt2020_pq().with_reference_white_nits(500.0);
-        assert_eq!(overridden, ColorSpec::Bt2020Pq);
-        assert_eq!(overridden.reference_white_nits(), None);
-    }
-
-    #[test]
-    fn reference_white_override_keeps_the_source_kind() {
-        let source = ColorSpec::scrgb().with_reference_white_nits(203.0);
-        assert_eq!(source.shader_id(), ColorSpec::scrgb().shader_id());
-        assert_eq!(source.reference_white_nits(), Some(203.0));
+    fn a_pq_source_needs_no_reference_white() {
+        // Nothing reads it, so an absent figure has to be harmless rather than
+        // a panic or a NaN reaching the shader.
+        let config = ColorConverterConfig::new(
+            64,
+            64,
+            InputFormat::BGRA,
+            OutputFormat::P010,
+            ColorSpec::Bt2020Pq,
+            ColorSpec::Bt2020Pq,
+            ColorRange::Full,
+        );
+        assert_eq!(config.effective_reference_white_nits(), 0.0);
     }
 
     // ========================
@@ -1392,7 +1375,7 @@ mod tests {
             64,
             InputFormat::BGRA,
             OutputFormat::NV12,
-            ColorSpec::srgb(),
+            ColorSpec::Srgb,
             target,
             range,
         )
@@ -1400,7 +1383,7 @@ mod tests {
 
     #[test]
     fn description_follows_the_target() {
-        let sdr = config_for(ColorSpec::srgb(), ColorRange::Limited)
+        let sdr = config_for(ColorSpec::Srgb, ColorRange::Limited)
             .color_description()
             .expect("sRGB is encodable");
         assert_eq!(sdr, ColorDescription::bt709());
@@ -1417,7 +1400,7 @@ mod tests {
     fn description_follows_the_range() {
         // The drift this whole split exists to prevent: what the shader
         // quantizes to and what the VUI claims are now one decision.
-        for target in [ColorSpec::srgb(), ColorSpec::Bt2020Pq] {
+        for target in [ColorSpec::Srgb, ColorSpec::Bt2020Pq] {
             for range in [ColorRange::Limited, ColorRange::Full] {
                 let config = config_for(target, range);
                 assert_eq!(
@@ -1441,13 +1424,13 @@ mod tests {
             64,
             InputFormat::BGRA,
             OutputFormat::P010,
-            ColorSpec::srgb(),
+            ColorSpec::Srgb,
             ColorSpec::Bt2020Pq,
             ColorRange::Full,
         );
-        let from_srgb = base.clone().with_source(ColorSpec::srgb());
-        let from_scrgb = base.clone().with_source(ColorSpec::scrgb());
-        let from_pq = base.with_source(ColorSpec::bt2020_pq());
+        let from_srgb = base.clone().with_source(ColorSpec::Srgb);
+        let from_scrgb = base.clone().with_source(ColorSpec::Bt709Linear);
+        let from_pq = base.with_source(ColorSpec::Bt2020Pq);
         assert_eq!(
             from_srgb.color_description(),
             from_scrgb.color_description()
@@ -1462,10 +1445,10 @@ mod tests {
     #[test]
     fn every_source_can_reach_pq() {
         for source in [
-            ColorSpec::srgb(),
-            ColorSpec::scrgb(),
-            ColorSpec::bt2020_linear(),
-            ColorSpec::bt2020_pq(),
+            ColorSpec::Srgb,
+            ColorSpec::Bt709Linear,
+            ColorSpec::Bt2020Linear,
+            ColorSpec::Bt2020Pq,
         ] {
             let config = config_for(ColorSpec::Bt2020Pq, ColorRange::Full).with_source(source);
             assert!(config.conversion_supported(), "{source:?}");
@@ -1476,15 +1459,15 @@ mod tests {
     fn only_srgb_can_reach_sdr() {
         // Everything else would need a forward gamma encode or tone mapping,
         // and the shader does neither. Rejected beats silently passed through.
-        let ok = config_for(ColorSpec::srgb(), ColorRange::Limited).with_source(ColorSpec::srgb());
+        let ok = config_for(ColorSpec::Srgb, ColorRange::Limited).with_source(ColorSpec::Srgb);
         assert!(ok.conversion_supported());
 
         for source in [
-            ColorSpec::scrgb(),
-            ColorSpec::bt2020_linear(),
-            ColorSpec::bt2020_pq(),
+            ColorSpec::Bt709Linear,
+            ColorSpec::Bt2020Linear,
+            ColorSpec::Bt2020Pq,
         ] {
-            let config = config_for(ColorSpec::srgb(), ColorRange::Limited).with_source(source);
+            let config = config_for(ColorSpec::Srgb, ColorRange::Limited).with_source(source);
             assert!(!config.conversion_supported(), "{source:?}");
         }
     }
@@ -1574,8 +1557,8 @@ mod tests {
             1080,
             InputFormat::BGRx,
             OutputFormat::NV12,
-            ColorSpec::srgb(),
-            ColorSpec::srgb(),
+            ColorSpec::Srgb,
+            ColorSpec::Srgb,
             ColorRange::Full,
         );
 
@@ -1584,7 +1567,7 @@ mod tests {
         assert_eq!(cloned.height, 1080);
         assert_eq!(cloned.input_format, InputFormat::BGRx);
         assert_eq!(cloned.output_format, OutputFormat::NV12);
-        assert_eq!(cloned.target, ColorSpec::srgb());
+        assert_eq!(cloned.target, ColorSpec::Srgb);
         assert!(cloned.range.is_full());
     }
 
@@ -1595,8 +1578,8 @@ mod tests {
             480,
             InputFormat::RGBA,
             OutputFormat::I420,
-            ColorSpec::srgb(),
-            ColorSpec::srgb(),
+            ColorSpec::Srgb,
+            ColorSpec::Srgb,
             ColorRange::Full,
         );
 
@@ -1637,8 +1620,8 @@ mod tests {
             64,
             InputFormat::BGRx,
             OutputFormat::NV12,
-            ColorSpec::srgb(),
-            ColorSpec::srgb(),
+            ColorSpec::Srgb,
+            ColorSpec::Srgb,
             ColorRange::Full,
         );
 
@@ -1672,8 +1655,8 @@ mod tests {
                     32,
                     *input_format,
                     *output_format,
-                    ColorSpec::srgb(),
-                    ColorSpec::srgb(),
+                    ColorSpec::Srgb,
+                    ColorSpec::Srgb,
                     ColorRange::Full,
                 );
 

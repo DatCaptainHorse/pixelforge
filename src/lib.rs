@@ -196,10 +196,12 @@
 //! [`ColorSpec::is_encodable`] is the question, and [`ColorConverter::new`]
 //! refuses the rest.
 //!
-//! The relative specs carry the luminance that a sample value of 1.0 stands
-//! for: 203 nits for `Srgb` per ITU-R BT.2408, and 80 for scRGB per IEC
-//! 61966-2-2. It is read only on the way to `Bt2020Pq`, where the PQ encode
-//! needs it to be absolute, and a spec used as a target ignores its own.
+//! Each space knows the luminance a sample value of 1.0 represents, see
+//! [`ColorSpec::reference_white_nits`]: 203 nits for the SDR-referred spaces
+//! per ITU-R BT.2408, and 80 for scRGB per IEC 61966-2-2. It is read from the
+//! source only, and only on the way to `Bt2020Pq`, where the PQ encode needs an
+//! absolute reference. A conversion that needs a different figure overrides it
+//! with [`ColorConverterConfig::with_reference_white_nits`].
 //!
 //! Every source reaches `Bt2020Pq`. Only `Srgb` reaches an SDR target, because
 //! the others would need a forward gamma encode or tone mapping; those pairings
@@ -233,7 +235,7 @@
 //!     1080,
 //!     InputFormat::BGRx,
 //!     OutputFormat::P010,
-//!     ColorSpec::srgb(),
+//!     ColorSpec::Srgb,
 //!     ColorSpec::Bt2020Pq,
 //!     ColorRange::Full,
 //! );
