@@ -1,35 +1,38 @@
-//! Example: Check every conversion path against a model of itself
+//! What the colour converter writes, checked against a model of itself.
 //!
-//! [`ColorConverterConfig`] takes two colour decisions: a [`ColorSpec`] for
-//! what the input pixels already are, and a [`ColorSpec`] for what the
-//! encoded stream should be. Between them they select which of the shader's
-//! stages run: an sRGB decode, a BT.709 to BT.2020 gamut hop, a PQ encode, or
-//! none of them for a passthrough.
+//! Two things are hard to see by looking at a picture and easy to see by
+//! computing the same thing twice. Both are checked here, off one synthetic
+//! frame and one readback path.
 //!
-//! Getting one of those stages wrong does not fail loudly. It produces a
-//! plausible picture with the wrong colour, which is why this reimplements the
-//! same pipeline on the CPU, stage for stage, and compares. Every supported
-//! pair is checked at 8-bit and 10-bit, in both cases against a model built
-//! from the source and target rather than from the shader's branches, so a
-//! branch taken wrongly shows up as a large disagreement.
+//! **Quantization.** The shader turns floating-point YUV into integer code
+//! values. Truncating instead of rounding is not a visible failure, it is a
+//! uniform half-code darkening, so each sample is scored against two
+//! hypotheses: that the shader rounds, and that it truncates. A correct shader
+//! matches the rounding prediction and shows a mean signed error near zero.
 //!
-//! It also asserts the refusals. Only [`ColorSpec::Srgb`] can reach
-//! [`ColorSpec::Srgb`]; a linear or PQ source would need a forward gamma
-//! encode or tone mapping, and the converter rejects those pairs rather than
-//! passing the samples through and mislabelling them.
+//! **Conversion paths.** A [`ColorSpec`] pair selects which shader stages run:
+//! an sRGB decode, a BT.709 to BT.2020 gamut hop, a PQ encode, or none of them
+//! for a passthrough. Getting one wrong produces a plausible picture in the
+//! wrong colour, so the pipeline is reimplemented on the CPU stage for stage,
+//! with the stages selected from the source and target rather than from the
+//! shader's branches, and compared sample by sample.
 //!
-//! Luma only, for the same reason as `convert_quantization`: chroma is a 2x2
-//! average in NV12 and P010, which would mix averaging error into the result.
+//! Luma only. It is one sample per pixel, whereas NV12 and P010 chroma is a 2x2
+//! average, which would fold averaging error into the measurement. The frame is
+//! deliberately not grey, because grey converts to exact code values under
+//! BT.709 and cannot tell any of these hypotheses apart.
 //!
-//! ```text
-//! cargo run --example convert_color_paths
-//! ```
+//! Ignored by default: requires a Vulkan Video device. Run with
+//! `cargo test -- --ignored`.
+
+#[allow(dead_code)]
+mod common;
 
 use ash::vk;
 use pixelforge::{
-    Codec, ColorConverter, ColorConverterConfig, ColorRange, ColorSpec, EncodeBitDepth,
-    EncodeConfig, Encoder, InputFormat, OutputFormat, RateControlMode, VideoContext,
-    VideoContextBuilder,
+    Codec, ColorConverter, ColorConverterConfig, ColorDescription, ColorRange, ColorSpec,
+    EncodeBitDepth, EncodeConfig, Encoder, InputFormat, OutputFormat, RateControlMode,
+    VideoContext, VideoContextBuilder,
 };
 
 const WIDTH: u32 = 256;
@@ -133,9 +136,22 @@ fn expected_code(
     }
 }
 
+/// The synthetic frame, on the GPU, cleaned up when the test drops it.
 struct SrcImage {
+    /// Keeps the device alive until after the image is destroyed.
+    context: VideoContext,
     image: vk::Image,
     memory: vk::DeviceMemory,
+}
+
+impl Drop for SrcImage {
+    fn drop(&mut self) {
+        let device = self.context.device();
+        unsafe {
+            device.destroy_image(self.image, None);
+            device.free_memory(self.memory, None);
+        }
+    }
 }
 
 unsafe fn one_shot<F: FnOnce(vk::CommandBuffer)>(
@@ -309,7 +325,11 @@ unsafe fn create_src_image(context: &VideoContext) -> Result<SrcImage, Box<dyn s
         device.destroy_buffer(staging, None);
         device.free_memory(staging_mem, None);
     }
-    Ok(SrcImage { image, memory })
+    Ok(SrcImage {
+        context: context.clone(),
+        image,
+        memory,
+    })
 }
 
 /// Read the converter's luma plane back as code values.
@@ -349,15 +369,53 @@ fn read_luma(
     })
 }
 
-fn check(
+/// One 8-bit and one 10-bit encoder, for the conversion's target image.
+///
+/// 10-bit needs a Main10 encoder, which not every device exposes, so a missing
+/// one skips the 10-bit half rather than failing the test.
+fn encoders(
+    context: &VideoContext,
+) -> Result<(Encoder, Option<Encoder>), Box<dyn std::error::Error>> {
+    let eight = Encoder::new(
+        context.clone(),
+        EncodeConfig::h264(WIDTH, HEIGHT)
+            .with_rate_control(RateControlMode::Cqp)
+            .with_frame_rate(30, 1)
+            .with_b_frames(0),
+    )?;
+    let ten = Encoder::new(
+        context.clone(),
+        EncodeConfig::h265(WIDTH, HEIGHT)
+            .with_bit_depth(EncodeBitDepth::Ten)
+            .with_rate_control(RateControlMode::Cqp)
+            .with_frame_rate(30, 1)
+            .with_b_frames(0),
+    )
+    .ok();
+    if ten.is_none() {
+        println!("no 10-bit H.265 encoder on this device: P010 cases skipped");
+    }
+    Ok((eight, ten))
+}
+
+fn context() -> Result<VideoContext, Box<dyn std::error::Error>> {
+    Ok(VideoContextBuilder::new()
+        .app_name("pixelforge-color-conversion")
+        .require_encode(Codec::H264)
+        .enable_validation(std::env::var("PIXELFORGE_VALIDATION").is_ok())
+        .build()?)
+}
+
+/// Convert one frame and read its luma plane back as code values.
+fn convert(
     context: &VideoContext,
     src: &SrcImage,
     encoder: &Encoder,
     source: ColorSpec,
     target: ColorSpec,
     output_format: OutputFormat,
-) -> Result<bool, Box<dyn std::error::Error>> {
-    let ten_bit = output_format.bytes_per_sample() == 2;
+    range: ColorRange,
+) -> Result<(Vec<u32>, ColorDescription), Box<dyn std::error::Error>> {
     let config = ColorConverterConfig::new(
         WIDTH,
         HEIGHT,
@@ -365,7 +423,7 @@ fn check(
         output_format,
         source,
         target,
-        ColorRange::Full,
+        range,
     );
     let mut converter = ColorConverter::new(context.clone(), config)?;
     let description = converter.color_description();
@@ -374,58 +432,85 @@ fn check(
         vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
         encoder.input_image(),
     )?;
-    let codes = read_luma(context, &converter, output_format)?;
-
-    let mut worst = 0f64;
-    let mut sum = 0f64;
-    for y in 0..HEIGHT {
-        for x in 0..WIDTH {
-            let got = codes[(y * WIDTH + x) as usize] as f64;
-            let want = expected_code(colour_at(x, y), source, target, ten_bit, true).round() as f64;
-            let d = (got - want).abs();
-            worst = worst.max(d);
-            sum += d;
-        }
-    }
-    let mean = sum / (WIDTH * HEIGHT) as f64;
-    // One code value of slack: the GPU is free to order and fuse these f32
-    // operations differently, which moves samples that land on a tie.
-    let ok = worst <= 1.0;
-    println!(
-        "{:<34} -> {:<10} {:<6} worst {worst:>5.1}, mean {mean:.4}  VUI {}/{}/{} {}  {}",
-        format!("{source:?}"),
-        format!("{target:?}"),
-        if ten_bit { "P010" } else { "NV12" },
-        description.color_primaries,
-        description.transfer_characteristics,
-        description.matrix_coefficients,
-        if description.full_range { "pc" } else { "tv" },
-        if ok { "ok" } else { "MISMATCH" }
-    );
-    Ok(ok)
+    Ok((read_luma(context, &converter, output_format)?, description))
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let context = VideoContextBuilder::new()
-        .app_name("path probe")
-        .require_encode(Codec::H264)
-        .build()?;
+#[test]
+#[ignore = "requires a Vulkan Video device"]
+fn quantizers_round_rather_than_truncate() -> Result<(), Box<dyn std::error::Error>> {
+    let context = context()?;
     let src = unsafe { create_src_image(&context)? };
-    let encoder_8 = Encoder::new(
-        context.clone(),
-        EncodeConfig::h264(WIDTH, HEIGHT)
-            .with_rate_control(RateControlMode::Cqp)
-            .with_frame_rate(30, 1)
-            .with_b_frames(0),
-    )?;
-    let encoder_10 = Encoder::new(
-        context.clone(),
-        EncodeConfig::h265(WIDTH, HEIGHT)
-            .with_bit_depth(EncodeBitDepth::Ten)
-            .with_rate_control(RateControlMode::Cqp)
-            .with_frame_rate(30, 1)
-            .with_b_frames(0),
-    )?;
+    let (eight, ten) = encoders(&context)?;
+
+    for (output_format, encoder) in [
+        (OutputFormat::NV12, Some(&eight)),
+        (OutputFormat::P010, ten.as_ref()),
+    ] {
+        let Some(encoder) = encoder else { continue };
+        let ten_bit = output_format.bytes_per_sample() == 2;
+        for range in [ColorRange::Limited, ColorRange::Full] {
+            let full = range.is_full();
+            let (codes, _) = convert(
+                &context,
+                &src,
+                encoder,
+                ColorSpec::Srgb,
+                ColorSpec::Srgb,
+                output_format,
+                range,
+            )?;
+
+            let mut if_truncating = 0usize;
+            let mut if_rounding = 0usize;
+            let mut signed_error = 0f64;
+            for y in 0..HEIGHT {
+                for x in 0..WIDTH {
+                    let got = codes[(y * WIDTH + x) as usize];
+                    let ideal = expected_code(
+                        colour_at(x, y),
+                        ColorSpec::Srgb,
+                        ColorSpec::Srgb,
+                        ten_bit,
+                        full,
+                    );
+                    if got != ideal as u32 {
+                        if_truncating += 1;
+                    }
+                    if got != ideal.round() as u32 {
+                        if_rounding += 1;
+                    }
+                    signed_error += got as f64 - ideal as f64;
+                }
+            }
+            let samples = (WIDTH * HEIGHT) as f64;
+            let bias = signed_error / samples;
+            println!(
+                "{output_format:?} {range:?}: {if_truncating} mismatches if truncating, \
+                 {if_rounding} if rounding, mean signed error {bias:+.4}"
+            );
+
+            // Truncation biases every sample low by about half a code value,
+            // which is what this is really watching for. The tie tolerance is
+            // for the GPU ordering its f32 arithmetic differently from us.
+            assert!(
+                if_rounding < if_truncating,
+                "{output_format:?} {range:?}: looks like it truncates"
+            );
+            assert!(
+                bias.abs() < 0.05,
+                "{output_format:?} {range:?}: mean signed error {bias:+.4} is a bias, not noise"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires a Vulkan Video device"]
+fn every_conversion_matches_the_model() -> Result<(), Box<dyn std::error::Error>> {
+    let context = context()?;
+    let src = unsafe { create_src_image(&context)? };
+    let (eight, ten) = encoders(&context)?;
 
     let supported = [
         (ColorSpec::Srgb, ColorSpec::Srgb),
@@ -434,27 +519,68 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         (ColorSpec::Bt2020Linear, ColorSpec::Bt2020Pq),
         (ColorSpec::Bt2020Pq, ColorSpec::Bt2020Pq),
     ];
-    let mut all_ok = true;
-    for (source, target) in supported {
-        all_ok &= check(
-            &context,
-            &src,
-            &encoder_8,
-            source,
-            target,
-            OutputFormat::NV12,
-        )?;
-        all_ok &= check(
-            &context,
-            &src,
-            &encoder_10,
-            source,
-            target,
-            OutputFormat::P010,
-        )?;
-    }
 
-    println!("\n--- these must be refused ---");
+    for (source, target) in supported {
+        for (output_format, encoder) in [
+            (OutputFormat::NV12, Some(&eight)),
+            (OutputFormat::P010, ten.as_ref()),
+        ] {
+            let Some(encoder) = encoder else { continue };
+            let ten_bit = output_format.bytes_per_sample() == 2;
+            let (codes, description) = convert(
+                &context,
+                &src,
+                encoder,
+                source,
+                target,
+                output_format,
+                ColorRange::Full,
+            )?;
+
+            let mut worst = 0f64;
+            let mut sum = 0f64;
+            for y in 0..HEIGHT {
+                for x in 0..WIDTH {
+                    let got = codes[(y * WIDTH + x) as usize] as f64;
+                    let want = expected_code(colour_at(x, y), source, target, ten_bit, true).round()
+                        as f64;
+                    let d = (got - want).abs();
+                    worst = worst.max(d);
+                    sum += d;
+                }
+            }
+            let mean = sum / (WIDTH * HEIGHT) as f64;
+            println!(
+                "{source:?} -> {target:?} {output_format:?}: worst {worst:.1}, mean {mean:.4}, \
+                 VUI {}/{}/{} {}",
+                description.color_primaries,
+                description.transfer_characteristics,
+                description.matrix_coefficients,
+                if description.full_range { "pc" } else { "tv" },
+            );
+
+            // The declaration has to describe the target, not the source.
+            assert_eq!(
+                Some(description.with_full_range(false)),
+                target.color_description(),
+                "{source:?} -> {target:?}: declared the wrong space"
+            );
+            // One code value of slack: the GPU is free to order and fuse these
+            // f32 operations differently, which moves samples landing on a tie.
+            assert!(
+                worst <= 1.0,
+                "{source:?} -> {target:?} {output_format:?}: worst {worst:.1} code values off"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires a Vulkan Video device"]
+fn unsupported_conversions_are_refused() -> Result<(), Box<dyn std::error::Error>> {
+    let context = context()?;
+
     let refused = [
         // An SDR target from something not already SDR-encoded: would need a
         // forward gamma encode, or tone mapping from PQ.
@@ -462,12 +588,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         (ColorSpec::Bt2020Linear, ColorSpec::Srgb),
         (ColorSpec::Bt2020Pq, ColorSpec::Srgb),
         // A target no decoder can be told about: linear light has no VUI code
-        // points, so these specs are source-only.
+        // points, so those specs are source-only.
         (ColorSpec::Srgb, ColorSpec::Bt709Linear),
         (ColorSpec::Srgb, ColorSpec::Bt2020Linear),
     ];
+
     for (source, target) in refused {
-        // The description has to be absent for exactly the unencodable ones.
         let config = ColorConverterConfig::new(
             WIDTH,
             HEIGHT,
@@ -477,28 +603,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             target,
             ColorRange::Full,
         );
-        let described = config.color_description().is_some();
-        if described != target.is_encodable() {
-            println!("{target:?}: color_description() and is_encodable() disagree");
-            all_ok = false;
-        }
-        match ColorConverter::new(context.clone(), config) {
-            Ok(_) => {
-                println!("{source:?} -> {target:?}: ACCEPTED, should not be");
-                all_ok = false;
-            }
-            Err(e) => println!("{source:?} -> {target:?}: refused ({e})"),
-        }
+        assert_eq!(
+            config.color_description().is_some(),
+            target.is_encodable(),
+            "{target:?}: color_description() and is_encodable() disagree"
+        );
+        let error = ColorConverter::new(context.clone(), config)
+            .err()
+            .unwrap_or_else(|| panic!("{source:?} -> {target:?} was accepted"));
+        println!("{source:?} -> {target:?}: {error}");
     }
-
-    unsafe {
-        let device = context.device();
-        device.destroy_image(src.image, None);
-        device.free_memory(src.memory, None);
-    }
-    if all_ok {
-        Ok(())
-    } else {
-        Err("at least one path disagrees with the model".into())
-    }
+    Ok(())
 }
