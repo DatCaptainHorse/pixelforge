@@ -603,6 +603,7 @@ trait EncoderApi: Send {
     fn request_idr(&mut self);
     fn invalidate_reference_frames(&mut self, first_lost_display_order: u64);
     fn set_target_bitrate(&mut self, bits_per_second: u32) -> Result<()>;
+    fn set_gop_size(&mut self, gop_size: Option<u32>);
     fn set_color_description(&mut self, desc: ColorDescription) -> Result<()>;
 }
 
@@ -624,6 +625,9 @@ impl<C: codec::VideoCodec> EncoderApi for codec::CodecEncoder<C> {
     }
     fn set_target_bitrate(&mut self, bits_per_second: u32) -> Result<()> {
         codec::CodecEncoder::set_target_bitrate(self, bits_per_second)
+    }
+    fn set_gop_size(&mut self, gop_size: Option<u32>) {
+        codec::CodecEncoder::set_gop_size(self, gop_size)
     }
     fn set_color_description(&mut self, desc: ColorDescription) -> Result<()> {
         codec::CodecEncoder::set_color_description(self, desc)
@@ -749,6 +753,20 @@ impl Encoder {
     /// accepting the call anyway would leave a caller believing otherwise.
     pub fn set_target_bitrate(&mut self, bits_per_second: u32) -> Result<()> {
         self.0.set_target_bitrate(bits_per_second)
+    }
+
+    /// Change how often an IDR is emitted, live.
+    ///
+    /// `None` stops periodic key frames: the stream then carries one only when
+    /// something asks. Intra-refresh encoding replaces periodic I-frames
+    /// entirely, and a congestion controller wants the same thing for a
+    /// different reason -- when keyframes are what the path cannot carry, the
+    /// answer is fewer of them, not smaller ones.
+    ///
+    /// Takes effect on the next frame. No session reset, no rebuild, and the
+    /// frame numbering is untouched, so nothing downstream resynchronises.
+    pub fn set_gop_size(&mut self, gop_size: Option<u32>) {
+        self.0.set_gop_size(gop_size)
     }
 
     /// Update the color description (VUI parameters) for the encoder.

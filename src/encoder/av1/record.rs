@@ -332,9 +332,7 @@ impl Av1 {
         // `EncoderCommon::rate_control_dirty`.
         let rate_control_dirty = common.rate_control_dirty;
         let sets_rate_control = should_reset_coding_state || rate_control_dirty;
-        // Clamp GOP values to at least 1; a value of 0 is undefined in
-        // Vulkan and causes undefined behavior on some drivers (RADV).
-        let gop_frames = common.config.gop_size.max(1);
+        let gop_frames = crate::encoder::codec::advisory_gop_length(common.config.gop_size);
         let mut av1_rc_info = vk::VideoEncodeAV1RateControlInfoKHR::default()
             .gop_frame_count(gop_frames)
             .key_frame_period(gop_frames)

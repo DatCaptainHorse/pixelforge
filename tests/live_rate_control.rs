@@ -106,6 +106,9 @@ fn retuning_bitrate_takes_effect_without_a_keyframe() -> Result<(), Box<dyn std:
     Ok(())
 }
 
+/// Periodic IDR interval for the GOP test, in frames.
+const GOP_FRAMES: u32 = 15;
+
 /// The clip as raw frames, or `None` when it is not on this machine.
 fn load_clip() -> Option<(Vec<u8>, usize)> {
     let path = std::env::var("PIXELFORGE_TEST_CLIP").unwrap_or_else(|_| DEFAULT_CLIP.to_string());
@@ -234,4 +237,118 @@ fn run_codec(
     Ok(format!(
         "mean delta {before:.0} -> {after:.0} bytes ({shrink:.1}x smaller), no keyframe"
     ))
+}
+
+/// Turning periodic key frames off, live.
+///
+/// The controller's second lever: when keyframes are what a path cannot carry,
+/// fewer of them beats smaller ones. `None` has to actually stop them, and an
+/// explicit request has to keep working afterwards -- a stream that can never
+/// produce a key frame again cannot recover a client that has lost sync.
+#[test]
+#[ignore = "requires a Vulkan Video device"]
+fn turning_off_periodic_keyframes_takes_effect() -> Result<(), Box<dyn std::error::Error>> {
+    let Some((clip, frame_size)) = load_clip() else {
+        println!("skipped: no raw clip at {DEFAULT_CLIP} (set PIXELFORGE_TEST_CLIP)");
+        return Ok(());
+    };
+    let context = VideoContextBuilder::new()
+        .app_name("Live GOP")
+        .enable_validation(cfg!(debug_assertions))
+        .build()?;
+
+    let mut failures = Vec::new();
+    for codec in [Codec::H264, Codec::H265, Codec::AV1] {
+        if !context.supports_encode(codec) {
+            continue;
+        }
+        match run_gop_codec(&context, codec, &clip, frame_size) {
+            Ok(report) => println!("{codec:?}: ok -- {report}"),
+            Err(e) => {
+                println!("{codec:?}: FAIL: {e}");
+                failures.push(format!("{codec:?}: {e}"));
+            }
+        }
+    }
+    if !failures.is_empty() {
+        return Err(format!("live gop failed: {}", failures.join("; ")).into());
+    }
+    Ok(())
+}
+
+fn run_gop_codec(
+    context: &pixelforge::VideoContext,
+    codec: Codec,
+    clip: &[u8],
+    frame_size: usize,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let config = match codec {
+        Codec::H264 => EncodeConfig::h264(WIDTH, HEIGHT),
+        Codec::H265 => EncodeConfig::h265(WIDTH, HEIGHT),
+        Codec::AV1 => EncodeConfig::av1(WIDTH, HEIGHT),
+    }
+    .with_rate_control(RateControlMode::Cbr)
+    .with_target_bitrate(HIGH_BPS)
+    .with_frame_rate(60, 1)
+    .with_pixel_format(PixelFormat::Yuv420)
+    .with_bit_depth(EncodeBitDepth::Eight)
+    .with_gop_size(GOP_FRAMES)
+    .with_b_frames(0);
+
+    let mut encoder = Encoder::new(context.clone(), config)?;
+    let mut input_image = InputImage::new(
+        context.clone(),
+        codec,
+        WIDTH,
+        HEIGHT,
+        EncodeBitDepth::Eight,
+        PixelFormat::Yuv420,
+    )?;
+
+    let mut pending: VecDeque<pixelforge::EncodeFuture> = VecDeque::new();
+    let mut keys: Vec<u64> = Vec::new();
+    let frames_in_clip = clip.len() / frame_size;
+
+    let mut drain = |pending: &mut VecDeque<pixelforge::EncodeFuture>,
+                     keys: &mut Vec<u64>|
+     -> Result<(), Box<dyn std::error::Error>> {
+        let p = pollster::block_on(pending.pop_front().unwrap())?;
+        if p.is_key_frame {
+            keys.push(p.pts);
+        }
+        Ok(())
+    };
+
+    for i in 0..FRAMES {
+        if i == RETUNE_AT {
+            encoder.set_gop_size(None);
+        }
+        let start = (i as usize % frames_in_clip) * frame_size;
+        let image = encoder.input_image();
+        input_image.upload_yuv420_to(image, &clip[start..start + frame_size])?;
+        pending.push_back(encoder.encode(image)?);
+        while pending.len() > 2 {
+            drain(&mut pending, &mut keys)?;
+        }
+    }
+    encoder.flush()?;
+    while !pending.is_empty() {
+        drain(&mut pending, &mut keys)?;
+    }
+
+    let before: Vec<u64> = keys.iter().copied().filter(|p| *p < RETUNE_AT).collect();
+    let after: Vec<u64> = keys.iter().copied().filter(|p| *p >= RETUNE_AT).collect();
+
+    if before.len() < 2 {
+        return Err(format!(
+            "expected periodic keyframes every {GOP_FRAMES} frames before the change, saw {before:?}"
+        )
+        .into());
+    }
+    if !after.is_empty() {
+        return Err(
+            format!("periodic keyframes continued after set_gop_size(None): {after:?}").into(),
+        );
+    }
+    Ok(format!("{} keyframes before, none after", before.len()))
 }

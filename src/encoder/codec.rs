@@ -237,6 +237,27 @@ pub(crate) struct RateControlPlan {
 /// the stream ignores its budget. Intel's ANV advertises `DISABLED` alone and
 /// `maxBitrate = 0`, so every CBR encode on it is really constant-QP wearing a
 /// bitrate's name, and nothing said so.
+/// The GOP length to advertise to the rate controller, from a config's
+/// `gop_size`.
+///
+/// Zero means "no periodic key frames" in this crate's config, and Vulkan spells
+/// that `UINT32_MAX`: for `gopFrameCount`, `idrPeriod` and AV1's
+/// `keyFramePeriod` alike, zero means *the implementation may assume a period
+/// of its choosing* and `UINT32_MAX` means infinite. Those are opposite
+/// instructions, and this crate's zero meant the second one.
+///
+/// Neither codec path said so. AV1 clamped zero to 1, which budgets for a key
+/// frame every single frame, while H.264 and H.265 passed zero through and let
+/// each driver invent a period. Three codecs, three answers, none of them the
+/// one the caller asked for.
+///
+/// This only shapes the rate controller's bit allocation. Where IDRs actually
+/// land is [`GopStructure`](crate::encoder::gop::GopStructure)'s decision and is
+/// unaffected either way.
+pub(crate) fn advisory_gop_length(gop_size: u32) -> u32 {
+    if gop_size == 0 { u32::MAX } else { gop_size }
+}
+
 pub(crate) fn rate_control_is_supported(
     mode: RateControlMode,
     supported: vk::VideoEncodeRateControlModeFlagsKHR,
@@ -431,6 +452,23 @@ impl<C: VideoCodec> CodecEncoder<C> {
         {
             self.common.gop.request_idr();
         }
+    }
+
+    /// Change how often an IDR is emitted, live.
+    ///
+    /// `None` stops periodic IDRs; the stream then carries key frames only when
+    /// something asks for one. Takes effect on the next frame, with no session
+    /// reset and no encoder rebuild.
+    pub fn set_gop_size(&mut self, gop_size: Option<u32>) {
+        let size = gop_size.unwrap_or(0);
+        if self.common.config.gop_size == size {
+            return;
+        }
+        self.common.config.gop_size = size;
+        self.common.gop.set_gop_size(gop_size);
+        // The GOP length rides the same per-frame rate-control struct as the
+        // bitrate, so it needs the same control command to take effect.
+        self.common.rate_control_dirty = true;
     }
 
     /// Retarget a bitrate-controlled encode, live.
@@ -826,6 +864,25 @@ pub(crate) fn build_encoder_common(req: &CommonInitRequest) -> Result<CommonInit
         common,
         active_reference_count: max_active_reference_pictures as u32,
     })
+}
+
+#[cfg(test)]
+mod advisory_gop_tests {
+    use super::*;
+
+    #[test]
+    fn no_periodic_keyframes_is_reported_as_infinite() {
+        // UINT32_MAX is Vulkan's own word for infinite here. Zero is not a
+        // synonym for it -- zero lets the implementation pick a period, which is
+        // the opposite instruction.
+        assert_eq!(advisory_gop_length(0), u32::MAX);
+    }
+
+    #[test]
+    fn a_real_period_is_reported_as_itself() {
+        assert_eq!(advisory_gop_length(1), 1);
+        assert_eq!(advisory_gop_length(240), 240);
+    }
 }
 
 #[cfg(test)]
