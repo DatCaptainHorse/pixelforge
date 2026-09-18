@@ -292,18 +292,6 @@ impl ColorConverterConfig {
         }
     }
 
-    /// Set what the input pixels already are.
-    pub fn with_source(mut self, source: ColorSpec) -> Self {
-        self.source = source;
-        self
-    }
-
-    /// Set what the encoded stream should be.
-    pub fn with_target(mut self, target: ColorSpec) -> Self {
-        self.target = target;
-        self
-    }
-
     /// Override the luminance a source sample value of 1.0 represents.
     ///
     /// Rarely needed: [`ColorSpec::reference_white_nits`] already gives the
@@ -319,12 +307,6 @@ impl ColorConverterConfig {
         self.reference_white_nits
             .or_else(|| self.source.reference_white_nits())
             .unwrap_or(0.0)
-    }
-
-    /// Set the quantization range.
-    pub fn with_range(mut self, range: ColorRange) -> Self {
-        self.range = range;
-        self
     }
 
     /// The description of what this conversion actually produces, for
@@ -1370,12 +1352,20 @@ mod tests {
     // ========================
 
     fn config_for(target: ColorSpec, range: ColorRange) -> ColorConverterConfig {
+        config_from(ColorSpec::Srgb, target, range)
+    }
+
+    fn config_from(
+        source: ColorSpec,
+        target: ColorSpec,
+        range: ColorRange,
+    ) -> ColorConverterConfig {
         ColorConverterConfig::new(
             64,
             64,
             InputFormat::BGRA,
             OutputFormat::NV12,
-            ColorSpec::Srgb,
+            source,
             target,
             range,
         )
@@ -1419,18 +1409,13 @@ mod tests {
     fn description_ignores_the_source() {
         // The source says nothing about the encoded stream, so it must not
         // reach the declaration.
-        let base = ColorConverterConfig::new(
-            64,
-            64,
-            InputFormat::BGRA,
-            OutputFormat::P010,
-            ColorSpec::Srgb,
+        let from_srgb = config_from(ColorSpec::Srgb, ColorSpec::Bt2020Pq, ColorRange::Full);
+        let from_scrgb = config_from(
+            ColorSpec::Bt709Linear,
             ColorSpec::Bt2020Pq,
             ColorRange::Full,
         );
-        let from_srgb = base.clone().with_source(ColorSpec::Srgb);
-        let from_scrgb = base.clone().with_source(ColorSpec::Bt709Linear);
-        let from_pq = base.with_source(ColorSpec::Bt2020Pq);
+        let from_pq = config_from(ColorSpec::Bt2020Pq, ColorSpec::Bt2020Pq, ColorRange::Full);
         assert_eq!(
             from_srgb.color_description(),
             from_scrgb.color_description()
@@ -1450,7 +1435,7 @@ mod tests {
             ColorSpec::Bt2020Linear,
             ColorSpec::Bt2020Pq,
         ] {
-            let config = config_for(ColorSpec::Bt2020Pq, ColorRange::Full).with_source(source);
+            let config = config_from(source, ColorSpec::Bt2020Pq, ColorRange::Full);
             assert!(config.conversion_supported(), "{source:?}");
         }
     }
@@ -1459,7 +1444,7 @@ mod tests {
     fn only_srgb_can_reach_sdr() {
         // Everything else would need a forward gamma encode or tone mapping,
         // and the shader does neither. Rejected beats silently passed through.
-        let ok = config_for(ColorSpec::Srgb, ColorRange::Limited).with_source(ColorSpec::Srgb);
+        let ok = config_from(ColorSpec::Srgb, ColorSpec::Srgb, ColorRange::Limited);
         assert!(ok.conversion_supported());
 
         for source in [
@@ -1467,7 +1452,7 @@ mod tests {
             ColorSpec::Bt2020Linear,
             ColorSpec::Bt2020Pq,
         ] {
-            let config = config_for(ColorSpec::Srgb, ColorRange::Limited).with_source(source);
+            let config = config_from(source, ColorSpec::Srgb, ColorRange::Limited);
             assert!(!config.conversion_supported(), "{source:?}");
         }
     }
