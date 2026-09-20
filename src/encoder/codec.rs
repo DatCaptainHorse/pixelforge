@@ -641,6 +641,19 @@ impl IntraRefreshState {
         self.index = (self.index + 1) % self.cycle_duration.max(1);
     }
 
+    /// Whether the next picture opens a refresh cycle.
+    ///
+    /// AV1 needs this: the spec asks for `error_resilient_mode` on the first
+    /// picture of a cycle, so that CDF data -- the adaptive entropy state,
+    /// which is carried forward between pictures and is not covered by
+    /// refreshing *samples* -- cannot propagate an error across the boundary.
+    /// Refreshing every region of the image and leaving the probability model
+    /// inherited from a corrupt picture would recover the picture and not the
+    /// stream.
+    pub fn starts_cycle(&self) -> bool {
+        self.index == 0
+    }
+
     /// Start the cycle over, because an IDR refreshed everything at once.
     pub fn restart(&mut self) {
         self.index = 0;
@@ -666,15 +679,22 @@ pub(crate) fn resolve_intra_refresh(
         warn!("intra refresh requested, but this device does not support it; using key frames");
         return None;
     }
-    // Block-row based first: it refreshes a horizontal band per picture, which
-    // is both the most widely implemented and the least visible, since motion
-    // in rendered content is more often horizontal than vertical. Per-picture
-    // partition is last because it ties the refresh region to the slice
-    // layout, which is a separate decision this does not control.
+    // Block-based first, because we have no preference about how the picture
+    // is divided and the spec says so explicitly: row-based and column-based
+    // are block-based with an extra guarantee about granularity, so anything
+    // offering either inherently offers block-based, and asking for the
+    // general mode leaves the division to the implementation that knows its
+    // own hardware. Picking row-based here would be choosing on the
+    // implementation's behalf for no reason we can defend.
+    //
+    // The specific modes follow only as a fallback for a device that somehow
+    // offers one without the general bit. Per-picture partition is last: it
+    // ties the refresh region to the slice layout, which is a separate
+    // decision this does not control.
     let mode = [
+        vk::VideoEncodeIntraRefreshModeFlagsKHR::BLOCK_BASED,
         vk::VideoEncodeIntraRefreshModeFlagsKHR::BLOCK_ROW_BASED,
         vk::VideoEncodeIntraRefreshModeFlagsKHR::BLOCK_COLUMN_BASED,
-        vk::VideoEncodeIntraRefreshModeFlagsKHR::BLOCK_BASED,
         vk::VideoEncodeIntraRefreshModeFlagsKHR::PER_PICTURE_PARTITION,
     ]
     .into_iter()
@@ -691,6 +711,17 @@ pub(crate) fn resolve_intra_refresh(
             caps.max_active_reference_pictures, active_reference_pictures
         );
         return None;
+    }
+    // Prediction inside a cycle is restricted to already-refreshed regions of
+    // a reference, which has the practical effect that a picture can usefully
+    // reference only the picture before it in the cycle, or one from outside
+    // the cycle. Extra references are not invalid -- they are just mostly
+    // unusable, and paid for in DPB memory and bandwidth either way.
+    if active_reference_pictures > 1 {
+        debug!(
+            "intra refresh with {active_reference_pictures} active references: prediction inside \
+             a cycle can only use the preceding picture, so the rest will contribute little"
+        );
     }
     if caps.max_cycle_duration == 0 {
         warn!("intra refresh requested, but the device reports no usable cycle; using key frames");
@@ -1361,6 +1392,36 @@ mod intra_refresh_tests {
     }
 
     /// Asking about a slot that does not exist must not panic mid-encode.
+    /// AV1 needs to know when a cycle opens, to reset the entropy model.
+    #[test]
+    fn the_first_picture_of_a_cycle_is_recognisable() {
+        let mut ir = state(3, 1);
+        assert!(ir.starts_cycle(), "a fresh cycle starts at its first picture");
+        ir.advance();
+        assert!(!ir.starts_cycle());
+        ir.advance();
+        assert!(!ir.starts_cycle());
+        ir.advance();
+        assert!(ir.starts_cycle(), "wrapping round begins a new cycle");
+    }
+
+    /// The normative rule is that a reference's clean region count is
+    /// `cycleDuration - dirtyIntraRefreshRegions`, and a picture encoded at
+    /// index `r` has refreshed regions `0..=r`. The two together are the
+    /// formula below, and this pins it against the spec rather than against
+    /// the simplified example in the extension proposal, which is written for
+    /// the mid-cycle case and disagrees at a cycle boundary.
+    #[test]
+    fn clean_regions_are_the_reference_index_plus_one() {
+        let mut ir = state(5, 1);
+        for r in 0..5u32 {
+            ir.index = r;
+            ir.wrote_slot(0, false);
+            let clean = ir.cycle_duration - ir.dirty_regions(0);
+            assert_eq!(clean, r + 1, "a picture encoded at index {r}");
+        }
+    }
+
     #[test]
     fn an_unknown_slot_is_treated_as_clean() {
         let ir = state(4, 1);

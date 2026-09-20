@@ -72,9 +72,18 @@ impl Av1 {
             _bitfield_1: Default::default(),
         };
         picture_info_flags.set_show_frame(1);
-        if is_key_frame {
+        // Also on the first picture of an intra refresh cycle. Refreshing the
+        // samples does not refresh the CDF data carried forward with them, so
+        // without this a corrupt entropy model survives a refresh that was
+        // supposed to be a recovery point.
+        let opens_refresh_cycle = common
+            .intra_refresh
+            .as_ref()
+            .is_some_and(|ir| ir.starts_cycle());
+        if is_key_frame || opens_refresh_cycle {
             picture_info_flags.set_error_resilient_mode(1);
-        } else {
+        }
+        if !is_key_frame {
             picture_info_flags.set_showable_frame(1);
         }
 
