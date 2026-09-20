@@ -113,6 +113,8 @@ impl H264 {
             profile_info: &profile_info,
             caps: &caps,
             align_unit: MB_SIZE,
+            // Macroblocks are 16x16 in every H.264 profile; nothing to query.
+            refresh_block: MB_SIZE,
             max_active_refs_cap: 32,
             bitstream_buffer_size,
             allow_layered_dpb: true,

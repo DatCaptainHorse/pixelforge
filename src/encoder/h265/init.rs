@@ -118,6 +118,7 @@ impl H265 {
             profile_info: &profile_info,
             caps: &caps,
             align_unit: CTB_SIZE,
+            refresh_block: crate::encoder::codec::h265_refresh_block(h265_caps.ctb_sizes),
             max_active_refs_cap: 15,
             bitstream_buffer_size,
             allow_layered_dpb: true,

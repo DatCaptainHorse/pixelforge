@@ -102,6 +102,7 @@ impl Av1 {
             profile_info: &profile_info,
             caps: &caps,
             align_unit: SUPERBLOCK_SIZE,
+            refresh_block: crate::encoder::codec::av1_refresh_block(av1_caps.superblock_sizes),
             // AV1 has NUM_REF_FRAMES = 8 DPB slots, and `refresh_frame_flags`
             // is an 8-bit syntax element. `build_encoder_common` adds one setup
             // slot on top of the active count, so cap active refs at 7 to keep
