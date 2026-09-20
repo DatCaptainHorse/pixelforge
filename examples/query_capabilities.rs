@@ -71,6 +71,11 @@ struct IntraRefreshRow {
     /// a refreshed region may predict from an unrefreshed one, so the sweep
     /// never actually converges. `None` where the codec has no such flag.
     constrained_intra_pred: Option<bool>,
+    /// The longest cycle a row sweep can actually use: the device maximum and
+    /// the picture's block-row count, whichever is smaller. The device figure
+    /// alone is misleading — it is generous enough that the picture is almost
+    /// always the real limit, and it is the one nothing else reports.
+    usable_row_cycle: u32,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -302,8 +307,16 @@ fn report_codec(
         print_video_caps(&caps);
         print_encode_caps(&encode_caps);
 
+        // The unit refresh regions are built from, which is the codec's own
+        // block and not the input granularity the encode caps report.
+        let (block, block_source) = match codec {
+            Codec::H264 => (16, "macroblocks"),
+            Codec::H265 => (largest_ctb(h265_caps.ctb_sizes), "CTBs"),
+            Codec::AV1 => (largest_superblock(av1_caps.superblock_sizes), "superblocks"),
+        };
+
         let modes = if ask_intra {
-            print_intra_refresh(&intra_caps, &encode_caps, reference);
+            print_intra_refresh(&intra_caps, block, block_source, reference);
             Some(intra_caps.intra_refresh_modes)
         } else {
             println!("\n    Intra refresh");
@@ -350,6 +363,9 @@ fn report_codec(
             max_cycle: intra_caps.max_intra_refresh_cycle_duration,
             max_active_refs: intra_caps.max_intra_refresh_active_reference_pictures,
             constrained_intra_pred: constrained,
+            usable_row_cycle: intra_caps
+                .max_intra_refresh_cycle_duration
+                .min(reference.height.div_ceil(block.max(1)).max(1)),
         });
     }
 }
@@ -485,16 +501,24 @@ fn print_encode_caps(caps: &vk::VideoEncodeCapabilitiesKHR) {
 /// Intra refresh, plus the arithmetic that turns the reported numbers into the
 /// thing anyone actually wants to know: how coarse a sweep this device can do.
 ///
-/// A refresh region is built out of the encoder's input picture granularity
-/// blocks, so a picture is a fixed number of blocks tall and wide. The finest
-/// possible sweep refreshes one block row per picture, which takes as many
-/// pictures as the picture is blocks tall. When the device's maximum cycle
-/// duration is shorter than that, the finest sweep is not available: each
-/// picture must refresh more than one row, the refreshed band is that much
-/// wider, and a wider band is a more visible one.
+/// `block` is the codec's own block size -- macroblock, CTB or superblock --
+/// because that is the unit refresh regions are built from. It is emphatically
+/// *not* `encodeInputPictureGranularity`, which describes how input images may
+/// be laid out and which the same query shows disagreeing: RADV reports a
+/// 64x16 input granularity for H.265 against 64x64 CTBs, and 8x2 for AV1
+/// against 64x64 superblocks. Reckoned in granularity, AV1 looks like 540 block
+/// rows at 1080p when it has 17.
+///
+/// The finest possible sweep refreshes one block row per picture, which takes
+/// as many pictures as the picture is blocks tall. When the device's maximum
+/// cycle is shorter than that the finest sweep is unavailable and each picture
+/// must refresh more than one row -- a wider band, and a wider band is a more
+/// visible one. When the *cycle in use* is longer than that, the cycle is
+/// asking for regions the picture does not have.
 fn print_intra_refresh(
     caps: &vk::VideoEncodeIntraRefreshCapabilitiesKHR,
-    encode: &vk::VideoEncodeCapabilitiesKHR,
+    block: u32,
+    block_source: &str,
     reference: Reference,
 ) {
     println!("    Intra refresh");
@@ -524,33 +548,30 @@ fn print_intra_refresh(
         yes_no(caps.non_rectangular_intra_refresh_regions != 0)
     );
 
-    let bw = encode.encode_input_picture_granularity.width.max(1);
-    let bh = encode.encode_input_picture_granularity.height.max(1);
-    let blocks_wide = reference.width.div_ceil(bw);
-    let blocks_tall = reference.height.div_ceil(bh);
+    let block = block.max(1);
+    let blocks_wide = reference.width.div_ceil(block).max(1);
+    let blocks_tall = reference.height.div_ceil(block).max(1);
     println!(
-        "      At {}x{} with {bw}x{bh} blocks: {blocks_wide} wide x {blocks_tall} tall",
+        "      At {}x{} in {block}x{block} {block_source}: {blocks_wide} wide x {blocks_tall} tall",
         reference.width, reference.height,
     );
 
-    for (label, needed) in [
-        ("one block row per picture", blocks_tall),
-        ("one block column per picture", blocks_wide),
-    ] {
-        let cap = caps.max_intra_refresh_cycle_duration;
-        if cap >= needed {
+    let cap = caps.max_intra_refresh_cycle_duration;
+    for (label, regions) in [("row sweep", blocks_tall), ("column sweep", blocks_wide)] {
+        // Two different failures, and they are not symmetric. Too few regions
+        // for the device cap only means the finest sweep is unavailable; a
+        // cycle longer than the region count is a cycle that cannot be served.
+        let usable = cap.min(regions);
+        println!(
+            "        {label}: {regions} region(s) available, device allows {cap} — \
+             longest usable cycle {usable} pictures ({})",
+            reference.seconds(usable),
+        );
+        if regions > cap {
             println!(
-                "        {label}: {needed} pictures per sweep ({}) — allowed",
-                reference.seconds(needed),
-            );
-        } else {
-            // Rounded up: the rows have to be covered, so a cycle that divides
-            // unevenly makes some pictures carry an extra row rather than
-            // leaving one unrefreshed.
-            let rows_per_picture = needed.div_ceil(cap.max(1));
-            println!(
-                "        {label}: would need {needed} pictures, device allows {cap} — \
-                 at least {rows_per_picture} per picture",
+                "          the finest sweep would need {regions} pictures; at {cap} each \
+                 picture refreshes at least {} row(s)",
+                regions.div_ceil(cap.max(1)),
             );
         }
     }
@@ -563,7 +584,10 @@ fn print_h264_caps(caps: &vk::VideoEncodeH264CapabilitiesKHR) {
         "      QP range:            {}..{}",
         caps.min_qp, caps.max_qp
     );
-    println!("      Max level idc:       {:?}", caps.max_level_idc);
+    println!(
+        "      Max level:           {}",
+        h264_level(caps.max_level_idc)
+    );
     println!("      Max slices:          {}", caps.max_slice_count);
     println!(
         "      References:          P L0 {}, B L0 {}, L1 {}",
@@ -598,7 +622,10 @@ fn print_h265_caps(caps: &vk::VideoEncodeH265CapabilitiesKHR) {
         "      QP range:            {}..{}",
         caps.min_qp, caps.max_qp
     );
-    println!("      Max level idc:       {:?}", caps.max_level_idc);
+    println!(
+        "      Max level:           {}",
+        h265_level(caps.max_level_idc)
+    );
     println!(
         "      Max slice segments:  {}",
         caps.max_slice_segment_count
@@ -648,7 +675,7 @@ fn print_av1_caps(caps: &vk::VideoEncodeAV1CapabilitiesKHR) {
         "      q-index range:       {}..{}",
         caps.min_q_index, caps.max_q_index
     );
-    println!("      Max level:           {:?}", caps.max_level);
+    println!("      Max level:           {}", av1_level(caps.max_level));
     println!(
         "      Picture alignment:   {}x{}",
         caps.coded_picture_alignment.width, caps.coded_picture_alignment.height,
@@ -748,8 +775,8 @@ fn print_quality_levels(
         }
 
         println!(
-            "      {level}: prefers {} with {} layer(s)",
-            flags_or_none(props.preferred_rate_control_mode),
+            "      {level}: prefers {}, {} rate control layer(s)",
+            preferred_rate_control(props.preferred_rate_control_mode),
             props.preferred_rate_control_layer_count,
         );
         match codec {
@@ -839,9 +866,16 @@ fn print_formats(
             let planes = prop
                 .image_create_flags
                 .contains(vk::ImageCreateFlags::MUTABLE_FORMAT);
+            // Type, tiling and usage as well as the format: RADV reports the
+            // same format three times for encode input, and without these the
+            // three lines are indistinguishable and read as a bug.
             println!(
-                "        {:?}  flags: {}{}",
-                prop.format,
+                "        {:?}  {:?}  {:?}",
+                prop.format, prop.image_type, prop.image_tiling,
+            );
+            println!("          usage: {}", flags_or_none(prop.image_usage_flags));
+            println!(
+                "          create flags: {}{}",
                 flags_or_none(prop.image_create_flags),
                 if planes { "  (per-plane views)" } else { "" },
             );
@@ -864,8 +898,8 @@ fn print_intra_refresh_summary(rows: &[IntraRefreshRow], reference: Reference) {
         return;
     }
     println!(
-        "  {:<6} {:<14} {:<10} {:<8} {:<7} modes",
-        "codec", "format", "cycle max", "refs", "c.i.p."
+        "  {:<6} {:<14} {:<10} {:<8} {:<8} {:<7} modes",
+        "codec", "format", "cycle max", "usable", "refs", "c.i.p."
     );
     for row in rows {
         let modes = match row.modes {
@@ -886,21 +920,27 @@ fn print_intra_refresh_summary(rows: &[IntraRefreshRow], reference: Reference) {
             Some(false) => "NO",
             None => "n/a",
         };
+        let usable = match row.modes {
+            Some(m) if !m.is_empty() => format!("{}", row.usable_row_cycle),
+            _ => "-".to_string(),
+        };
         println!(
-            "  {:<6} {:<14} {:<10} {:<8} {:<7} {}",
+            "  {:<6} {:<14} {:<10} {:<8} {:<8} {:<7} {}",
             format!("{:?}", row.codec),
             row.format,
             cycle,
+            usable,
             refs,
             cip,
             modes,
         );
     }
+    println!("\n  cycle max is what the device allows; usable is that capped by the block rows a");
     println!(
-        "\n  cycle max is in pictures — {} at {} fps for the largest value shown.",
-        reference.seconds(rows.iter().map(|r| r.max_cycle).max().unwrap_or(0)),
-        reference.fps,
+        "  {}x{} picture actually has, which is the smaller limit and the one that governs a",
+        reference.width, reference.height,
     );
+    println!("  row sweep. A cycle set above it asks for regions the picture cannot supply.");
     println!(
         "  c.i.p. is constrained_intra_pred: without it a refreshed region may predict from an"
     );
@@ -1011,6 +1051,82 @@ fn flags_or_none<T: std::fmt::Debug + Copy>(flags: T) -> String {
         "none".to_string()
     } else {
         s
+    }
+}
+
+/// The CTB size to reckon refresh regions in, from what the device offers.
+///
+/// The largest offered: it gives the fewest regions, and the fewest regions is
+/// the bound that holds whichever size the encoder ends up coding with.
+fn largest_ctb(sizes: vk::VideoEncodeH265CtbSizeFlagsKHR) -> u32 {
+    use vk::VideoEncodeH265CtbSizeFlagsKHR as Ctb;
+    for (flag, size) in [(Ctb::TYPE_64, 64), (Ctb::TYPE_32, 32), (Ctb::TYPE_16, 16)] {
+        if sizes.contains(flag) {
+            return size;
+        }
+    }
+    64
+}
+
+/// The superblock size to reckon refresh regions in. See [`largest_ctb`].
+fn largest_superblock(sizes: vk::VideoEncodeAV1SuperblockSizeFlagsKHR) -> u32 {
+    use vk::VideoEncodeAV1SuperblockSizeFlagsKHR as Sb;
+    for (flag, size) in [(Sb::TYPE_128, 128), (Sb::TYPE_64, 64)] {
+        if sizes.contains(flag) {
+            return size;
+        }
+    }
+    128
+}
+
+/// A codec level as the number people write it, plus the raw ordinal.
+///
+/// The Vulkan enums are dense ordinals, not encoded level numbers, so the raw
+/// value reads as a plausible-looking level that is not the level: H.264 level
+/// 5.2 comes back as 15 and AV1 level 6.1 as 17. Both halves are printed
+/// because the ordinal is what a bug report would quote back.
+fn h264_level(idc: u32) -> String {
+    const LEVELS: [&str; 19] = [
+        "1.0", "1.1", "1.2", "1.3", "2.0", "2.1", "2.2", "3.0", "3.1", "3.2", "4.0", "4.1", "4.2",
+        "5.0", "5.1", "5.2", "6.0", "6.1", "6.2",
+    ];
+    level_name(&LEVELS, idc)
+}
+
+fn h265_level(idc: u32) -> String {
+    const LEVELS: [&str; 13] = [
+        "1.0", "2.0", "2.1", "3.0", "3.1", "4.0", "4.1", "5.0", "5.1", "5.2", "6.0", "6.1", "6.2",
+    ];
+    level_name(&LEVELS, idc)
+}
+
+fn av1_level(level: u32) -> String {
+    const LEVELS: [&str; 24] = [
+        "2.0", "2.1", "2.2", "2.3", "3.0", "3.1", "3.2", "3.3", "4.0", "4.1", "4.2", "4.3", "5.0",
+        "5.1", "5.2", "5.3", "6.0", "6.1", "6.2", "6.3", "7.0", "7.1", "7.2", "7.3",
+    ];
+    level_name(&LEVELS, level)
+}
+
+fn level_name(levels: &[&str], value: u32) -> String {
+    match levels.get(value as usize) {
+        Some(name) => format!("{name} (enum {value})"),
+        None => format!("unknown (enum {value})"),
+    }
+}
+
+/// A rate control mode from a *preference* field, where zero is a value.
+///
+/// `flags_or_none` would call it "none", and here zero means
+/// `VK_VIDEO_ENCODE_RATE_CONTROL_MODE_DEFAULT_KHR` -- the implementation
+/// declining to express a preference, not the absence of one. Measured on
+/// RADV, every quality level reports exactly this, so the difference between
+/// "offers nothing" and "has no preference" is the whole content of the line.
+fn preferred_rate_control(mode: vk::VideoEncodeRateControlModeFlagsKHR) -> String {
+    if mode == vk::VideoEncodeRateControlModeFlagsKHR::DEFAULT {
+        "DEFAULT (no preference expressed)".to_string()
+    } else {
+        format!("{mode:?}")
     }
 }
 
