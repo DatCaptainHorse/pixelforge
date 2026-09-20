@@ -125,7 +125,7 @@ fn run_codec(
     .with_bit_depth(EncodeBitDepth::Eight)
     .with_gop_size(GOP_FRAMES)
     .with_intra_refresh(refresh)
-    .with_intra_refresh_limit_prediction(std::env::var("PIXELFORGE_LIMIT_PREDICTION").is_ok())
+    .with_intra_refresh_recovery(std::env::var("PIXELFORGE_LIMIT_PREDICTION").is_ok())
     .with_max_reference_frames(max_refs)
     .with_b_frames(0);
 

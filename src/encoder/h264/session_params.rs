@@ -138,6 +138,23 @@ impl H264 {
         pps_flags.set_transform_8x8_mode_flag(transform_8x8 as u32);
         pps_flags.set_entropy_coding_mode_flag(self.preferred_entropy_cabac() as u32);
         pps_flags.set_deblocking_filter_control_present_flag(1);
+        // Intra refresh needs this, and only intra refresh. It forbids an
+        // intra-coded block from predicting spatially from neighbouring
+        // *inter*-coded blocks -- which during a refresh cycle are precisely
+        // the regions not yet refreshed. Without it the refreshed strip
+        // predicts from the stale content it was meant to replace, so the
+        // refresh never actually converges and its boundary stays visible at
+        // any bitrate, buffer size or cycle length.
+        //
+        // It costs compression, because intra blocks lose neighbours they
+        // could otherwise have used -- at 1080p and one megabit, enough to
+        // collapse the picture into blocking. So it follows the recovery
+        // option rather than intra refresh itself: spreading intra blocks to
+        // avoid a key-frame burst does not need it, and converging without a
+        // key frame does.
+        if config.intra_refresh_cycle.is_some() && config.intra_refresh_recovery {
+            pps_flags.set_constrained_intra_pred_flag(1);
+        }
 
         // vk_video_samples sets chroma QP offsets to 6 for 4:4:4 (driver compat).
         let (chroma_qp_index_offset, second_chroma_qp_index_offset) = match config.pixel_format {

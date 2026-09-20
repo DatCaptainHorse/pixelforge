@@ -397,18 +397,30 @@ pub struct EncodeConfig {
     /// vertical sweep and silently getting a horizontal one would make the
     /// next comparison meaningless.
     pub intra_refresh_mode: Option<IntraRefreshShape>,
-    /// Stop refreshed regions predicting from regions not yet refreshed.
+    /// Make the refresh cycle a genuine recovery point, at the cost of picture.
     ///
-    /// The spec calls this optional, and it is the half of intra refresh that
-    /// costs picture quality. It buys convergence for a decoder joining
-    /// mid-cycle or recovering from loss without a key frame; it costs the
-    /// ability to predict anything moving out of the refreshed band, so
-    /// content drifts and then snaps as the refresh reaches it.
+    /// Intra refresh has two halves. One is free: spreading intra-coded blocks
+    /// across a cycle instead of concentrating them in a key frame, which is
+    /// what removes the burst. The other is this, and it is what makes a
+    /// decoder joining mid-cycle -- or recovering from loss without a key
+    /// frame -- actually converge:
+    ///
+    ///   * Prediction is limited to already-refreshed regions, so a refreshed
+    ///     region cannot inherit from one that is still stale.
+    ///   * `constrained_intra_pred_flag` is set, so an intra block cannot
+    ///     predict *spatially* from a neighbouring inter block either. Without
+    ///     it the refreshed strip inherits the very content it was meant to
+    ///     replace, and the cycle refreshes nothing.
+    ///
+    /// Both cost compression, and at low bitrates the second is brutal:
+    /// measured at 1080p, six megabits looks clean and one megabit collapses
+    /// into blocking, because intra blocks lose the neighbours that made them
+    /// affordable.
     ///
     /// Off by default. A client that joined with a key frame -- which it must,
     /// since intra refresh cannot start a decoder -- has nothing to converge
-    /// from and would pay that for nothing.
-    pub intra_refresh_limit_prediction: bool,
+    /// from and would pay all of that for nothing.
+    pub intra_refresh_recovery: bool,
     /// Color description for VUI signaling.
     /// Defaults to BT.709 (full-range) when `None`.
     pub color_description: Option<ColorDescription>,
@@ -446,7 +458,7 @@ impl EncodeConfig {
             max_reference_frames: DEFAULT_MAX_REFERENCE_FRAMES,
             intra_refresh_cycle: None,
             intra_refresh_mode: None,
-            intra_refresh_limit_prediction: false,
+            intra_refresh_recovery: false,
             virtual_buffer_size_ms: 1000,
             initial_virtual_buffer_size_ms: 1000,
             color_description: None,
@@ -479,7 +491,7 @@ impl EncodeConfig {
             max_reference_frames: DEFAULT_MAX_REFERENCE_FRAMES,
             intra_refresh_cycle: None,
             intra_refresh_mode: None,
-            intra_refresh_limit_prediction: false,
+            intra_refresh_recovery: false,
             virtual_buffer_size_ms: 1000,
             initial_virtual_buffer_size_ms: 1000,
             color_description: None,
@@ -512,7 +524,7 @@ impl EncodeConfig {
             max_reference_frames: DEFAULT_MAX_REFERENCE_FRAMES,
             intra_refresh_cycle: None,
             intra_refresh_mode: None,
-            intra_refresh_limit_prediction: false,
+            intra_refresh_recovery: false,
             virtual_buffer_size_ms: 1000,
             initial_virtual_buffer_size_ms: 1000,
             color_description: None,
@@ -615,9 +627,10 @@ impl EncodeConfig {
         self
     }
 
-    /// Limit prediction to already-refreshed regions; see the field.
-    pub fn with_intra_refresh_limit_prediction(mut self, limit: bool) -> Self {
-        self.intra_refresh_limit_prediction = limit;
+    /// Make the cycle a real recovery point, at the cost of picture; see the
+    /// field.
+    pub fn with_intra_refresh_recovery(mut self, limit: bool) -> Self {
+        self.intra_refresh_recovery = limit;
         self
     }
 

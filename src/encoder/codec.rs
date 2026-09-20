@@ -796,7 +796,7 @@ pub(crate) fn resolve_intra_refresh(
     Some(IntraRefreshState {
         cycle_duration,
         index: 0,
-        restrict_prediction: config.intra_refresh_limit_prediction,
+        restrict_prediction: config.intra_refresh_recovery,
         mode,
     })
 }
