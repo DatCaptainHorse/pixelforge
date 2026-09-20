@@ -670,6 +670,76 @@ impl IntraRefreshState {
     }
 }
 
+/// The CTB size to reckon refresh regions in, from what the device offers.
+///
+/// The largest offered, deliberately. It gives the fewest regions, and the
+/// fewest regions is the only bound that holds whichever size the encoder
+/// actually ends up coding with -- guessing small would let a cycle through
+/// that the picture cannot supply regions for, which is the failure this is
+/// here to stop. Erring the other way merely shortens a sweep.
+///
+/// A device that reports no size has told us nothing, so the largest legal CTB
+/// is assumed for the same reason.
+pub(crate) fn h265_refresh_block(ctb_sizes: vk::VideoEncodeH265CtbSizeFlagsKHR) -> u32 {
+    use vk::VideoEncodeH265CtbSizeFlagsKHR as Ctb;
+    for (flag, size) in [(Ctb::TYPE_64, 64), (Ctb::TYPE_32, 32), (Ctb::TYPE_16, 16)] {
+        if ctb_sizes.contains(flag) {
+            return size;
+        }
+    }
+    64
+}
+
+/// The superblock size to reckon refresh regions in. See
+/// [`h265_refresh_block`] for why this takes the largest.
+pub(crate) fn av1_refresh_block(sizes: vk::VideoEncodeAV1SuperblockSizeFlagsKHR) -> u32 {
+    use vk::VideoEncodeAV1SuperblockSizeFlagsKHR as Sb;
+    for (flag, size) in [(Sb::TYPE_128, 128), (Sb::TYPE_64, 64)] {
+        if sizes.contains(flag) {
+            return size;
+        }
+    }
+    128
+}
+
+/// How many refresh regions a picture can be divided into under `mode`, or
+/// `None` when that is not a question this can answer.
+///
+/// This is the bound the cycle duration has to respect. A cycle is a schedule
+/// for handing out regions one picture at a time, so a cycle longer than the
+/// picture has regions is asking for regions that do not exist: the sweep
+/// either covers nothing on some pictures or is rejected outright, and neither
+/// failure announces itself -- what shows up is a band that crawls unevenly
+/// down the picture, which reads as an encoder quality problem rather than a
+/// configuration one.
+///
+/// `block` is the codec's own block size -- macroblock, CTB, superblock --
+/// because that is the unit refresh regions are built from. It is emphatically
+/// *not* `encodeInputPictureGranularity`, which describes how input images may
+/// be laid out and which differs: measured on RADV, H.265 reports a 64x16
+/// input granularity while its CTBs are 64x64, and AV1 reports 8x2 against
+/// 64x64 superblocks. Using the granularity overstates the row count by more
+/// than thirty times for AV1.
+fn refresh_region_limit(
+    mode: vk::VideoEncodeIntraRefreshModeFlagsKHR,
+    width: u32,
+    height: u32,
+    block: u32,
+) -> Option<u32> {
+    let block = block.max(1);
+    let columns = width.div_ceil(block).max(1);
+    let rows = height.div_ceil(block).max(1);
+    match mode {
+        vk::VideoEncodeIntraRefreshModeFlagsKHR::BLOCK_ROW_BASED => Some(rows),
+        vk::VideoEncodeIntraRefreshModeFlagsKHR::BLOCK_COLUMN_BASED => Some(columns),
+        // The implementation divides the picture however it likes and does not
+        // say which way, so only a bound that holds for either is safe.
+        vk::VideoEncodeIntraRefreshModeFlagsKHR::BLOCK_BASED => Some(rows.min(columns)),
+        // Regions follow the slice or tile layout, which this does not set.
+        _ => None,
+    }
+}
+
 /// Decide whether intra refresh is on, and how, given what was asked for and
 /// what the device offers.
 ///
@@ -680,7 +750,9 @@ pub(crate) fn resolve_intra_refresh(
     context: &VideoContext,
     config: &EncodeConfig,
     caps: IntraRefreshCaps,
-    dpb_slot_count: usize,
+    // The codec's own block size -- macroblock, CTB or superblock -- which is
+    // the unit refresh regions are built from.
+    refresh_block: u32,
     active_reference_pictures: u32,
 ) -> Option<IntraRefreshState> {
     let cycle = config.intra_refresh_cycle?;
@@ -787,12 +859,43 @@ pub(crate) fn resolve_intra_refresh(
         warn!("intra refresh requested, but the device reports no usable cycle; using key frames");
         return None;
     }
-    let cycle_duration = cycle.min(caps.max_cycle_duration).max(2);
-    if cycle_duration != cycle {
-        debug!(
-            "intra refresh cycle {cycle} exceeds the device maximum {}; using {cycle_duration}",
-            caps.max_cycle_duration
+    // Two bounds, and the picture's is the one that used to be missing. The
+    // device maximum is generous -- 256 pictures, measured on RADV -- while a
+    // 1080p H.265 picture is only 17 CTB rows tall, so a cycle set in seconds
+    // clears the device bound easily and overruns the picture's silently.
+    let region_limit = refresh_region_limit(
+        mode,
+        config.dimensions.width,
+        config.dimensions.height,
+        refresh_block,
+    );
+    let bound = caps
+        .max_cycle_duration
+        .min(region_limit.unwrap_or(u32::MAX));
+    if bound < 2 {
+        warn!(
+            "intra refresh requested, but this picture divides into {bound} refresh region(s) \
+             under {mode:?}; using key frames"
         );
+        return None;
+    }
+    let cycle_duration = cycle.clamp(2, bound);
+    if cycle_duration != cycle {
+        match region_limit {
+            // Named apart because they mean different things to whoever reads
+            // it: the device bound is a property of the hardware, the region
+            // bound a property of this resolution and codec, and only the
+            // second one moves when the stream is reconfigured.
+            Some(limit) if limit < caps.max_cycle_duration => debug!(
+                "intra refresh cycle {cycle} exceeds the {limit} refresh region(s) a \
+                 {}x{} picture has under {mode:?}; using {cycle_duration}",
+                config.dimensions.width, config.dimensions.height,
+            ),
+            _ => debug!(
+                "intra refresh cycle {cycle} exceeds the device maximum {}; using {cycle_duration}",
+                caps.max_cycle_duration
+            ),
+        }
     }
     debug!("intra refresh on: {cycle_duration} pictures per cycle, mode {mode:?}");
     Some(IntraRefreshState {
@@ -872,6 +975,15 @@ pub(crate) struct CommonInitRequest<'a> {
     pub caps: &'a DeviceVideoCaps,
     /// Codec block size for coded-extent alignment (macroblock / CTB / superblock).
     pub align_unit: u32,
+    /// Codec block size to reckon intra refresh regions in.
+    ///
+    /// Separate from `align_unit` because that one is what this crate codes
+    /// with while this one is what the *device* says it divides pictures into,
+    /// and they disagree: H.265 aligns to 32 here while RADV offers only 64x64
+    /// CTBs. A refresh bound computed from the smaller of the two is twice as
+    /// permissive as the picture actually allows, which puts the cycle back
+    /// over the limit this exists to keep it under.
+    pub refresh_block: u32,
     /// Upper bound on active reference pictures the codec's syntax allows.
     pub max_active_refs_cap: usize,
     pub bitstream_buffer_size: usize,
@@ -1206,7 +1318,7 @@ pub(crate) fn build_encoder_common(req: &CommonInitRequest) -> Result<CommonInit
         context,
         config,
         req.intra_refresh_caps,
-        dpb_slot_count,
+        req.refresh_block,
         max_active_reference_pictures as u32,
     );
     let mut intra_refresh_create = intra_refresh.as_ref().map(|ir| {
@@ -1473,5 +1585,122 @@ mod intra_refresh_tests {
         assert_eq!(ir.index, 2);
         ir.restart();
         assert_eq!(ir.index, 0);
+    }
+}
+
+#[cfg(test)]
+mod refresh_block_tests {
+    use super::*;
+
+    /// The coarsest division the device offers is the one that gives the
+    /// fewest regions, and the fewest regions is the bound that holds however
+    /// the encoder ends up dividing the picture.
+    #[test]
+    fn the_largest_offered_ctb_is_taken() {
+        use vk::VideoEncodeH265CtbSizeFlagsKHR as Ctb;
+        assert_eq!(h265_refresh_block(Ctb::TYPE_64), 64);
+        assert_eq!(
+            h265_refresh_block(Ctb::TYPE_16 | Ctb::TYPE_32 | Ctb::TYPE_64),
+            64
+        );
+        assert_eq!(h265_refresh_block(Ctb::TYPE_16 | Ctb::TYPE_32), 32);
+        assert_eq!(h265_refresh_block(Ctb::TYPE_16), 16);
+    }
+
+    /// A device reporting no CTB size at all has told us nothing, and a guess
+    /// that is too small under-bounds the cycle -- which is the failure this
+    /// whole path exists to prevent. The largest legal CTB is the safe guess.
+    #[test]
+    fn an_empty_ctb_report_falls_back_to_the_largest() {
+        assert_eq!(
+            h265_refresh_block(vk::VideoEncodeH265CtbSizeFlagsKHR::empty()),
+            64
+        );
+    }
+
+    #[test]
+    fn the_largest_offered_superblock_is_taken() {
+        use vk::VideoEncodeAV1SuperblockSizeFlagsKHR as Sb;
+        assert_eq!(av1_refresh_block(Sb::TYPE_64), 64);
+        assert_eq!(av1_refresh_block(Sb::TYPE_64 | Sb::TYPE_128), 128);
+        assert_eq!(
+            av1_refresh_block(vk::VideoEncodeAV1SuperblockSizeFlagsKHR::empty()),
+            128
+        );
+    }
+}
+
+#[cfg(test)]
+mod intra_refresh_cycle_tests {
+    use super::*;
+
+    const ROWS: vk::VideoEncodeIntraRefreshModeFlagsKHR =
+        vk::VideoEncodeIntraRefreshModeFlagsKHR::BLOCK_ROW_BASED;
+    const COLUMNS: vk::VideoEncodeIntraRefreshModeFlagsKHR =
+        vk::VideoEncodeIntraRefreshModeFlagsKHR::BLOCK_COLUMN_BASED;
+    const BLOCKS: vk::VideoEncodeIntraRefreshModeFlagsKHR =
+        vk::VideoEncodeIntraRefreshModeFlagsKHR::BLOCK_BASED;
+    const PARTITIONS: vk::VideoEncodeIntraRefreshModeFlagsKHR =
+        vk::VideoEncodeIntraRefreshModeFlagsKHR::PER_PICTURE_PARTITION;
+
+    /// 1080p in 64x64 blocks is 30 across and 17 down, so a row sweep has 17
+    /// regions to give out and a column sweep 30. A cycle longer than that
+    /// asks for regions the picture does not have.
+    #[test]
+    fn a_sweep_is_bounded_by_the_blocks_in_its_direction() {
+        assert_eq!(refresh_region_limit(ROWS, 1920, 1080, 64), Some(17));
+        assert_eq!(refresh_region_limit(COLUMNS, 1920, 1080, 64), Some(30));
+    }
+
+    /// H.264's 16x16 macroblocks divide the same picture far more finely, which
+    /// is why the same cycle can be legal for one codec and not another on one
+    /// device.
+    #[test]
+    fn a_smaller_block_gives_a_longer_usable_sweep() {
+        assert_eq!(refresh_region_limit(ROWS, 1920, 1080, 16), Some(68));
+        assert_eq!(refresh_region_limit(COLUMNS, 1920, 1080, 16), Some(120));
+    }
+
+    /// Rounded up. 1080 is not a whole number of 64-block rows, and the
+    /// remainder is still a row that has to be refreshed -- rounding down
+    /// would leave a strip that the sweep never reaches.
+    #[test]
+    fn a_partial_block_row_still_counts_as_a_row() {
+        assert_eq!(refresh_region_limit(ROWS, 1920, 1080, 64), Some(17));
+        assert_eq!(refresh_region_limit(ROWS, 1920, 1088, 64), Some(17));
+        assert_eq!(refresh_region_limit(ROWS, 1920, 1089, 64), Some(18));
+    }
+
+    /// Block-based leaves the division to the implementation, so which way it
+    /// sweeps is not knowable here. The smaller of the two bounds is the only
+    /// one safe against both.
+    #[test]
+    fn block_based_takes_the_tighter_of_the_two_directions() {
+        assert_eq!(refresh_region_limit(BLOCKS, 1920, 1080, 64), Some(17));
+        // A tall picture reverses which direction is the tight one.
+        assert_eq!(refresh_region_limit(BLOCKS, 1080, 1920, 64), Some(17));
+    }
+
+    /// Per-picture partition ties regions to the slice or tile layout, which
+    /// is a different bound entirely and not one this controls. No limit is
+    /// claimed rather than a wrong one imposed.
+    #[test]
+    fn a_partition_sweep_has_no_bound_this_can_compute() {
+        assert_eq!(refresh_region_limit(PARTITIONS, 1920, 1080, 64), None);
+    }
+
+    /// A block size of zero cannot come from a real device, but dividing by it
+    /// would panic, and a capability query that returned nothing is exactly
+    /// when that would happen.
+    #[test]
+    fn a_zero_block_size_does_not_divide_by_zero() {
+        assert_eq!(refresh_region_limit(ROWS, 1920, 1080, 0), Some(1080));
+    }
+
+    /// A picture smaller than one block has one region, which is not a sweep.
+    /// The caller refuses at that point; the limit just has to be honest.
+    #[test]
+    fn a_picture_under_one_block_has_a_single_region() {
+        assert_eq!(refresh_region_limit(ROWS, 32, 32, 64), Some(1));
     }
 }
