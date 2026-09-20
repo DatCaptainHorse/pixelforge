@@ -152,7 +152,7 @@ impl H264 {
         // option rather than intra refresh itself: spreading intra blocks to
         // avoid a key-frame burst does not need it, and converging without a
         // key frame does.
-        if config.intra_refresh_cycle.is_some() && config.intra_refresh_recovery {
+        if config.intra_refresh == Some(crate::encoder::IntraRefresh::Recovering) {
             pps_flags.set_constrained_intra_pred_flag(1);
         }
 

@@ -32,6 +32,10 @@ pub const DEFAULT_FRAME_RATE: u32 = 30;
 /// Default GOP (Group of Pictures) size.
 pub const DEFAULT_GOP_SIZE: u32 = 30;
 
+/// The rate-control buffer an encode gets when nothing says otherwise and
+/// nothing about the usage hint suggests a live path.
+pub const DEFAULT_VIRTUAL_BUFFER_MS: u32 = 1000;
+
 /// Default QP (quantization parameter) for H.264.
 pub const DEFAULT_H264_QP: u32 = 26;
 
@@ -185,6 +189,54 @@ impl From<EncodeContentHint> for vk::VideoEncodeContentFlagsKHR {
             EncodeContentHint::Rendered => vk::VideoEncodeContentFlagsKHR::RENDERED,
         }
     }
+}
+
+/// What an intra refresh cycle is being asked to do.
+///
+/// Intra refresh has two halves and they are separable, which is why this is a
+/// choice and not a setting. The first half is nearly free: spreading
+/// intra-coded blocks across a cycle instead of concentrating them in a key
+/// frame, which is what removes the burst. The second is what makes the cycle
+/// a genuine recovery point, and it is not free at all.
+///
+/// The cycle *length* is not part of this. It is derived from the key frame
+/// interval, the device, and how many refresh regions the picture has -- every
+/// input already known, and the one thing a caller could contribute is a value
+/// the picture cannot serve.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum IntraRefresh {
+    /// Spread a key frame's cost evenly across a cycle, and nothing more.
+    ///
+    /// No prediction is restricted, so the stream costs about what it would
+    /// without refresh -- it simply stops arriving in bursts. What it does not
+    /// give is convergence: a decoder joining mid-stream, or one that has lost
+    /// data, is not made correct by the sweep passing over it and still needs
+    /// a key frame.
+    ///
+    /// The default, because a decoder must join on a key frame regardless --
+    /// intra refresh cannot start one -- so a stream that can ask for a key
+    /// frame when it needs one has nothing to gain from paying continuously
+    /// for the alternative.
+    #[default]
+    Smooth,
+    /// Make the cycle a recovery point, at the cost of picture.
+    ///
+    /// A decoder joining anywhere, or recovering from loss, becomes correct
+    /// within one cycle with no key frame at all. Two restrictions buy that:
+    ///
+    ///   * Prediction is limited to already-refreshed regions, so a refreshed
+    ///     region cannot inherit from one that is still stale.
+    ///   * `constrained_intra_pred_flag` is set, so an intra block cannot
+    ///     predict *spatially* from a neighbouring inter block either. Without
+    ///     it the refreshed strip inherits the very content it was meant to
+    ///     replace, and the cycle refreshes nothing.
+    ///
+    /// Both cost compression and at low bitrates the second is brutal:
+    /// measured at 1080p, six megabits looks clean and one megabit collapses
+    /// into blocking, because intra blocks lose the neighbours that made them
+    /// affordable. H.264 and H.265 carry the flag; AV1 has no equivalent
+    /// syntax, so there only the region restriction applies.
+    Recovering,
 }
 
 /// Encoder tuning modes.
@@ -357,31 +409,29 @@ pub struct EncodeConfig {
     /// Controls how much the encoder can deviate from the target bitrate
     /// on a per-frame basis. Smaller values produce more uniform frame
     /// sizes.
-    pub virtual_buffer_size_ms: u32,
+    /// `None` derives it from [`encode_usage_hint`](Self::encode_usage_hint)
+    /// and the frame rate, which is nearly always the better answer: a live
+    /// path wants a few frames of slack and an offline one wants a second.
+    pub virtual_buffer_size_ms: Option<u32>,
     /// Initial VBV buffer fullness in milliseconds.
     /// Controls how much budget the encoder has for IDR/I-frames.
     /// Setting this to 0 constrains IDR frames to the same budget as
     /// P-frames. Setting it equal to `virtual_buffer_size_ms` gives
     /// IDR frames maximum headroom.
-    pub initial_virtual_buffer_size_ms: u32,
-    /// Pictures in one intra refresh cycle, or `None` for periodic key frames.
+    /// `None` follows `virtual_buffer_size_ms`, giving key frames the whole
+    /// buffer to spend.
+    pub initial_virtual_buffer_size_ms: Option<u32>,
+    /// Whether to replace periodic key frames with an intra refresh cycle,
+    /// and what the cycle is for. `None` keeps periodic key frames.
     ///
-    /// Intra refresh replaces the key frame with a cycle: each picture codes
-    /// one slice of the image as intra, and after a full cycle every part has
-    /// been refreshed, so a decoder joining anywhere is correct within one
-    /// cycle. The same recovery, spread evenly.
-    ///
-    /// What it is *for* is that evenness. A key frame is the largest picture a
-    /// stream contains -- measured here at 1080p, up to 141 kB against a 4 kB
-    /// delta frame -- so it is the one the rate control cannot fit and the one
-    /// a network cannot absorb. Sizing the rate-control buffer small enough to
-    /// track a bitrate quickly starves key frames (one came out at 2114 bytes,
-    /// which every picture in the group then predicts from); sizing it large
-    /// enough for key frames makes the encoder slow to obey a new bitrate. A
-    /// stream with no key frames is not subject to that trade.
+    /// The cycle length is not a setting: see [`IntraRefresh`]. It is derived
+    /// from the key frame interval, bounded by what the device allows and by
+    /// how many refresh regions the picture has -- and the picture is usually
+    /// the binding one, which is exactly the bound a caller setting a duration
+    /// in seconds has no way to see.
     ///
     /// Ignored, with a warning, where the device cannot do it.
-    pub intra_refresh_cycle: Option<u32>,
+    pub intra_refresh: Option<IntraRefresh>,
     /// Which shape the refresh regions take, or `None` to let the
     /// implementation decide.
     ///
@@ -397,30 +447,6 @@ pub struct EncodeConfig {
     /// vertical sweep and silently getting a horizontal one would make the
     /// next comparison meaningless.
     pub intra_refresh_mode: Option<IntraRefreshShape>,
-    /// Make the refresh cycle a genuine recovery point, at the cost of picture.
-    ///
-    /// Intra refresh has two halves. One is free: spreading intra-coded blocks
-    /// across a cycle instead of concentrating them in a key frame, which is
-    /// what removes the burst. The other is this, and it is what makes a
-    /// decoder joining mid-cycle -- or recovering from loss without a key
-    /// frame -- actually converge:
-    ///
-    ///   * Prediction is limited to already-refreshed regions, so a refreshed
-    ///     region cannot inherit from one that is still stale.
-    ///   * `constrained_intra_pred_flag` is set, so an intra block cannot
-    ///     predict *spatially* from a neighbouring inter block either. Without
-    ///     it the refreshed strip inherits the very content it was meant to
-    ///     replace, and the cycle refreshes nothing.
-    ///
-    /// Both cost compression, and at low bitrates the second is brutal:
-    /// measured at 1080p, six megabits looks clean and one megabit collapses
-    /// into blocking, because intra blocks lose the neighbours that made them
-    /// affordable.
-    ///
-    /// Off by default. A client that joined with a key frame -- which it must,
-    /// since intra refresh cannot start a decoder -- has nothing to converge
-    /// from and would pay all of that for nothing.
-    pub intra_refresh_recovery: bool,
     /// Color description for VUI signaling.
     /// Defaults to BT.709 (full-range) when `None`.
     pub color_description: Option<ColorDescription>,
@@ -456,11 +482,10 @@ impl EncodeConfig {
             gop_size: DEFAULT_GOP_SIZE,
             b_frame_count: 0, // Start without B-frames for simplicity.
             max_reference_frames: DEFAULT_MAX_REFERENCE_FRAMES,
-            intra_refresh_cycle: None,
+            intra_refresh: None,
             intra_refresh_mode: None,
-            intra_refresh_recovery: false,
-            virtual_buffer_size_ms: 1000,
-            initial_virtual_buffer_size_ms: 1000,
+            virtual_buffer_size_ms: None,
+            initial_virtual_buffer_size_ms: None,
             color_description: None,
             rgb_input: None,
             encode_usage_hint: EncodeUsageHint::Default,
@@ -489,11 +514,10 @@ impl EncodeConfig {
             gop_size: DEFAULT_GOP_SIZE,
             b_frame_count: 0, // Start without B-frames for simplicity.
             max_reference_frames: DEFAULT_MAX_REFERENCE_FRAMES,
-            intra_refresh_cycle: None,
+            intra_refresh: None,
             intra_refresh_mode: None,
-            intra_refresh_recovery: false,
-            virtual_buffer_size_ms: 1000,
-            initial_virtual_buffer_size_ms: 1000,
+            virtual_buffer_size_ms: None,
+            initial_virtual_buffer_size_ms: None,
             color_description: None,
             rgb_input: None,
             encode_usage_hint: EncodeUsageHint::Default,
@@ -522,11 +546,10 @@ impl EncodeConfig {
             gop_size: DEFAULT_GOP_SIZE,
             b_frame_count: 0, // Start without B-frames for simplicity.
             max_reference_frames: DEFAULT_MAX_REFERENCE_FRAMES,
-            intra_refresh_cycle: None,
+            intra_refresh: None,
             intra_refresh_mode: None,
-            intra_refresh_recovery: false,
-            virtual_buffer_size_ms: 1000,
-            initial_virtual_buffer_size_ms: 1000,
+            virtual_buffer_size_ms: None,
+            initial_virtual_buffer_size_ms: None,
             color_description: None,
             rgb_input: None,
             encode_usage_hint: EncodeUsageHint::Default,
@@ -608,16 +631,35 @@ impl EncodeConfig {
         self
     }
 
-    /// Set the VBV/HRD virtual buffer size in milliseconds.
-    /// Smaller values produce more uniform frame sizes at the cost of
-    /// quality variation during scene changes.
-    /// Encode with intra refresh over `cycle` pictures instead of key frames.
+    /// The rate-control buffer this encode will actually use, in milliseconds.
     ///
-    /// A cycle length is a trade between how quickly a decoder joining the
-    /// stream becomes correct and how much of each picture is intra-coded: a
-    /// short cycle recovers fast and costs bitrate, a long one the reverse.
-    pub fn with_intra_refresh(mut self, cycle: Option<u32>) -> Self {
-        self.intra_refresh_cycle = cycle.filter(|c| *c > 1);
+    /// What the caller set, or what the usage hint and frame rate imply.
+    pub fn resolved_virtual_buffer_ms(&self) -> u32 {
+        self.virtual_buffer_size_ms.unwrap_or_else(|| {
+            crate::encoder::codec::default_virtual_buffer_ms(
+                self.encode_usage_hint,
+                self.frame_rate_numerator,
+                self.frame_rate_denominator,
+            )
+        })
+    }
+
+    /// The initial buffer fullness this encode will actually use.
+    ///
+    /// Follows the buffer size unless the caller said otherwise, which gives a
+    /// key frame the whole buffer to spend -- the alternative holds it to a
+    /// P-frame's budget, and a starved key frame is one every picture in the
+    /// group then predicts from.
+    pub fn resolved_initial_virtual_buffer_ms(&self) -> u32 {
+        self.initial_virtual_buffer_size_ms
+            .unwrap_or_else(|| self.resolved_virtual_buffer_ms())
+    }
+
+    /// Replace periodic key frames with an intra refresh cycle, or `None` to
+    /// keep them. See [`IntraRefresh`] for what the two variants buy, and the
+    /// field for why the cycle length is not an argument here.
+    pub fn with_intra_refresh(mut self, refresh: Option<IntraRefresh>) -> Self {
+        self.intra_refresh = refresh;
         self
     }
 
@@ -627,22 +669,21 @@ impl EncodeConfig {
         self
     }
 
-    /// Make the cycle a real recovery point, at the cost of picture; see the
-    /// field.
-    pub fn with_intra_refresh_recovery(mut self, limit: bool) -> Self {
-        self.intra_refresh_recovery = limit;
-        self
-    }
-
+    /// Set the VBV/HRD virtual buffer size in milliseconds.
+    ///
+    /// Smaller values produce more uniform frame sizes at the cost of quality
+    /// variation during scene changes. Leaving it unset derives it from the
+    /// usage hint and the frame rate, which is what most callers want -- see
+    /// the field.
     pub fn with_virtual_buffer_size_ms(mut self, ms: u32) -> Self {
-        self.virtual_buffer_size_ms = ms;
+        self.virtual_buffer_size_ms = Some(ms);
         self
     }
 
     /// Set the initial VBV buffer fullness in milliseconds.
     /// Use 0 to tightly constrain IDR/I-frame sizes.
     pub fn with_initial_virtual_buffer_size_ms(mut self, ms: u32) -> Self {
-        self.initial_virtual_buffer_size_ms = ms;
+        self.initial_virtual_buffer_size_ms = Some(ms);
         self
     }
 

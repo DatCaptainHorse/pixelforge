@@ -24,7 +24,10 @@ use crate::encoder::resources::{
     create_dpb_images, destroy_encoder_resources, get_video_format, lcm,
     query_supported_video_formats, upload_image_to_input,
 };
-use crate::encoder::{ColorDescription, EncodeConfig, FrameType, RateControlMode};
+use crate::encoder::{
+    ColorDescription, DEFAULT_VIRTUAL_BUFFER_MS, EncodeConfig, EncodeUsageHint, FrameType,
+    IntraRefresh, RateControlMode,
+};
 use crate::error::{PixelForgeError, Result};
 use crate::sync::TimelinePoint;
 use crate::vulkan::VideoContext;
@@ -670,6 +673,65 @@ impl IntraRefreshState {
     }
 }
 
+/// Frames of rate-control buffer a latency-sensitive encode gets.
+///
+/// Expressed in frames rather than milliseconds because that is the unit the
+/// trade is actually in: the buffer is how far ahead of the target the encoder
+/// may run before it has to correct, and "far" is counted in pictures. A fixed
+/// millisecond figure means something different at 30 fps than at 144.
+const STREAMING_VBV_FRAMES: u32 = 4;
+
+/// The rate-control buffer to use when the caller did not name one.
+///
+/// Taken from the usage hint, which is the caller already having said what the
+/// stream is for. A large buffer lets a scene change be coded properly and
+/// makes the encoder slow to obey a new bitrate; a small one does the reverse.
+/// Neither is right in general, but each is clearly right for one of the two
+/// things a hint distinguishes: nothing is watching an offline encode in real
+/// time, and everything is watching a live one.
+pub(crate) fn default_virtual_buffer_ms(
+    hint: EncodeUsageHint,
+    fps_numerator: u32,
+    fps_denominator: u32,
+) -> u32 {
+    match hint {
+        EncodeUsageHint::Streaming | EncodeUsageHint::Conferencing => {
+            let num = fps_numerator.max(1) as u64;
+            let den = fps_denominator.max(1) as u64;
+            // Rounded up: a buffer of four frames that does not quite hold four
+            // frames is the one result this must not produce, and truncation
+            // gives exactly that wherever the rate divides unevenly.
+            let ms = (STREAMING_VBV_FRAMES as u64 * 1000 * den).div_ceil(num);
+            ms.clamp(1, u32::MAX as u64) as u32
+        }
+        _ => DEFAULT_VIRTUAL_BUFFER_MS,
+    }
+}
+
+/// The intra refresh cycle to run, in pictures.
+///
+/// Derived rather than configured, because every input to it is already known
+/// and the one thing a caller could add is an error. The cycle replaces the
+/// key frame interval, so it inherits it -- which keeps the recovery period
+/// from quietly changing when refresh is turned on -- and is then bounded by
+/// what the device allows and by how many refresh regions the picture actually
+/// has. In practice the picture is the binding one: a four-second interval at
+/// 60 fps is 240 pictures against the 17 CTB rows of a 1080p H.265 frame.
+///
+/// `gop_size` of zero or `u32::MAX` both mean no periodic key frames, and so
+/// no interval to inherit; the remaining bounds decide.
+fn derived_cycle(gop_size: u32, device_max: u32, region_limit: Option<u32>) -> u32 {
+    let bound = device_max.min(region_limit.unwrap_or(u32::MAX));
+    let wanted = if gop_size == 0 || gop_size == u32::MAX {
+        bound
+    } else {
+        gop_size
+    };
+    // Two is the shortest thing that is a cycle: one region refreshed in one
+    // picture is a key frame with extra steps.
+    wanted.min(bound).max(2)
+}
+
 /// The CTB size to reckon refresh regions in, from what the device offers.
 ///
 /// The largest offered, deliberately. It gives the fewest regions, and the
@@ -755,7 +817,7 @@ pub(crate) fn resolve_intra_refresh(
     refresh_block: u32,
     active_reference_pictures: u32,
 ) -> Option<IntraRefreshState> {
-    let cycle = config.intra_refresh_cycle?;
+    let refresh = config.intra_refresh?;
     debug!(
         "intra refresh caps: modes {:?}, max cycle {}, max active refs {}",
         caps.modes, caps.max_cycle_duration, caps.max_active_reference_pictures
@@ -879,29 +941,26 @@ pub(crate) fn resolve_intra_refresh(
         );
         return None;
     }
-    let cycle_duration = cycle.clamp(2, bound);
-    if cycle_duration != cycle {
-        match region_limit {
-            // Named apart because they mean different things to whoever reads
-            // it: the device bound is a property of the hardware, the region
-            // bound a property of this resolution and codec, and only the
-            // second one moves when the stream is reconfigured.
-            Some(limit) if limit < caps.max_cycle_duration => debug!(
-                "intra refresh cycle {cycle} exceeds the {limit} refresh region(s) a \
-                 {}x{} picture has under {mode:?}; using {cycle_duration}",
-                config.dimensions.width, config.dimensions.height,
-            ),
-            _ => debug!(
-                "intra refresh cycle {cycle} exceeds the device maximum {}; using {cycle_duration}",
-                caps.max_cycle_duration
-            ),
-        }
-    }
-    debug!("intra refresh on: {cycle_duration} pictures per cycle, mode {mode:?}");
+    let cycle_duration = derived_cycle(config.gop_size, caps.max_cycle_duration, region_limit);
+    // Both bounds named, because they mean different things to whoever reads
+    // it: the device one is a property of the hardware, the region one a
+    // property of this resolution and codec, and only the second moves when
+    // the stream is reconfigured.
+    debug!(
+        "intra refresh on: {cycle_duration} pictures per cycle, mode {mode:?}, {refresh:?} \
+         (key frame interval {}, device allows {}, a {}x{} picture has {} region(s))",
+        config.gop_size,
+        caps.max_cycle_duration,
+        config.dimensions.width,
+        config.dimensions.height,
+        region_limit
+            .map(|l| l.to_string())
+            .unwrap_or_else(|| "an unknowable number of".to_string()),
+    );
     Some(IntraRefreshState {
         cycle_duration,
         index: 0,
-        restrict_prediction: config.intra_refresh_recovery,
+        restrict_prediction: refresh == IntraRefresh::Recovering,
         mode,
     })
 }
@@ -1283,7 +1342,7 @@ pub(crate) fn build_encoder_common(req: &CommonInitRequest) -> Result<CommonInit
     // is restricted to a reference's already-refreshed regions, so only the
     // preceding picture is usefully referenceable. The references given up
     // here were going to contribute nothing and cost DPB memory for it.
-    if config.intra_refresh_cycle.is_some()
+    if config.intra_refresh.is_some()
         && context.has_video_encode_intra_refresh()
         && req.intra_refresh_caps.modes != vk::VideoEncodeIntraRefreshModeFlagsKHR::NONE
     {
@@ -1702,5 +1761,113 @@ mod intra_refresh_cycle_tests {
     #[test]
     fn a_picture_under_one_block_has_a_single_region() {
         assert_eq!(refresh_region_limit(ROWS, 32, 32, 64), Some(1));
+    }
+}
+
+#[cfg(test)]
+mod derived_cycle_tests {
+    use super::*;
+
+    /// The cycle replaces the key frame interval, so that is what it inherits
+    /// when the picture is fine enough to serve it.
+    #[test]
+    fn a_short_key_frame_interval_becomes_the_cycle() {
+        assert_eq!(derived_cycle(30, 256, Some(68)), 30);
+    }
+
+    /// And the picture wins when it is not. A 1080p H.265 picture has 17 CTB
+    /// rows, so a four-second key frame interval at 60 fps -- 240 pictures --
+    /// is served by 17, not by the 256 the device would allow.
+    #[test]
+    fn the_picture_bounds_a_long_key_frame_interval() {
+        assert_eq!(derived_cycle(240, 256, Some(17)), 17);
+        assert_eq!(derived_cycle(240, 256, Some(68)), 68);
+    }
+
+    #[test]
+    fn the_device_bounds_it_when_the_device_is_the_tighter_one() {
+        assert_eq!(derived_cycle(240, 12, Some(68)), 12);
+    }
+
+    /// A stream that emits no periodic key frames has no interval to inherit.
+    /// Vulkan spells that infinite as UINT32_MAX and this crate also accepts
+    /// zero from a caller that meant the same thing; either way the remaining
+    /// bounds decide.
+    #[test]
+    fn no_key_frame_interval_falls_back_to_the_bounds() {
+        assert_eq!(derived_cycle(u32::MAX, 256, Some(17)), 17);
+        assert_eq!(derived_cycle(0, 256, Some(17)), 17);
+        assert_eq!(derived_cycle(0, 12, None), 12);
+    }
+
+    /// Two is the shortest thing that is a cycle: one region refreshed in one
+    /// picture is a key frame with extra steps.
+    #[test]
+    fn a_cycle_never_comes_out_below_two() {
+        assert_eq!(derived_cycle(1, 256, Some(68)), 2);
+        assert_eq!(derived_cycle(0, 256, Some(1)), 2);
+    }
+}
+
+#[cfg(test)]
+mod virtual_buffer_tests {
+    use super::*;
+
+    /// A streaming hint means a path with a latency budget, and a rate-control
+    /// buffer is latency: the encoder may run that far ahead of the target
+    /// before it has to correct. Four frames, so the figure tracks the frame
+    /// rate rather than fixing a millisecond count that means something
+    /// different at 30 fps than at 144.
+    #[test]
+    fn a_streaming_hint_buys_a_few_frames_of_slack() {
+        assert_eq!(
+            default_virtual_buffer_ms(EncodeUsageHint::Streaming, 60, 1),
+            67
+        );
+        assert_eq!(
+            default_virtual_buffer_ms(EncodeUsageHint::Streaming, 30, 1),
+            134
+        );
+        assert_eq!(
+            default_virtual_buffer_ms(EncodeUsageHint::Conferencing, 60, 1),
+            67
+        );
+    }
+
+    /// Rounded up. A buffer of four frames that does not quite hold four
+    /// frames is the one result this must not produce, and truncation gives
+    /// exactly that wherever the frame rate does not divide a millisecond
+    /// evenly -- 4 frames at 90 fps is 44.4 ms, and 44 is three frames and
+    /// change.
+    #[test]
+    fn a_frame_rate_that_divides_unevenly_rounds_up() {
+        assert_eq!(
+            default_virtual_buffer_ms(EncodeUsageHint::Streaming, 90, 1),
+            45
+        );
+        assert_eq!(
+            default_virtual_buffer_ms(EncodeUsageHint::Streaming, 60000, 1001),
+            67
+        );
+    }
+
+    /// Nothing is watching an offline encode in real time, so the buffer is
+    /// free to be large, and large is what gets a scene change coded properly.
+    #[test]
+    fn an_offline_hint_keeps_the_generous_buffer() {
+        for hint in [
+            EncodeUsageHint::Recording,
+            EncodeUsageHint::Transcoding,
+            EncodeUsageHint::Default,
+        ] {
+            assert_eq!(default_virtual_buffer_ms(hint, 60, 1), 1000, "{hint:?}");
+        }
+    }
+
+    /// A frame rate of zero cannot come from a sane caller, but it can come
+    /// from an uninitialised one, and dividing by it would panic.
+    #[test]
+    fn a_zero_frame_rate_does_not_divide_by_zero() {
+        assert!(default_virtual_buffer_ms(EncodeUsageHint::Streaming, 0, 0) > 0);
     }
 }

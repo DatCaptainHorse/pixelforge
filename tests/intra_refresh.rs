@@ -21,8 +21,8 @@
 //! `cargo test --test intra_refresh -- --ignored --nocapture`.
 
 use pixelforge::{
-    Codec, EncodeBitDepth, EncodeConfig, Encoder, InputImage, PixelFormat, RateControlMode,
-    VideoContextBuilder,
+    Codec, EncodeBitDepth, EncodeConfig, Encoder, InputImage, IntraRefresh, PixelFormat,
+    RateControlMode, VideoContextBuilder,
 };
 use std::collections::VecDeque;
 
@@ -45,11 +45,18 @@ fn frames() -> u64 {
         .unwrap_or(180)
 }
 const GOP_FRAMES: u32 = 30;
-fn refresh_cycle() -> u32 {
-    std::env::var("PIXELFORGE_CYCLE")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(30)
+
+/// Which of the two refresh features to exercise.
+///
+/// The cycle length is no longer a knob -- it is derived from `GOP_FRAMES`,
+/// the device, and how many refresh regions the picture has -- so what is left
+/// to choose is what the cycle is *for*.
+fn refresh_mode() -> IntraRefresh {
+    if std::env::var("PIXELFORGE_LIMIT_PREDICTION").is_ok() {
+        IntraRefresh::Recovering
+    } else {
+        IntraRefresh::Smooth
+    }
 }
 fn bitrate_bps() -> u32 {
     std::env::var("PIXELFORGE_BITRATE")
@@ -108,7 +115,7 @@ fn run_codec(
     codec: Codec,
     clip: &[u8],
     frame_size: usize,
-    refresh: Option<u32>,
+    refresh: Option<IntraRefresh>,
     max_refs: u32,
 ) -> Result<Run, Box<dyn std::error::Error>> {
     let config = match codec {
@@ -125,7 +132,6 @@ fn run_codec(
     .with_bit_depth(EncodeBitDepth::Eight)
     .with_gop_size(GOP_FRAMES)
     .with_intra_refresh(refresh)
-    .with_intra_refresh_recovery(std::env::var("PIXELFORGE_LIMIT_PREDICTION").is_ok())
     .with_max_reference_frames(max_refs)
     .with_b_frames(0);
 
@@ -224,7 +230,7 @@ fn intra_refresh_replaces_key_frames_and_evens_out_the_stream()
         // The same clip, the same bitrate, the same everything but refresh, so
         // the comparison is of one variable.
         let plain = run_codec(&context, codec, &clip, frame_size, None, 2)?;
-        let refreshed = run_codec(&context, codec, &clip, frame_size, Some(refresh_cycle()), 2)?;
+        let refreshed = run_codec(&context, codec, &clip, frame_size, Some(refresh_mode()), 2)?;
         // Refresh clamps active references to what the device allows under it
         // (one, here), so a fair comparison needs the control clamped too --
         // otherwise this measures the reference count and calls it refresh.
@@ -253,15 +259,7 @@ fn intra_refresh_replaces_key_frames_and_evens_out_the_stream()
             println!("  wrote {name} ({} bytes)", plain.stream.len());
         }
         if !refreshed.stream.is_empty() {
-            let name = format!(
-                "dump_{codec:?}_cycle{}{}.bin",
-                refresh_cycle(),
-                if std::env::var("PIXELFORGE_LIMIT_PREDICTION").is_ok() {
-                    "_limited"
-                } else {
-                    ""
-                }
-            );
+            let name = format!("dump_{codec:?}_refresh_{:?}.bin", refresh_mode());
             std::fs::write(&name, &refreshed.stream).expect("write dump");
             println!("  wrote {name} ({} bytes)", refreshed.stream.len());
         }
