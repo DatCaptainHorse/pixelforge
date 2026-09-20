@@ -28,10 +28,35 @@ use std::collections::VecDeque;
 
 const WIDTH: u32 = 1280;
 const HEIGHT: u32 = 720;
-const FRAMES: u64 = 180;
+fn frames() -> u64 {
+    std::env::var("PIXELFORGE_FRAMES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(180)
+}
 const GOP_FRAMES: u32 = 30;
-const REFRESH_CYCLE: u32 = 30;
-const BITRATE_BPS: u32 = 4_000_000;
+fn refresh_cycle() -> u32 {
+    std::env::var("PIXELFORGE_CYCLE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(30)
+}
+fn bitrate_bps() -> u32 {
+    std::env::var("PIXELFORGE_BITRATE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(4_000_000)
+}
+
+/// Rate-control buffer, to match what the caller actually runs. nescapture
+/// sizes this in frames and runs it as low as one, which is a different
+/// encoder to the 1000 ms default this test used to measure.
+fn vbv_ms() -> u32 {
+    std::env::var("PIXELFORGE_VBV_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1000)
+}
 
 const DEFAULT_CLIP: &str = "testdata/cp2077_1280x720_yuv420p.yuv";
 
@@ -45,6 +70,9 @@ fn load_clip() -> Option<(Vec<u8>, usize)> {
 struct Run {
     sizes: Vec<usize>,
     keyframes: usize,
+    /// The bitstream itself, kept only when it is going to be written out.
+    /// Looking at the picture is the only way to judge a visible artifact.
+    stream: Vec<u8>,
 }
 
 impl Run {
@@ -79,7 +107,9 @@ fn run_codec(
         Codec::AV1 => EncodeConfig::av1(WIDTH, HEIGHT),
     }
     .with_rate_control(RateControlMode::Cbr)
-    .with_target_bitrate(BITRATE_BPS)
+    .with_target_bitrate(bitrate_bps())
+    .with_virtual_buffer_size_ms(vbv_ms())
+    .with_initial_virtual_buffer_size_ms(vbv_ms())
     .with_frame_rate(60, 1)
     .with_pixel_format(PixelFormat::Yuv420)
     .with_bit_depth(EncodeBitDepth::Eight)
@@ -99,9 +129,11 @@ fn run_codec(
     )?;
 
     let mut pending: VecDeque<pixelforge::EncodeFuture> = VecDeque::new();
+    let dumping = std::env::var("PIXELFORGE_DUMP").is_ok();
     let mut run = Run {
         sizes: Vec::new(),
         keyframes: 0,
+        stream: Vec::new(),
     };
     let frames_in_clip = clip.len() / frame_size;
 
@@ -110,13 +142,29 @@ fn run_codec(
      -> Result<(), Box<dyn std::error::Error>> {
         let p = pollster::block_on(pending.pop_front().unwrap())?;
         run.sizes.push(p.data.len());
+        if dumping {
+            run.stream.extend_from_slice(&p.data);
+        }
         if p.is_key_frame {
             run.keyframes += 1;
         }
         Ok(())
     };
 
-    for i in 0..FRAMES {
+    // The live path retunes about once a second. Rate control is session
+    // state re-issued through a coding-control command, and so is intra
+    // refresh -- so whether one disturbs the other is a real question and not
+    // one the spec answers.
+    let retune = std::env::var("PIXELFORGE_RETUNE").is_ok();
+    for i in 0..frames() {
+        if retune && i > 0 && i % 60 == 0 {
+            let bps = if (i / 60) % 2 == 0 {
+                bitrate_bps()
+            } else {
+                bitrate_bps() / 2
+            };
+            encoder.set_target_bitrate(bps)?;
+        }
         let start = (i as usize % frames_in_clip) * frame_size;
         let image = encoder.input_image();
         input_image.upload_yuv420_to(image, &clip[start..start + frame_size])?;
@@ -165,7 +213,7 @@ fn intra_refresh_replaces_key_frames_and_evens_out_the_stream()
         // The same clip, the same bitrate, the same everything but refresh, so
         // the comparison is of one variable.
         let plain = run_codec(&context, codec, &clip, frame_size, None, 2)?;
-        let refreshed = run_codec(&context, codec, &clip, frame_size, Some(REFRESH_CYCLE), 2)?;
+        let refreshed = run_codec(&context, codec, &clip, frame_size, Some(refresh_cycle()), 2)?;
         // Refresh clamps active references to what the device allows under it
         // (one, here), so a fair comparison needs the control clamped too --
         // otherwise this measures the reference count and calls it refresh.
@@ -188,6 +236,16 @@ fn intra_refresh_replaces_key_frames_and_evens_out_the_stream()
                 .collect::<Vec<_>>()
                 .join(" ")
         };
+        if !plain.stream.is_empty() {
+            let name = format!("dump_{codec:?}_plain.bin");
+            std::fs::write(&name, &plain.stream).expect("write dump");
+            println!("  wrote {name} ({} bytes)", plain.stream.len());
+        }
+        if !refreshed.stream.is_empty() {
+            let name = format!("dump_{codec:?}_cycle{}.bin", refresh_cycle());
+            std::fs::write(&name, &refreshed.stream).expect("write dump");
+            println!("  wrote {name} ({} bytes)", refreshed.stream.len());
+        }
         println!("  {codec:?} plain    largest: {}", top(&plain));
         println!("  {codec:?} refresh  largest: {}", top(&refreshed));
         println!(
