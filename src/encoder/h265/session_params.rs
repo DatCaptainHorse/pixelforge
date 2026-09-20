@@ -270,13 +270,32 @@ impl H265 {
             pProfileTierLevel: profile_tier_level_boxed.as_ref(),
         };
 
-        let pps_flags = ash::vk::native::StdVideoH265PpsFlags {
+        let mut pps_flags = ash::vk::native::StdVideoH265PpsFlags {
             _bitfield_align_1: [],
             _bitfield_1: ash::vk::native::StdVideoH265PpsFlags::new_bitfield_1(
                 0, 0, 0, 1, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
                 0, 0, 0,
             ),
         };
+        // Intra refresh needs this, and only intra refresh. It forbids an
+        // intra-coded block from predicting spatially from neighbouring
+        // *inter*-coded blocks -- which during a refresh cycle are precisely
+        // the regions not yet refreshed. Without it the refreshed strip
+        // predicts from the stale content it was meant to replace, so the
+        // refresh never actually converges and its boundary stays visible at
+        // any bitrate, buffer size or cycle length.
+        //
+        // It costs compression, because intra blocks lose neighbours they
+        // could otherwise have used -- at 1080p and one megabit, enough to
+        // collapse the picture into blocking. So it follows the recovery
+        // option rather than intra refresh itself: spreading intra blocks to
+        // avoid a key-frame burst does not need it, and converging without a
+        // key frame does.
+        // Set by name rather than by position in the bitfield above, where
+        // thirty-one ordered zeroes and ones are not something to count.
+        if config.intra_refresh_cycle.is_some() && config.intra_refresh_recovery {
+            pps_flags.set_constrained_intra_pred_flag(1);
+        }
 
         let pps = ash::vk::native::StdVideoH265PictureParameterSet {
             flags: pps_flags,
