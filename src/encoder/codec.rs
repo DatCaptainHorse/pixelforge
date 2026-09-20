@@ -593,6 +593,8 @@ pub(crate) struct IntraRefreshCaps {
     pub modes: vk::VideoEncodeIntraRefreshModeFlagsKHR,
     pub max_cycle_duration: u32,
     pub max_active_reference_pictures: u32,
+    pub partition_independent_refresh_regions: u32,
+    pub non_rectangular_refresh_regions: u32,
 }
 
 /// Intra refresh as it will actually be used, once the device has been asked.
@@ -790,23 +792,6 @@ pub(crate) fn resolve_intra_refresh(
         debug!(
             "intra refresh cycle {cycle} exceeds the device maximum {}; using {cycle_duration}",
             caps.max_cycle_duration
-        );
-    }
-    if config.codec == crate::encoder::Codec::AV1 {
-        // Measured on RADV (Mesa 26.3.0-devel, RDNA4): AV1 encoded with intra
-        // refresh produces a bitstream dav1d rejects from the first inter
-        // picture onward -- 240 frames decode without refresh, one with it.
-        // Not the error resilience the spec asks for on a cycle's first
-        // picture (removing it changes nothing) and not the compound
-        // prediction VUID (this encodes single-reference), while H.264 and
-        // H.265 through the same code produce valid streams.
-        //
-        // Said rather than refused: the combination may work on another
-        // driver, and refusing here would hide it from whoever is in a
-        // position to find out.
-        warn!(
-            "intra refresh with AV1 has been seen to produce an undecodable stream on RADV; \
-             check the output before relying on it"
         );
     }
     debug!("intra refresh on: {cycle_duration} pictures per cycle, mode {mode:?}");

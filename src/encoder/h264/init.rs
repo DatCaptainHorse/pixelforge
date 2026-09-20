@@ -93,6 +93,10 @@ impl H264 {
             max_cycle_duration: intra_refresh_caps.max_intra_refresh_cycle_duration,
             max_active_reference_pictures: intra_refresh_caps
                 .max_intra_refresh_active_reference_pictures,
+            partition_independent_refresh_regions: intra_refresh_caps
+                .partition_independent_intra_refresh_regions,
+            non_rectangular_refresh_regions: intra_refresh_caps
+                .non_rectangular_intra_refresh_regions,
         };
         crate::encoder::codec::warn_unsupported_rate_control(
             &config,
