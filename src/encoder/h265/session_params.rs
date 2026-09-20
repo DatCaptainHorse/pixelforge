@@ -293,7 +293,7 @@ impl H265 {
         // key frame does.
         // Set by name rather than by position in the bitfield above, where
         // thirty-one ordered zeroes and ones are not something to count.
-        if config.intra_refresh_cycle.is_some() && config.intra_refresh_recovery {
+        if config.intra_refresh == Some(crate::encoder::IntraRefresh::Recovering) {
             pps_flags.set_constrained_intra_pred_flag(1);
         }
 

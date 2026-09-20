@@ -439,8 +439,10 @@ impl H265 {
         if !rc.is_disabled() {
             rc_info = rc_info
                 .layers(&rc_layers)
-                .virtual_buffer_size_in_ms(common.config.virtual_buffer_size_ms)
-                .initial_virtual_buffer_size_in_ms(common.config.initial_virtual_buffer_size_ms);
+                .virtual_buffer_size_in_ms(common.config.resolved_virtual_buffer_ms())
+                .initial_virtual_buffer_size_in_ms(
+                    common.config.resolved_initial_virtual_buffer_ms(),
+                );
         }
 
         // Reset and write start timestamp
