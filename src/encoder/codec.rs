@@ -698,7 +698,20 @@ pub(crate) fn resolve_intra_refresh(
         vk::VideoEncodeIntraRefreshModeFlagsKHR::PER_PICTURE_PARTITION,
     ]
     .into_iter()
-    .find(|m| caps.modes.contains(*m))?;
+    .find(|m| caps.modes.contains(*m));
+    let Some(mode) = mode else {
+        // Said, not swallowed. The device advertises the extension per device
+        // and the modes per *profile*, so one codec having intra refresh says
+        // nothing about another: measured on RADV, H.265 offers a mode and
+        // H.264 and AV1 offer none. Declining quietly leaves a stream still
+        // emitting key frames while its caller believes it is not, and the
+        // only visible difference is a burst nobody is expecting.
+        warn!(
+            "intra refresh requested, but {:?} offers no refresh mode on this device; using key frames",
+            config.codec
+        );
+        return None;
+    };
 
     // A device may support fewer active references under intra refresh than
     // it does otherwise. Exceeding it is invalid usage, and invalid usage in
@@ -1107,6 +1120,26 @@ pub(crate) fn build_encoder_common(req: &CommonInitRequest) -> Result<CommonInit
     let mut target_active_refs = (config.max_reference_frames as usize)
         .min(max_active_supported)
         .min(req.max_active_refs_cap);
+    // A device may allow fewer active references under intra refresh than
+    // otherwise -- measured on RADV, one for H.264 and AV1 -- and exceeding it
+    // is invalid usage. Clamped rather than treated as a conflict, because
+    // refresh cannot use the extra ones regardless: inside a cycle, prediction
+    // is restricted to a reference's already-refreshed regions, so only the
+    // preceding picture is usefully referenceable. The references given up
+    // here were going to contribute nothing and cost DPB memory for it.
+    if config.intra_refresh_cycle.is_some()
+        && context.has_video_encode_intra_refresh()
+        && req.intra_refresh_caps.modes != vk::VideoEncodeIntraRefreshModeFlagsKHR::NONE
+    {
+        let allowed = req.intra_refresh_caps.max_active_reference_pictures as usize;
+        if allowed >= 1 && allowed < target_active_refs {
+            debug!(
+                "intra refresh allows {allowed} active reference picture(s), not \
+                 {target_active_refs}; using {allowed}"
+            );
+            target_active_refs = allowed;
+        }
+    }
     if target_active_refs < 1 && max_active_supported >= 1 {
         target_active_refs = 1;
     }
@@ -1396,7 +1429,10 @@ mod intra_refresh_tests {
     #[test]
     fn the_first_picture_of_a_cycle_is_recognisable() {
         let mut ir = state(3, 1);
-        assert!(ir.starts_cycle(), "a fresh cycle starts at its first picture");
+        assert!(
+            ir.starts_cycle(),
+            "a fresh cycle starts at its first picture"
+        );
         ir.advance();
         assert!(!ir.starts_cycle());
         ir.advance();
