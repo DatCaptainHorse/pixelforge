@@ -474,11 +474,7 @@ impl Av1 {
         }
 
         let future = common.submit_frame();
-        crate::encoder::codec::intra_refresh_committed(
-            common,
-            common.current_dpb_slot as usize,
-            is_key_frame,
-        );
+        crate::encoder::codec::intra_refresh_committed(common, is_key_frame);
         future
     }
 

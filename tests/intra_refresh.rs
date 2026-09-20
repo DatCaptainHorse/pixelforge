@@ -26,8 +26,18 @@ use pixelforge::{
 };
 use std::collections::VecDeque;
 
-const WIDTH: u32 = 1280;
-const HEIGHT: u32 = 720;
+fn width() -> u32 {
+    std::env::var("PIXELFORGE_W")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1280)
+}
+fn height() -> u32 {
+    std::env::var("PIXELFORGE_H")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(720)
+}
 fn frames() -> u64 {
     std::env::var("PIXELFORGE_FRAMES")
         .ok()
@@ -63,7 +73,7 @@ const DEFAULT_CLIP: &str = "testdata/cp2077_1280x720_yuv420p.yuv";
 fn load_clip() -> Option<(Vec<u8>, usize)> {
     let path = std::env::var("PIXELFORGE_TEST_CLIP").unwrap_or_else(|_| DEFAULT_CLIP.into());
     let bytes = std::fs::read(&path).ok()?;
-    let frame_size = (WIDTH as usize * HEIGHT as usize * 3) / 2;
+    let frame_size = (width() as usize * height() as usize * 3) / 2;
     (bytes.len() >= frame_size).then_some((bytes, frame_size))
 }
 
@@ -102,9 +112,9 @@ fn run_codec(
     max_refs: u32,
 ) -> Result<Run, Box<dyn std::error::Error>> {
     let config = match codec {
-        Codec::H264 => EncodeConfig::h264(WIDTH, HEIGHT),
-        Codec::H265 => EncodeConfig::h265(WIDTH, HEIGHT),
-        Codec::AV1 => EncodeConfig::av1(WIDTH, HEIGHT),
+        Codec::H264 => EncodeConfig::h264(width(), height()),
+        Codec::H265 => EncodeConfig::h265(width(), height()),
+        Codec::AV1 => EncodeConfig::av1(width(), height()),
     }
     .with_rate_control(RateControlMode::Cbr)
     .with_target_bitrate(bitrate_bps())
@@ -115,6 +125,7 @@ fn run_codec(
     .with_bit_depth(EncodeBitDepth::Eight)
     .with_gop_size(GOP_FRAMES)
     .with_intra_refresh(refresh)
+    .with_intra_refresh_limit_prediction(std::env::var("PIXELFORGE_LIMIT_PREDICTION").is_ok())
     .with_max_reference_frames(max_refs)
     .with_b_frames(0);
 
@@ -122,8 +133,8 @@ fn run_codec(
     let mut input_image = InputImage::new(
         context.clone(),
         codec,
-        WIDTH,
-        HEIGHT,
+        width(),
+        height(),
         EncodeBitDepth::Eight,
         PixelFormat::Yuv420,
     )?;
@@ -242,7 +253,15 @@ fn intra_refresh_replaces_key_frames_and_evens_out_the_stream()
             println!("  wrote {name} ({} bytes)", plain.stream.len());
         }
         if !refreshed.stream.is_empty() {
-            let name = format!("dump_{codec:?}_cycle{}.bin", refresh_cycle());
+            let name = format!(
+                "dump_{codec:?}_cycle{}{}.bin",
+                refresh_cycle(),
+                if std::env::var("PIXELFORGE_LIMIT_PREDICTION").is_ok() {
+                    "_limited"
+                } else {
+                    ""
+                }
+            );
             std::fs::write(&name, &refreshed.stream).expect("write dump");
             println!("  wrote {name} ({} bytes)", refreshed.stream.len());
         }
