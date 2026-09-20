@@ -702,14 +702,48 @@ pub(crate) fn resolve_intra_refresh(
     // offers one without the general bit. Per-picture partition is last: it
     // ties the refresh region to the slice layout, which is a separate
     // decision this does not control.
-    let mode = [
-        vk::VideoEncodeIntraRefreshModeFlagsKHR::BLOCK_BASED,
-        vk::VideoEncodeIntraRefreshModeFlagsKHR::BLOCK_ROW_BASED,
-        vk::VideoEncodeIntraRefreshModeFlagsKHR::BLOCK_COLUMN_BASED,
-        vk::VideoEncodeIntraRefreshModeFlagsKHR::PER_PICTURE_PARTITION,
-    ]
-    .into_iter()
-    .find(|m| caps.modes.contains(*m));
+    // An explicit preference is honoured or refused, never silently
+    // substituted: asking for a vertical sweep and getting a horizontal one
+    // would make the next comparison meaningless.
+    let mode = match config.intra_refresh_mode {
+        Some(shape) => {
+            let wanted = match shape {
+                crate::encoder::IntraRefreshShape::Blocks => {
+                    vk::VideoEncodeIntraRefreshModeFlagsKHR::BLOCK_BASED
+                }
+                crate::encoder::IntraRefreshShape::Rows => {
+                    vk::VideoEncodeIntraRefreshModeFlagsKHR::BLOCK_ROW_BASED
+                }
+                crate::encoder::IntraRefreshShape::Columns => {
+                    vk::VideoEncodeIntraRefreshModeFlagsKHR::BLOCK_COLUMN_BASED
+                }
+                crate::encoder::IntraRefreshShape::Partitions => {
+                    vk::VideoEncodeIntraRefreshModeFlagsKHR::PER_PICTURE_PARTITION
+                }
+            };
+            if !caps.modes.contains(wanted) {
+                warn!(
+                    "intra refresh shape {shape:?} is not offered by this device (it offers \
+                     {:?}); using key frames",
+                    caps.modes
+                );
+                return None;
+            }
+            Some(wanted)
+        }
+        // No preference, so the general mode, which the spec says to prefer
+        // in exactly that case: row- and column-based are block-based with an
+        // added granularity guarantee, so anything offering either offers
+        // this, and the implementation knows its own hardware.
+        None => [
+            vk::VideoEncodeIntraRefreshModeFlagsKHR::BLOCK_BASED,
+            vk::VideoEncodeIntraRefreshModeFlagsKHR::BLOCK_ROW_BASED,
+            vk::VideoEncodeIntraRefreshModeFlagsKHR::BLOCK_COLUMN_BASED,
+            vk::VideoEncodeIntraRefreshModeFlagsKHR::PER_PICTURE_PARTITION,
+        ]
+        .into_iter()
+        .find(|m| caps.modes.contains(*m)),
+    };
     let Some(mode) = mode else {
         // Said, not swallowed. The device advertises the extension per device
         // and the modes per *profile*, so one codec having intra refresh says

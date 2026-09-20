@@ -298,6 +298,19 @@ impl ColorDescription {
     }
 }
 
+/// How the picture is divided into intra refresh regions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IntraRefreshShape {
+    /// Let the implementation divide and choose a direction.
+    Blocks,
+    /// A horizontal band, sweeping down the picture.
+    Rows,
+    /// A vertical band, sweeping across the picture.
+    Columns,
+    /// One region per encoded picture partition.
+    Partitions,
+}
+
 /// Encode configuration.
 #[derive(Debug, Clone)]
 #[must_use]
@@ -369,6 +382,21 @@ pub struct EncodeConfig {
     ///
     /// Ignored, with a warning, where the device cannot do it.
     pub intra_refresh_cycle: Option<u32>,
+    /// Which shape the refresh regions take, or `None` to let the
+    /// implementation decide.
+    ///
+    /// `Blocks` leaves the division and the direction of the sweep to the
+    /// driver, which is what the spec recommends when the application has no
+    /// preference. The specific shapes are a preference: `Rows` sweeps a
+    /// horizontal band down the picture, `Columns` a vertical band across it.
+    /// Which looks better is a question about the content -- a camera panning
+    /// horizontally interacts differently with a horizontal sweep than with a
+    /// vertical one -- and is not answerable from here.
+    ///
+    /// Refused, with a warning, if the device does not offer it. Asking for a
+    /// vertical sweep and silently getting a horizontal one would make the
+    /// next comparison meaningless.
+    pub intra_refresh_mode: Option<IntraRefreshShape>,
     /// Stop refreshed regions predicting from regions not yet refreshed.
     ///
     /// The spec calls this optional, and it is the half of intra refresh that
@@ -417,6 +445,7 @@ impl EncodeConfig {
             b_frame_count: 0, // Start without B-frames for simplicity.
             max_reference_frames: DEFAULT_MAX_REFERENCE_FRAMES,
             intra_refresh_cycle: None,
+            intra_refresh_mode: None,
             intra_refresh_limit_prediction: false,
             virtual_buffer_size_ms: 1000,
             initial_virtual_buffer_size_ms: 1000,
@@ -449,6 +478,7 @@ impl EncodeConfig {
             b_frame_count: 0, // Start without B-frames for simplicity.
             max_reference_frames: DEFAULT_MAX_REFERENCE_FRAMES,
             intra_refresh_cycle: None,
+            intra_refresh_mode: None,
             intra_refresh_limit_prediction: false,
             virtual_buffer_size_ms: 1000,
             initial_virtual_buffer_size_ms: 1000,
@@ -481,6 +511,7 @@ impl EncodeConfig {
             b_frame_count: 0, // Start without B-frames for simplicity.
             max_reference_frames: DEFAULT_MAX_REFERENCE_FRAMES,
             intra_refresh_cycle: None,
+            intra_refresh_mode: None,
             intra_refresh_limit_prediction: false,
             virtual_buffer_size_ms: 1000,
             initial_virtual_buffer_size_ms: 1000,
@@ -575,6 +606,12 @@ impl EncodeConfig {
     /// short cycle recovers fast and costs bitrate, a long one the reverse.
     pub fn with_intra_refresh(mut self, cycle: Option<u32>) -> Self {
         self.intra_refresh_cycle = cycle.filter(|c| *c > 1);
+        self
+    }
+
+    /// Ask for a particular refresh shape; see the field.
+    pub fn with_intra_refresh_mode(mut self, mode: Option<IntraRefreshShape>) -> Self {
+        self.intra_refresh_mode = mode;
         self
     }
 
