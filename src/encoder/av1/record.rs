@@ -220,8 +220,8 @@ impl Av1 {
             loop_filter_mode_deltas: [0; 2],
         };
 
-        let (ref_frame_idx, ref_order_hint, primary_ref_frame, refresh_frame_flags) =
-            self.calculate_reference_frame_mapping(is_key_frame, current_dpb_slot);
+        let (ref_frame_idx, ref_order_hint, primary_ref_frame, refresh_frame_flags) = self
+            .calculate_reference_frame_mapping(is_key_frame, opens_refresh_cycle, current_dpb_slot);
 
         let std_picture_info = ash::vk::native::StdVideoEncodeAV1PictureInfo {
             flags: picture_info_flags,
@@ -490,6 +490,7 @@ impl Av1 {
     fn calculate_reference_frame_mapping(
         &self,
         is_key_frame: bool,
+        error_resilient: bool,
         current_dpb_slot: u8,
     ) -> ([i8; 7], [u8; 8], u8, u8) {
         const PRIMARY_REF_NONE: u8 = 7;
@@ -515,7 +516,21 @@ impl Av1 {
         }
         // Load the frame context from the most recent (LAST) reference, and
         // refresh only the current slot so this frame becomes the new LAST.
+        //
+        // Except under error resilience, where AV1 does not code
+        // `primary_ref_frame` at all: the header reads it only when the frame
+        // is inter *and* not error resilient, and takes it as
+        // `PRIMARY_REF_NONE` otherwise. Saying zero there describes a frame
+        // that inherits a context the decoder will not load, and the result is
+        // a bitstream dav1d refuses outright -- which is what intra refresh
+        // did to AV1 the moment the first cycle began, since that is where the
+        // error resilience is set.
+        let primary_ref = if error_resilient {
+            PRIMARY_REF_NONE
+        } else {
+            0u8
+        };
         let refresh_flags = 1u8 << current_dpb_slot;
-        (ref_frame_idx, ref_order_hint, 0u8, refresh_flags)
+        (ref_frame_idx, ref_order_hint, primary_ref, refresh_flags)
     }
 }
