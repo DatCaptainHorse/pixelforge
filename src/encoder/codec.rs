@@ -675,6 +675,10 @@ pub(crate) fn resolve_intra_refresh(
     active_reference_pictures: u32,
 ) -> Option<IntraRefreshState> {
     let cycle = config.intra_refresh_cycle?;
+    debug!(
+        "intra refresh caps: modes {:?}, max cycle {}, max active refs {}",
+        caps.modes, caps.max_cycle_duration, caps.max_active_reference_pictures
+    );
     if !context.has_video_encode_intra_refresh() {
         warn!("intra refresh requested, but this device does not support it; using key frames");
         return None;
