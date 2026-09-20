@@ -764,6 +764,57 @@ pub(crate) fn av1_refresh_block(sizes: vk::VideoEncodeAV1SuperblockSizeFlagsKHR)
     128
 }
 
+/// Which refresh shape to sweep with when the caller has no preference.
+///
+/// The choice is the region count, and the region count is geometry: a
+/// landscape picture has more block columns than block rows, so a column
+/// sweep divides the same work into more steps and each step disturbs a
+/// thinner strip. A thinner strip is a smaller artifact, because what the
+/// viewer sees is the freshly intra-coded band standing against neighbours
+/// that have been refined over the whole cycle.
+///
+/// Measured on RADV, 1080p, 5 Mbps, real game content, against periodic key
+/// frames as the control: intra refresh cost 0.131 JOD sweeping rows (17
+/// regions) and 0.082 sweeping columns (30 regions), so the direction alone
+/// recovered 38% of it. H.264, whose 16x16 macroblocks give 68 rows and 120
+/// columns, cost 0.006 and 0.002 -- the same ordering, and small enough
+/// either way to be free.
+///
+/// The general block mode ranks *below* both explicit directions, which
+/// reverses the order this used to use. The old reasoning was that the spec
+/// recommends leaving the division to the implementation when the application
+/// has no preference, and that was sound before there was a measurement. The
+/// measurement says otherwise: the implementation's choice is unknowable from
+/// here, so its region count cannot be reasoned about, while the explicit
+/// directions can. Measured on RADV the general mode resolves to rows, which
+/// is the worse of the two on every landscape picture.
+fn preferred_refresh_mode(
+    modes: vk::VideoEncodeIntraRefreshModeFlagsKHR,
+    width: u32,
+    height: u32,
+    block: u32,
+) -> Option<vk::VideoEncodeIntraRefreshModeFlagsKHR> {
+    use vk::VideoEncodeIntraRefreshModeFlagsKHR as Mode;
+    let block = block.max(1);
+    let columns = width.div_ceil(block);
+    let rows = height.div_ceil(block);
+    // Ties go to rows, which only has to be stable rather than right: at equal
+    // counts the two sweeps disturb the same number of blocks per step.
+    let (wider, narrower) = if columns > rows {
+        (Mode::BLOCK_COLUMN_BASED, Mode::BLOCK_ROW_BASED)
+    } else {
+        (Mode::BLOCK_ROW_BASED, Mode::BLOCK_COLUMN_BASED)
+    };
+    [
+        wider,
+        narrower,
+        Mode::BLOCK_BASED,
+        Mode::PER_PICTURE_PARTITION,
+    ]
+    .into_iter()
+    .find(|m| modes.contains(*m))
+}
+
 /// How many refresh regions a picture can be divided into under `mode`, or
 /// `None` when that is not a question this can answer.
 ///
@@ -867,18 +918,16 @@ pub(crate) fn resolve_intra_refresh(
             }
             Some(wanted)
         }
-        // No preference, so the general mode, which the spec says to prefer
-        // in exactly that case: row- and column-based are block-based with an
-        // added granularity guarantee, so anything offering either offers
-        // this, and the implementation knows its own hardware.
-        None => [
-            vk::VideoEncodeIntraRefreshModeFlagsKHR::BLOCK_BASED,
-            vk::VideoEncodeIntraRefreshModeFlagsKHR::BLOCK_ROW_BASED,
-            vk::VideoEncodeIntraRefreshModeFlagsKHR::BLOCK_COLUMN_BASED,
-            vk::VideoEncodeIntraRefreshModeFlagsKHR::PER_PICTURE_PARTITION,
-        ]
-        .into_iter()
-        .find(|m| caps.modes.contains(*m)),
+        // No preference, so the direction that divides this picture into the
+        // most regions. See `preferred_refresh_mode` -- the old order put the
+        // general block mode first on the spec's advice, and measurement says
+        // that is the worse choice on any landscape picture.
+        None => preferred_refresh_mode(
+            caps.modes,
+            config.dimensions.width,
+            config.dimensions.height,
+            refresh_block,
+        ),
     };
     let Some(mode) = mode else {
         // Said, not swallowed. The device advertises the extension per device
@@ -1869,5 +1918,95 @@ mod virtual_buffer_tests {
     #[test]
     fn a_zero_frame_rate_does_not_divide_by_zero() {
         assert!(default_virtual_buffer_ms(EncodeUsageHint::Streaming, 0, 0) > 0);
+    }
+}
+
+#[cfg(test)]
+mod preferred_mode_tests {
+    use super::*;
+
+    const ROWS: vk::VideoEncodeIntraRefreshModeFlagsKHR =
+        vk::VideoEncodeIntraRefreshModeFlagsKHR::BLOCK_ROW_BASED;
+    const COLUMNS: vk::VideoEncodeIntraRefreshModeFlagsKHR =
+        vk::VideoEncodeIntraRefreshModeFlagsKHR::BLOCK_COLUMN_BASED;
+    const BLOCKS: vk::VideoEncodeIntraRefreshModeFlagsKHR =
+        vk::VideoEncodeIntraRefreshModeFlagsKHR::BLOCK_BASED;
+    const PARTITIONS: vk::VideoEncodeIntraRefreshModeFlagsKHR =
+        vk::VideoEncodeIntraRefreshModeFlagsKHR::PER_PICTURE_PARTITION;
+
+    /// A landscape picture has more block columns than block rows, so a
+    /// column sweep divides the same work into more steps and each step
+    /// disturbs a thinner strip. Measured on RADV at 1080p, H.265: switching
+    /// rows to columns recovered 38% of what intra refresh cost against
+    /// periodic key frames.
+    #[test]
+    fn a_landscape_picture_sweeps_columns() {
+        let all = ROWS | COLUMNS | BLOCKS;
+        assert_eq!(preferred_refresh_mode(all, 1920, 1080, 64), Some(COLUMNS));
+    }
+
+    /// The rule is the region count, not the word "columns". Turn the picture
+    /// on its side and the answer turns with it.
+    #[test]
+    fn a_portrait_picture_sweeps_rows() {
+        let all = ROWS | COLUMNS | BLOCKS;
+        assert_eq!(preferred_refresh_mode(all, 1080, 1920, 64), Some(ROWS));
+    }
+
+    /// A square picture has the same count either way, so neither is better
+    /// and the choice only has to be stable.
+    #[test]
+    fn a_square_picture_picks_one_and_sticks_to_it() {
+        let all = ROWS | COLUMNS | BLOCKS;
+        let once = preferred_refresh_mode(all, 1024, 1024, 64);
+        assert_eq!(once, preferred_refresh_mode(all, 1024, 1024, 64));
+        assert!(once == Some(ROWS) || once == Some(COLUMNS));
+    }
+
+    /// Only one direction offered means there is nothing to weigh.
+    #[test]
+    fn a_single_offered_direction_is_taken_whichever_it_is() {
+        assert_eq!(
+            preferred_refresh_mode(ROWS | BLOCKS, 1920, 1080, 64),
+            Some(ROWS)
+        );
+        assert_eq!(
+            preferred_refresh_mode(COLUMNS | BLOCKS, 1080, 1920, 64),
+            Some(COLUMNS)
+        );
+    }
+
+    /// With no explicit direction on offer, the general mode is all there is.
+    /// It is last among the block modes rather than first, which reverses the
+    /// old order: the implementation picks the division and does not say
+    /// which, so its region count cannot be known and cannot be preferred.
+    #[test]
+    fn block_based_is_the_fallback_not_the_first_choice() {
+        assert_eq!(preferred_refresh_mode(BLOCKS, 1920, 1080, 64), Some(BLOCKS));
+        assert_eq!(
+            preferred_refresh_mode(BLOCKS | PARTITIONS, 1920, 1080, 64),
+            Some(BLOCKS)
+        );
+    }
+
+    #[test]
+    fn per_picture_partition_is_the_last_resort() {
+        assert_eq!(
+            preferred_refresh_mode(PARTITIONS, 1920, 1080, 64),
+            Some(PARTITIONS)
+        );
+    }
+
+    #[test]
+    fn a_device_offering_nothing_gets_nothing() {
+        assert_eq!(
+            preferred_refresh_mode(
+                vk::VideoEncodeIntraRefreshModeFlagsKHR::NONE,
+                1920,
+                1080,
+                64
+            ),
+            None
+        );
     }
 }

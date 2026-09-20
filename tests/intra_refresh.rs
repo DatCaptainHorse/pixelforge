@@ -21,8 +21,8 @@
 //! `cargo test --test intra_refresh -- --ignored --nocapture`.
 
 use pixelforge::{
-    Codec, EncodeBitDepth, EncodeConfig, Encoder, InputImage, IntraRefresh, PixelFormat,
-    RateControlMode, VideoContextBuilder,
+    Codec, EncodeBitDepth, EncodeConfig, Encoder, InputImage, IntraRefresh, IntraRefreshShape,
+    PixelFormat, RateControlMode, VideoContextBuilder,
 };
 use std::collections::VecDeque;
 
@@ -51,6 +51,21 @@ const GOP_FRAMES: u32 = 30;
 /// The cycle length is no longer a knob -- it is derived from `GOP_FRAMES`,
 /// the device, and how many refresh regions the picture has -- so what is left
 /// to choose is what the cycle is *for*.
+/// Which way the sweep runs, from the environment.
+///
+/// The shape decides how many refresh regions the picture has, and that is the
+/// number that governs the band's thickness: a 1080p picture in 64x64 blocks is
+/// 17 rows but 30 columns, so a column sweep spreads the same work over nearly
+/// twice as many steps.
+fn refresh_shape() -> Option<IntraRefreshShape> {
+    match std::env::var("PIXELFORGE_SHAPE").as_deref() {
+        Ok("rows") => Some(IntraRefreshShape::Rows),
+        Ok("columns") => Some(IntraRefreshShape::Columns),
+        Ok("blocks") => Some(IntraRefreshShape::Blocks),
+        _ => None,
+    }
+}
+
 fn refresh_mode() -> IntraRefresh {
     if std::env::var("PIXELFORGE_LIMIT_PREDICTION").is_ok() {
         IntraRefresh::Recovering
@@ -132,6 +147,7 @@ fn run_codec(
     .with_bit_depth(EncodeBitDepth::Eight)
     .with_gop_size(GOP_FRAMES)
     .with_intra_refresh(refresh)
+    .with_intra_refresh_mode(refresh_shape())
     .with_max_reference_frames(max_refs)
     .with_b_frames(0);
 
