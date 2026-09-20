@@ -572,11 +572,7 @@ impl H265 {
         }
 
         let future = common.submit_frame();
-        crate::encoder::codec::intra_refresh_committed(
-            common,
-            common.current_dpb_slot as usize,
-            is_idr,
-        );
+        crate::encoder::codec::intra_refresh_committed(common, is_idr);
         future
     }
 }

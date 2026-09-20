@@ -602,38 +602,59 @@ pub(crate) struct IntraRefreshState {
     pub cycle_duration: u32,
     /// Where the next picture falls in the cycle, `0..cycle_duration`.
     pub index: u32,
-    /// The refresh index each DPB slot was written at.
-    ///
-    /// A reference has to declare how much of it is still unrefreshed, and
-    /// that depends on where in the cycle it was encoded -- so the answer is
-    /// per slot, not per frame. `None` means the slot holds a picture that is
-    /// clean everywhere: an IDR, or anything from before refresh began.
-    pub slot_index: Vec<Option<u32>>,
     pub mode: vk::VideoEncodeIntraRefreshModeFlagsKHR,
+    /// Whether to stop refreshed regions predicting from unrefreshed ones.
+    ///
+    /// The spec calls this optional -- "applications *may want to* limit the
+    /// set of intra refresh regions of the reference picture" -- and what it
+    /// buys is convergence for a decoder that joins mid-cycle, or after loss,
+    /// without a key frame. What it costs is prediction.
+    ///
+    /// The cost is not small. Under the restriction, region `i` may predict
+    /// only from regions below the current refresh index, so anything moving
+    /// vertically out of that band cannot be predicted at all: content drifts
+    /// until the refresh reaches it and then snaps into place. Measured at
+    /// 1080p with a 240-picture cycle each region is about four pixel rows, so
+    /// *any* vertical motion breaks prediction and the snapping is continuous
+    /// -- seen as a band crawling down the picture. A 30-picture cycle gives
+    /// regions of about 36 rows and is much better, but slow-moving content
+    /// still pulses as the band passes.
+    ///
+    /// So it is off unless asked for. A client that joins with a real key
+    /// frame -- which it must, since intra refresh cannot start a decoder --
+    /// has nothing to converge from, and pays that cost for nothing.
+    pub restrict_prediction: bool,
 }
 
 impl IntraRefreshState {
-    /// Regions of a reference that have not been refreshed yet.
+    /// Dirty regions to declare for every active reference.
     ///
-    /// A picture encoded at index `i` has refreshed regions `0..=i`, so
-    /// `cycle_duration - (i + 1)` remain dirty. The encoder needs this to know
-    /// which parts of a reference the refreshed parts of the current picture
-    /// are forbidden to predict from -- that prohibition is the whole reason
-    /// intra refresh converges instead of dragging stale data forward forever.
-    pub fn dirty_regions(&self, slot: usize) -> u32 {
-        match self.slot_index.get(slot).copied().flatten() {
-            Some(i) => self.cycle_duration.saturating_sub(i + 1),
-            // Clean everywhere: nothing of it is unrefreshed.
-            None => 0,
+    /// Not tracked per reference picture, because the spec does not define it
+    /// that way: VUID-vkCmdEncodeVideoKHR-pNext-10843 requires this to equal
+    /// the cycle duration minus *the encoded picture's* refresh index, for
+    /// every reference declaring a non-zero count. A number derived from the
+    /// reference's own history instead happens to agree while the reference is
+    /// the immediately preceding picture and is invalid usage the moment it is
+    /// not -- which in video encode shows up as a corrupt picture rather than
+    /// an error.
+    ///
+    /// Zero means no restriction, which is the legal way to decline it.
+    pub fn dirty_regions(&self) -> u32 {
+        if self.restrict_prediction {
+            self.cycle_duration.saturating_sub(self.index)
+        } else {
+            0
         }
     }
 
-    /// Note that `slot` now holds the picture just encoded.
-    pub fn wrote_slot(&mut self, slot: usize, was_idr: bool) {
-        if slot >= self.slot_index.len() {
-            return;
-        }
-        self.slot_index[slot] = if was_idr { None } else { Some(self.index) };
+    /// Whether the next picture opens a refresh cycle.
+    ///
+    /// AV1 needs this: the spec asks for `error_resilient_mode` on the first
+    /// picture of a cycle, so that CDF data -- the adaptive entropy state,
+    /// carried forward between pictures and not covered by refreshing
+    /// *samples* -- cannot propagate an error across the boundary.
+    pub fn starts_cycle(&self) -> bool {
+        self.index == 0
     }
 
     /// Move to the next picture in the cycle.
@@ -641,23 +662,9 @@ impl IntraRefreshState {
         self.index = (self.index + 1) % self.cycle_duration.max(1);
     }
 
-    /// Whether the next picture opens a refresh cycle.
-    ///
-    /// AV1 needs this: the spec asks for `error_resilient_mode` on the first
-    /// picture of a cycle, so that CDF data -- the adaptive entropy state,
-    /// which is carried forward between pictures and is not covered by
-    /// refreshing *samples* -- cannot propagate an error across the boundary.
-    /// Refreshing every region of the image and leaving the probability model
-    /// inherited from a corrupt picture would recover the picture and not the
-    /// stream.
-    pub fn starts_cycle(&self) -> bool {
-        self.index == 0
-    }
-
-    /// Start the cycle over, because an IDR refreshed everything at once.
+    /// Start the cycle over, because a key frame refreshed everything at once.
     pub fn restart(&mut self) {
         self.index = 0;
-        self.slot_index.fill(None);
     }
 }
 
@@ -755,7 +762,7 @@ pub(crate) fn resolve_intra_refresh(
     Some(IntraRefreshState {
         cycle_duration,
         index: 0,
-        slot_index: vec![None; dpb_slot_count],
+        restrict_prediction: config.intra_refresh_limit_prediction,
         mode,
     })
 }
@@ -780,18 +787,16 @@ pub(crate) struct IntraRefreshFrame {
 /// stream actually contains -- which a decoder cannot detect and cannot
 /// recover from, because every region would appear refreshed a picture before
 /// it really was.
-pub(crate) fn intra_refresh_committed(common: &mut EncoderCommon, slot: usize, was_idr: bool) {
+pub(crate) fn intra_refresh_committed(common: &mut EncoderCommon, was_idr: bool) {
     let Some(ir) = common.intra_refresh.as_mut() else {
         return;
     };
     if was_idr {
         // A key frame refreshed the whole picture at once, so the cycle has
-        // nothing left to do and starts again from a clean reference.
+        // nothing left to do and starts again.
         ir.restart();
-        ir.wrote_slot(slot, true);
         return;
     }
-    ir.wrote_slot(slot, false);
     ir.advance();
 }
 
@@ -804,14 +809,13 @@ pub(crate) fn intra_refresh_frame(
     ref_slots: &[vk::VideoReferenceSlotInfoKHR],
 ) -> Option<IntraRefreshFrame> {
     let ir = common.intra_refresh.as_ref()?;
+    // The same count for every reference, because that is what the spec
+    // requires: it is a function of the encoded picture's refresh index, not
+    // of any reference's history.
+    let regions = ir.dirty_regions();
     let dirty = ref_slots
         .iter()
-        .map(|slot| {
-            // A negative slot index means "no slot", which cannot be stale
-            // because there is nothing there to be stale.
-            let regions = usize::try_from(slot.slot_index)
-                .map(|s| ir.dirty_regions(s))
-                .unwrap_or(0);
+        .map(|_| {
             vk::VideoReferenceIntraRefreshInfoKHR::default().dirty_intra_refresh_regions(regions)
         })
         .collect();
@@ -1361,82 +1365,60 @@ mod rate_control_support_tests {
 mod intra_refresh_tests {
     use super::*;
 
-    fn state(cycle: u32, slots: usize) -> IntraRefreshState {
+    fn state(cycle: u32, restrict: bool) -> IntraRefreshState {
         IntraRefreshState {
             cycle_duration: cycle,
             index: 0,
-            slot_index: vec![None; slots],
             mode: vk::VideoEncodeIntraRefreshModeFlagsKHR::BLOCK_ROW_BASED,
+            restrict_prediction: restrict,
         }
     }
 
-    /// A picture encoded at index `i` has refreshed regions `0..=i`, so
-    /// `cycle - (i + 1)` are left. Getting this wrong does not fail loudly --
-    /// the encode succeeds and the picture is subtly wrong for a whole cycle.
+    /// VUID-vkCmdEncodeVideoKHR-pNext-10843: a non-zero count must equal the
+    /// cycle duration minus *the encoded picture's* refresh index. A value
+    /// derived from the reference's own history instead agrees only while the
+    /// reference is the immediately preceding picture, and is invalid usage
+    /// otherwise -- which shows up as a corrupt picture, not an error.
     #[test]
-    fn a_reference_declares_the_regions_it_has_not_refreshed() {
-        let mut ir = state(4, 2);
-        // Nothing encoded yet: an untouched slot is clean, not stale.
-        assert_eq!(ir.dirty_regions(0), 0);
-
-        ir.wrote_slot(0, false); // encoded at index 0
-        assert_eq!(ir.dirty_regions(0), 3, "one region of four refreshed");
-        ir.advance();
-        ir.wrote_slot(1, false); // encoded at index 1
-        assert_eq!(ir.dirty_regions(1), 2);
-    }
-
-    /// The last picture of a cycle leaves nothing dirty, which is what makes
-    /// the cycle a recovery point at all.
-    #[test]
-    fn the_end_of_a_cycle_is_clean() {
-        let mut ir = state(3, 1);
-        for _ in 0..2 {
-            ir.advance();
+    fn the_dirty_count_is_the_one_the_spec_requires() {
+        let mut ir = state(30, true);
+        for index in 0..30 {
+            ir.index = index;
+            assert_eq!(
+                ir.dirty_regions(),
+                30 - index,
+                "cycle duration minus index, at index {index}"
+            );
         }
-        assert_eq!(ir.index, 2, "last position of a three-picture cycle");
-        ir.wrote_slot(0, false);
-        assert_eq!(ir.dirty_regions(0), 0);
     }
 
+    /// Declining the restriction is legal and is how it is declined: zero
+    /// means no limit, and the structure carrying zero imposes nothing.
     #[test]
-    fn a_cycle_wraps_rather_than_running_off_the_end() {
-        let mut ir = state(3, 1);
+    fn declining_the_restriction_declares_nothing_dirty() {
+        let mut ir = state(30, false);
+        for index in 0..30 {
+            ir.index = index;
+            assert_eq!(ir.dirty_regions(), 0);
+        }
+    }
+
+    /// VUID-vkCmdEncodeVideoKHR-pEncodeInfo-10841: the index must be less than
+    /// the cycle duration, always.
+    #[test]
+    fn the_index_stays_inside_the_cycle() {
+        let mut ir = state(3, true);
         for _ in 0..7 {
             ir.advance();
             assert!(ir.index < 3, "index {} left the cycle", ir.index);
         }
     }
 
-    /// A key frame refreshes everything at once, so the cycle it was part way
-    /// through is finished, not merely interrupted.
-    #[test]
-    fn a_key_frame_restarts_the_cycle_and_clears_every_slot() {
-        let mut ir = state(4, 2);
-        ir.wrote_slot(0, false);
-        ir.advance();
-        ir.wrote_slot(1, false);
-        assert_ne!(ir.dirty_regions(0), 0);
-
-        ir.restart();
-        assert_eq!(ir.index, 0);
-        assert_eq!(
-            ir.dirty_regions(0),
-            0,
-            "a slot left stale across a key frame"
-        );
-        assert_eq!(ir.dirty_regions(1), 0);
-    }
-
-    /// Asking about a slot that does not exist must not panic mid-encode.
     /// AV1 needs to know when a cycle opens, to reset the entropy model.
     #[test]
     fn the_first_picture_of_a_cycle_is_recognisable() {
-        let mut ir = state(3, 1);
-        assert!(
-            ir.starts_cycle(),
-            "a fresh cycle starts at its first picture"
-        );
+        let mut ir = state(3, true);
+        assert!(ir.starts_cycle());
         ir.advance();
         assert!(!ir.starts_cycle());
         ir.advance();
@@ -1445,33 +1427,15 @@ mod intra_refresh_tests {
         assert!(ir.starts_cycle(), "wrapping round begins a new cycle");
     }
 
-    /// The normative rule is that a reference's clean region count is
-    /// `cycleDuration - dirtyIntraRefreshRegions`, and a picture encoded at
-    /// index `r` has refreshed regions `0..=r`. The two together are the
-    /// formula below, and this pins it against the spec rather than against
-    /// the simplified example in the extension proposal, which is written for
-    /// the mid-cycle case and disagrees at a cycle boundary.
+    /// A key frame refreshed everything at once, so the cycle it interrupted
+    /// is finished rather than paused.
     #[test]
-    fn clean_regions_are_the_reference_index_plus_one() {
-        let mut ir = state(5, 1);
-        for r in 0..5u32 {
-            ir.index = r;
-            ir.wrote_slot(0, false);
-            let clean = ir.cycle_duration - ir.dirty_regions(0);
-            assert_eq!(clean, r + 1, "a picture encoded at index {r}");
-        }
-    }
-
-    #[test]
-    fn an_unknown_slot_is_treated_as_clean() {
-        let ir = state(4, 1);
-        assert_eq!(ir.dirty_regions(99), 0);
-    }
-
-    #[test]
-    fn writing_a_slot_that_does_not_exist_is_ignored() {
-        let mut ir = state(4, 1);
-        ir.wrote_slot(99, false);
-        assert_eq!(ir.slot_index.len(), 1);
+    fn a_key_frame_restarts_the_cycle() {
+        let mut ir = state(4, true);
+        ir.advance();
+        ir.advance();
+        assert_eq!(ir.index, 2);
+        ir.restart();
+        assert_eq!(ir.index, 0);
     }
 }

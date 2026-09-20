@@ -369,6 +369,18 @@ pub struct EncodeConfig {
     ///
     /// Ignored, with a warning, where the device cannot do it.
     pub intra_refresh_cycle: Option<u32>,
+    /// Stop refreshed regions predicting from regions not yet refreshed.
+    ///
+    /// The spec calls this optional, and it is the half of intra refresh that
+    /// costs picture quality. It buys convergence for a decoder joining
+    /// mid-cycle or recovering from loss without a key frame; it costs the
+    /// ability to predict anything moving out of the refreshed band, so
+    /// content drifts and then snaps as the refresh reaches it.
+    ///
+    /// Off by default. A client that joined with a key frame -- which it must,
+    /// since intra refresh cannot start a decoder -- has nothing to converge
+    /// from and would pay that for nothing.
+    pub intra_refresh_limit_prediction: bool,
     /// Color description for VUI signaling.
     /// Defaults to BT.709 (full-range) when `None`.
     pub color_description: Option<ColorDescription>,
@@ -405,6 +417,7 @@ impl EncodeConfig {
             b_frame_count: 0, // Start without B-frames for simplicity.
             max_reference_frames: DEFAULT_MAX_REFERENCE_FRAMES,
             intra_refresh_cycle: None,
+            intra_refresh_limit_prediction: false,
             virtual_buffer_size_ms: 1000,
             initial_virtual_buffer_size_ms: 1000,
             color_description: None,
@@ -436,6 +449,7 @@ impl EncodeConfig {
             b_frame_count: 0, // Start without B-frames for simplicity.
             max_reference_frames: DEFAULT_MAX_REFERENCE_FRAMES,
             intra_refresh_cycle: None,
+            intra_refresh_limit_prediction: false,
             virtual_buffer_size_ms: 1000,
             initial_virtual_buffer_size_ms: 1000,
             color_description: None,
@@ -467,6 +481,7 @@ impl EncodeConfig {
             b_frame_count: 0, // Start without B-frames for simplicity.
             max_reference_frames: DEFAULT_MAX_REFERENCE_FRAMES,
             intra_refresh_cycle: None,
+            intra_refresh_limit_prediction: false,
             virtual_buffer_size_ms: 1000,
             initial_virtual_buffer_size_ms: 1000,
             color_description: None,
@@ -560,6 +575,12 @@ impl EncodeConfig {
     /// short cycle recovers fast and costs bitrate, a long one the reverse.
     pub fn with_intra_refresh(mut self, cycle: Option<u32>) -> Self {
         self.intra_refresh_cycle = cycle.filter(|c| *c > 1);
+        self
+    }
+
+    /// Limit prediction to already-refreshed regions; see the field.
+    pub fn with_intra_refresh_limit_prediction(mut self, limit: bool) -> Self {
+        self.intra_refresh_limit_prediction = limit;
         self
     }
 

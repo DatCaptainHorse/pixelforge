@@ -578,11 +578,7 @@ impl H264 {
         }
 
         let future = common.submit_frame()?;
-        crate::encoder::codec::intra_refresh_committed(
-            common,
-            common.current_dpb_slot as usize,
-            is_idr,
-        );
+        crate::encoder::codec::intra_refresh_committed(common, is_idr);
         // Clear the unmark queue only after the encode is committed to the GPU.
         // If any fallible step above had failed, the MMCO ops would still live
         // in `pending_unmark_frame_nums` so a retry re-emits them — otherwise the
