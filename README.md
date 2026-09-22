@@ -185,30 +185,66 @@ CPU is the consumer's job; `examples/common` shows one way.
 
 ### Color Conversion (RGB → YUV)
 
-PixelForge includes a GPU compute shader for converting RGB input to YUV output, supporting multiple color spaces:
+PixelForge includes a GPU compute shader for converting RGB input to YUV
+output. The source color describes the input. The target color describes the stream.
+Both are a [`ColorSpec`].
 
-| Color Space | Description |
-|-------------|-------------|
-| `Bt709` | Standard SDR (BT.709 coefficients) |
-| `Bt2020` | HDR passthrough (BT.2020 coefficients, PQ-encoded input) |
-| `SrgbToBt2020Pq` | SDR-in-HDR (sRGB → linear → BT.2020 gamut → PQ OETF) |
-| `Bt709LinearToBt2020Pq` | scRGB HDR (linear BT.709 → BT.2020 gamut → PQ OETF). `sdr_reference_white_nits` sets the interpretation of 1.0; per the scRGB spec (IEC 61966-2-2), 80 nits. |
+| `ColorSpec` | | Can be a target |
+|-------------|-|-----------------|
+| `Srgb` | Ordinary SDR content | yes |
+| `Bt709Linear` | scRGB, from an `EXTENDED_SRGB_LINEAR_EXT` swapchain | no |
+| `Bt2020Linear` | Linear light, wide gamut | no |
+| `Bt2020Pq` | HDR10, from an `HDR10_ST2084_EXT` swapchain | yes |
+
+The linear spaces cannot be a target, because a video file has no way to
+record that it holds linear light. Any source can be converted to
+`Bt2020Pq`. Only `Srgb` can be converted to `Srgb`; the others would need
+tone mapping or a gamma curve applied, which the shader does not do.
+[`ColorConverter::new`] rejects the combinations it cannot do.
+
+Encoding to HDR needs to know how bright the source's white is, since HDR
+carries real brightness values and SDR does not. Each space has a sensible
+default, see [`ColorSpec::reference_white_nits`], overridable with
+[`ColorConverterConfig::with_reference_white_nits`].
 
 Supported input formats: BGRx, RGBx, BGRA, RGBA, ABGR2101010 (10-bit packed), RGBA16F (FP16).
 Supported output formats: NV12 (8-bit), I420 (8-bit), YUV444 (8-bit), P010 (10-bit), YUV444P10 (10-bit).
 
+Pass [`ColorConverter::color_description`] to the encoder rather than
+describing the colours a second time by hand. The two have to agree: if the
+converter writes full-range pixels and the stream says limited, players
+stretch the range again and the picture comes out wrong.
+
 ```rust
-use pixelforge::{ColorConverter, ColorConverterConfig, ColorSpace, InputFormat, OutputFormat, VideoContextBuilder};
+use pixelforge::{
+    Codec, ColorConverter, ColorConverterConfig, ColorRange, ColorSpec, EncodeConfig,
+    Encoder, InputFormat, OutputFormat, VideoContextBuilder,
+};
 
 let context = VideoContextBuilder::new()
     .app_name("Color Converter")
+    .require_encode(Codec::H265)
     .build()?;
 
-let mut config = ColorConverterConfig::new(1920, 1080, InputFormat::BGRx, OutputFormat::NV12);
-config.color_space = ColorSpace::SrgbToBt2020Pq;
+// SDR desktop content, encoded as HDR10 for an HDR streaming session.
+let config = ColorConverterConfig::new(
+    1920,
+    1080,
+    InputFormat::BGRx,
+    OutputFormat::P010,
+    ColorSpec::Srgb,
+    ColorSpec::Bt2020Pq,
+    ColorRange::Full,
+);
 
 let mut converter = ColorConverter::new(context.clone(), config)?;
-// converter.convert(input_image, output_buffer)?;
+
+// The encoder declares exactly what the shader wrote.
+let encode_config = EncodeConfig::h265(1920, 1080)
+    .with_color_description(converter.color_description());
+
+let mut encoder = Encoder::new(context, encode_config)?;
+// converter.convert(input_image, layout, encoder.input_image())?;
 ```
 
 ## Benchmarking

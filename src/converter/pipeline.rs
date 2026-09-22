@@ -16,7 +16,7 @@ const COLOR_CONVERT_SPIRV_BYTES: &[u8] = include_bytes!("../../shader/color_conv
 /// Get the SPIR-V bytecode for the color conversion shader.
 ///
 /// The shader expects:
-/// - Push constants: width, height, input_format, output_format, color_space, full_range (6 × u32)
+/// - Push constants: width, height, input_format, output_format, source, target, range, reference_white_nits (8 × u32)
 /// - Binding 0: Input image (sampler2D)
 /// - Binding 1: Output buffer (YUV data)
 ///
@@ -73,7 +73,7 @@ pub fn create_converter(
     let push_constant_range = vk::PushConstantRange::default()
         .stage_flags(vk::ShaderStageFlags::COMPUTE)
         .offset(0)
-        .size(28); // 7 x u32: width, height, input_format, output_format, color_space, full_range, sdr_white_nits(f32)
+        .size(32); // 8 x u32: width, height, input_format, output_format, source, target, range, reference_white_nits(f32)
 
     let pipeline_layout_info = vk::PipelineLayoutCreateInfo::default()
         .set_layouts(std::slice::from_ref(&descriptor_set_layout))
