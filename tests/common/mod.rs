@@ -109,6 +109,9 @@ pub struct Readback {
     /// the caller has to get right.
     _context: VideoContext,
     device: ash::Device,
+    /// Barriers through the KHR entry point, which a device created below
+    /// Vulkan 1.3 still has; the adopted-device tests create one.
+    sync2: ash::khr::synchronization2::Device,
     queue: vk::Queue,
     pool: vk::CommandPool,
     command_buffer: vk::CommandBuffer,
@@ -146,6 +149,7 @@ impl Readback {
         };
         Ok(Self {
             _context: context.clone(),
+            sync2: ash::khr::synchronization2::Device::load(context.instance(), &device),
             device,
             queue: context.transfer_queue(),
             pool,
@@ -178,7 +182,7 @@ impl Readback {
             layer_count: 1,
         };
         let regions = [
-            vk::BufferImageCopy2::default()
+            vk::BufferImageCopy::default()
                 .buffer_offset(0)
                 .buffer_row_length(frame.coded_width)
                 .buffer_image_height(frame.coded_height)
@@ -188,7 +192,7 @@ impl Readback {
                     height: frame.coded_height,
                     depth: 1,
                 }),
-            vk::BufferImageCopy2::default()
+            vk::BufferImageCopy::default()
                 .buffer_offset(y_size as u64)
                 .buffer_row_length(frame.coded_width / 2)
                 .buffer_image_height(frame.coded_height / 2)
@@ -234,23 +238,22 @@ impl Readback {
                     .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                     .image(frame.image)
                     .subresource_range(range)];
-                self.device.cmd_pipeline_barrier2(
+                self.sync2.cmd_pipeline_barrier2(
                     self.command_buffer,
                     &vk::DependencyInfo::default().image_memory_barriers(&to_src),
                 );
             }
 
-            self.device.cmd_copy_image_to_buffer2(
+            self.device.cmd_copy_image_to_buffer(
                 self.command_buffer,
-                &vk::CopyImageToBufferInfo2::default()
-                    .src_image(frame.image)
-                    .src_image_layout(if needs_transition {
-                        vk::ImageLayout::TRANSFER_SRC_OPTIMAL
-                    } else {
-                        frame.layout
-                    })
-                    .dst_buffer(buffer)
-                    .regions(&regions),
+                frame.image,
+                if needs_transition {
+                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL
+                } else {
+                    frame.layout
+                },
+                buffer,
+                &regions,
             );
 
             if needs_transition {
@@ -265,7 +268,7 @@ impl Readback {
                     .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                     .image(frame.image)
                     .subresource_range(range)];
-                self.device.cmd_pipeline_barrier2(
+                self.sync2.cmd_pipeline_barrier2(
                     self.command_buffer,
                     &vk::DependencyInfo::default().image_memory_barriers(&restore),
                 );

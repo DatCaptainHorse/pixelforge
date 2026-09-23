@@ -357,6 +357,7 @@ impl EncodePipeline {
     pub(crate) fn submit_current(
         &mut self,
         device: &ash::Device,
+        sync2: &ash::khr::synchronization2::Device,
         encode_queue: vk::Queue,
     ) -> Result<EncodeFuture> {
         let wait = self.timeline.wait();
@@ -396,6 +397,7 @@ impl EncodePipeline {
         unsafe {
             submit_encode_only(
                 device,
+                sync2,
                 command_buffer,
                 fence,
                 encode_queue,

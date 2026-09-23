@@ -268,6 +268,10 @@ impl VideoContextBuilder {
 /// features must be enabled as well, and are not listed here because they are
 /// feature-struct fields rather than extensions: `synchronization2` and
 /// `timelineSemaphore`.
+///
+/// The instance may ask for any Vulkan version from 1.1 up. Pixelforge reaches
+/// everything newer through the extensions listed here, so an application that
+/// created its instance for 1.1 or 1.2 does not have to raise it.
 #[derive(Debug, Clone)]
 pub struct DeviceRequirements {
     /// Queue families pixelforge needs a queue created for. Merge these with
@@ -449,10 +453,15 @@ fn supports_internally_synchronized_queues(
 }
 
 fn decode_extension_names(decode_codecs: &[Codec]) -> Vec<&'static std::ffi::CStr> {
+    // Synchronization2 and timeline semaphores are core in 1.3 and 1.2, but
+    // are listed anyway: enabling a promoted extension is harmless, and on a
+    // device created from an instance asking for less it is what makes them
+    // available at all.
     let mut names = vec![
         ash::khr::video_queue::NAME,
         ash::khr::video_decode_queue::NAME,
         ash::khr::synchronization2::NAME,
+        ash::khr::timeline_semaphore::NAME,
     ];
     if decode_codecs.contains(&Codec::H264) {
         names.push(ash::khr::video_decode_h264::NAME);
@@ -479,6 +488,14 @@ struct VideoContextInner {
     instance: ash::Instance,
     physical_device: vk::PhysicalDevice,
     device: ash::Device,
+    /// `vkQueueSubmit2` and `vkCmdPipelineBarrier2` through their KHR names.
+    ///
+    /// The core entry points exist only when the device was created from an
+    /// instance asking for Vulkan 1.3. An adopted device may come from an
+    /// application that asked for less, where the core pointers are null and
+    /// calling them crashes. The KHR names are valid on any device with
+    /// `VK_KHR_synchronization2` enabled, which pixelforge requires either way.
+    sync2: ash::khr::synchronization2::Device,
     video_encode_queue_family: Option<u32>,
     video_encode_timestamp_valid_bits: u32,
     video_encode_queue: Option<vk::Queue>,
@@ -537,6 +554,10 @@ impl VideoContext {
     /// Get the Vulkan device.
     pub fn device(&self) -> &ash::Device {
         &self.inner.device
+    }
+
+    pub(crate) fn sync2(&self) -> &ash::khr::synchronization2::Device {
+        &self.inner.sync2
     }
 
     pub(crate) fn video_encode_queue_family(&self) -> Option<u32> {
@@ -1184,6 +1205,7 @@ impl VideoContext {
         Ok(Self {
             inner: std::sync::Arc::new(VideoContextInner {
                 entry,
+                sync2: ash::khr::synchronization2::Device::load(&instance, &device),
                 instance,
                 physical_device,
                 device,
@@ -1286,6 +1308,7 @@ impl VideoContext {
         Ok(VideoContext {
             inner: std::sync::Arc::new(VideoContextInner {
                 entry,
+                sync2: ash::khr::synchronization2::Device::load(&instance, &device),
                 instance,
                 physical_device,
                 device,
