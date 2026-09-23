@@ -67,15 +67,26 @@ impl Av1 {
         // chained in (required by the driver).
         let mut av1_caps = vk::VideoEncodeAV1CapabilitiesKHR::default();
         let mut encode_caps = vk::VideoEncodeCapabilitiesKHR::default();
+        // Chained even when intra refresh was not asked for: the answer is
+        // wanted for the log either way, and a driver that does not know the
+        // struct leaves it at its defaults rather than failing.
+        let mut intra_refresh_caps = vk::VideoEncodeIntraRefreshCapabilitiesKHR::default();
         let mut capabilities = vk::VideoCapabilitiesKHR::default()
             .push(&mut encode_caps)
-            .push(&mut av1_caps);
+            .push(&mut av1_caps)
+            .push(&mut intra_refresh_caps);
         let mut rgb_caps = vk::VideoEncodeRgbConversionCapabilitiesVALVE::default();
         if config.rgb_input.is_some() {
             capabilities = capabilities.push(&mut rgb_caps);
         }
         let caps = query_video_caps(&context, &profile_info, &mut capabilities)?;
         let rgb_caps = config.rgb_input.map(|_| RgbConversionCaps::from(&rgb_caps));
+        let intra_refresh_plan = crate::encoder::codec::IntraRefreshCaps {
+            modes: intra_refresh_caps.intra_refresh_modes,
+            max_cycle_duration: intra_refresh_caps.max_intra_refresh_cycle_duration,
+            max_active_reference_pictures: intra_refresh_caps
+                .max_intra_refresh_active_reference_pictures,
+        };
         crate::encoder::codec::warn_unsupported_rate_control(
             &config,
             encode_caps.rate_control_modes,
@@ -99,6 +110,7 @@ impl Av1 {
             // (required for AMD RADV).
             allow_layered_dpb: true,
             rgb_caps,
+            intra_refresh_caps: intra_refresh_plan,
         })?;
         let active_reference_count = init.active_reference_count;
         let common = init.common;

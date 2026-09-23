@@ -38,6 +38,7 @@ struct EncodePlan {
     ycbcr_2plane_444: bool,
     sampler_ycbcr_conversion: bool,
     rgb_conversion: bool,
+    intra_refresh: bool,
 }
 
 impl EncodePlan {
@@ -101,6 +102,11 @@ impl EncodePlan {
         let mut ycbcr = vk::PhysicalDeviceSamplerYcbcrConversionFeatures::default();
         let mut query = vk::PhysicalDeviceFeatures2::default().push(&mut ycbcr);
         unsafe { instance.get_physical_device_features2(physical_device, &mut query) };
+        let mut intra_refresh = vk::PhysicalDeviceVideoEncodeIntraRefreshFeaturesKHR::default();
+        if has(ash::khr::video_encode_intra_refresh::NAME) {
+            let mut query = vk::PhysicalDeviceFeatures2::default().push(&mut intra_refresh);
+            unsafe { instance.get_physical_device_features2(physical_device, &mut query) };
+        }
 
         Ok(Self {
             families: EncodeQueueFamilies {
@@ -115,6 +121,11 @@ impl EncodePlan {
             sampler_ycbcr_conversion: ycbcr.sampler_ycbcr_conversion != 0,
             rgb_conversion: has(ash::valve::video_encode_rgb_conversion::NAME)
                 && supports_rgb_conversion(instance, physical_device),
+            // Extension and feature both: with the feature off the driver
+            // parses the refresh structs and ignores them, and the stream
+            // silently never refreshes.
+            intra_refresh: has(ash::khr::video_encode_intra_refresh::NAME)
+                && intra_refresh.video_encode_intra_refresh != 0,
         })
     }
 
@@ -144,6 +155,9 @@ impl EncodePlan {
         if self.rgb_conversion {
             names.push(ash::valve::video_encode_rgb_conversion::NAME);
         }
+        if self.intra_refresh {
+            names.push(ash::khr::video_encode_intra_refresh::NAME);
+        }
         names
     }
 
@@ -155,6 +169,7 @@ impl EncodePlan {
             ycbcr_2plane_444_formats: self.ycbcr_2plane_444,
             video_encode_av1: self.codecs.contains(&Codec::AV1),
             video_encode_rgb_conversion: self.rgb_conversion,
+            video_encode_intra_refresh: self.intra_refresh,
         }
     }
 
@@ -325,6 +340,7 @@ impl VideoContext {
                 supported_decode_codecs: Vec::new(),
                 has_push_descriptor: plan.push_descriptor,
                 has_video_encode_rgb_conversion: plan.rgb_conversion,
+                has_video_encode_intra_refresh: plan.intra_refresh,
                 has_unified_image_layouts: false,
                 owns_device: false,
                 // The caller owns the instance; reporting is theirs to set up.

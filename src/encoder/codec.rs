@@ -14,6 +14,7 @@
 
 use ash::vk;
 use ash::vk::TaggedStructure;
+use tracing::{debug, warn};
 
 use crate::encoder::dpb::MAX_DPB_SLOTS;
 use crate::encoder::gop::{GopFrameType, GopPosition, GopStructure};
@@ -67,6 +68,11 @@ pub(crate) struct EncoderCommon {
     /// undefined rather than merely ineffective. The flag is what makes a live
     /// retune a state change instead of a lie.
     pub rate_control_dirty: bool,
+    /// Intra refresh, when the device supports it and the config asked.
+    ///
+    /// `None` means key frames, which is what every stream did before this
+    /// existed and what a device without the extension still does.
+    pub intra_refresh: Option<IntraRefreshState>,
 
     pub dpb_images: Vec<vk::Image>,
     pub dpb_image_memories: Vec<vk::DeviceMemory>,
@@ -578,6 +584,197 @@ impl<C: VideoCodec> Drop for CodecEncoder<C> {
 /// What a codec passes to [`build_encoder_common`]; the codec owns the parts that
 /// genuinely differ (its profile, block size, reference cap), the builder owns
 /// the rest.
+/// What a device can do with intra refresh, for this profile.
+///
+/// Copied out of the Vulkan query so it outlives that call's pointer chain,
+/// the same reason [`DeviceVideoCaps`] exists.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct IntraRefreshCaps {
+    pub modes: vk::VideoEncodeIntraRefreshModeFlagsKHR,
+    pub max_cycle_duration: u32,
+    pub max_active_reference_pictures: u32,
+}
+
+/// Intra refresh as it will actually be used, once the device has been asked.
+#[derive(Clone, Debug)]
+pub(crate) struct IntraRefreshState {
+    /// Pictures in a full cycle.
+    pub cycle_duration: u32,
+    /// Where the next picture falls in the cycle, `0..cycle_duration`.
+    pub index: u32,
+    /// The refresh index each DPB slot was written at.
+    ///
+    /// A reference has to declare how much of it is still unrefreshed, and
+    /// that depends on where in the cycle it was encoded -- so the answer is
+    /// per slot, not per frame. `None` means the slot holds a picture that is
+    /// clean everywhere: an IDR, or anything from before refresh began.
+    pub slot_index: Vec<Option<u32>>,
+    pub mode: vk::VideoEncodeIntraRefreshModeFlagsKHR,
+}
+
+impl IntraRefreshState {
+    /// Regions of a reference that have not been refreshed yet.
+    ///
+    /// A picture encoded at index `i` has refreshed regions `0..=i`, so
+    /// `cycle_duration - (i + 1)` remain dirty. The encoder needs this to know
+    /// which parts of a reference the refreshed parts of the current picture
+    /// are forbidden to predict from -- that prohibition is the whole reason
+    /// intra refresh converges instead of dragging stale data forward forever.
+    pub fn dirty_regions(&self, slot: usize) -> u32 {
+        match self.slot_index.get(slot).copied().flatten() {
+            Some(i) => self.cycle_duration.saturating_sub(i + 1),
+            // Clean everywhere: nothing of it is unrefreshed.
+            None => 0,
+        }
+    }
+
+    /// Note that `slot` now holds the picture just encoded.
+    pub fn wrote_slot(&mut self, slot: usize, was_idr: bool) {
+        if slot >= self.slot_index.len() {
+            return;
+        }
+        self.slot_index[slot] = if was_idr { None } else { Some(self.index) };
+    }
+
+    /// Move to the next picture in the cycle.
+    pub fn advance(&mut self) {
+        self.index = (self.index + 1) % self.cycle_duration.max(1);
+    }
+
+    /// Start the cycle over, because an IDR refreshed everything at once.
+    pub fn restart(&mut self) {
+        self.index = 0;
+        self.slot_index.fill(None);
+    }
+}
+
+/// Decide whether intra refresh is on, and how, given what was asked for and
+/// what the device offers.
+///
+/// Returns `None` when it is off, having said why if it was wanted. Silence
+/// would leave a stream that still emits key frames while its caller believes
+/// otherwise -- and the whole point of asking was to stop emitting them.
+pub(crate) fn resolve_intra_refresh(
+    context: &VideoContext,
+    config: &EncodeConfig,
+    caps: IntraRefreshCaps,
+    dpb_slot_count: usize,
+    active_reference_pictures: u32,
+) -> Option<IntraRefreshState> {
+    let cycle = config.intra_refresh_cycle?;
+    if !context.has_video_encode_intra_refresh() {
+        warn!("intra refresh requested, but this device does not support it; using key frames");
+        return None;
+    }
+    // Block-row based first: it refreshes a horizontal band per picture, which
+    // is both the most widely implemented and the least visible, since motion
+    // in rendered content is more often horizontal than vertical. Per-picture
+    // partition is last because it ties the refresh region to the slice
+    // layout, which is a separate decision this does not control.
+    let mode = [
+        vk::VideoEncodeIntraRefreshModeFlagsKHR::BLOCK_ROW_BASED,
+        vk::VideoEncodeIntraRefreshModeFlagsKHR::BLOCK_COLUMN_BASED,
+        vk::VideoEncodeIntraRefreshModeFlagsKHR::BLOCK_BASED,
+        vk::VideoEncodeIntraRefreshModeFlagsKHR::PER_PICTURE_PARTITION,
+    ]
+    .into_iter()
+    .find(|m| caps.modes.contains(*m))?;
+
+    // A device may support fewer active references under intra refresh than
+    // it does otherwise. Exceeding it is invalid usage, and invalid usage in
+    // video encode tends to surface as a corrupt picture rather than an error,
+    // so this refuses rather than trying its luck.
+    if active_reference_pictures > caps.max_active_reference_pictures {
+        warn!(
+            "intra refresh requested, but it allows {} active reference picture(s) and this \
+             encode uses {}; using key frames",
+            caps.max_active_reference_pictures, active_reference_pictures
+        );
+        return None;
+    }
+    if caps.max_cycle_duration == 0 {
+        warn!("intra refresh requested, but the device reports no usable cycle; using key frames");
+        return None;
+    }
+    let cycle_duration = cycle.min(caps.max_cycle_duration).max(2);
+    if cycle_duration != cycle {
+        debug!(
+            "intra refresh cycle {cycle} exceeds the device maximum {}; using {cycle_duration}",
+            caps.max_cycle_duration
+        );
+    }
+    debug!("intra refresh on: {cycle_duration} pictures per cycle, mode {mode:?}");
+    Some(IntraRefreshState {
+        cycle_duration,
+        index: 0,
+        slot_index: vec![None; dpb_slot_count],
+        mode,
+    })
+}
+
+/// The per-picture intra refresh structs, and the reference slots updated to
+/// declare how stale each of them is.
+///
+/// Returned together because the reference structs must stay alive as long as
+/// the slots that point at them, and separating the two invites one being
+/// dropped while the other is still being read by the driver.
+pub(crate) struct IntraRefreshFrame {
+    pub info: vk::VideoEncodeIntraRefreshInfoKHR<'static>,
+    pub dirty: Vec<vk::VideoReferenceIntraRefreshInfoKHR<'static>>,
+}
+
+/// Note that a picture has been committed, and move the cycle on.
+///
+/// Called after the encode is submitted rather than before, for the same
+/// reason the H.264 unmark queue is cleared there: a failure on the way to the
+/// queue leaves the picture unencoded, and a cycle that advanced anyway would
+/// have every later picture claiming a refresh position one ahead of what the
+/// stream actually contains -- which a decoder cannot detect and cannot
+/// recover from, because every region would appear refreshed a picture before
+/// it really was.
+pub(crate) fn intra_refresh_committed(common: &mut EncoderCommon, slot: usize, was_idr: bool) {
+    let Some(ir) = common.intra_refresh.as_mut() else {
+        return;
+    };
+    if was_idr {
+        // A key frame refreshed the whole picture at once, so the cycle has
+        // nothing left to do and starts again from a clean reference.
+        ir.restart();
+        ir.wrote_slot(slot, true);
+        return;
+    }
+    ir.wrote_slot(slot, false);
+    ir.advance();
+}
+
+/// Build this picture's intra refresh structs, if refresh is on.
+///
+/// The caller must chain `dirty[i]` onto reference slot `i` and `info` onto
+/// the encode info, and set [`vk::VideoEncodeFlagsKHR::INTRA_REFRESH`].
+pub(crate) fn intra_refresh_frame(
+    common: &EncoderCommon,
+    ref_slots: &[vk::VideoReferenceSlotInfoKHR],
+) -> Option<IntraRefreshFrame> {
+    let ir = common.intra_refresh.as_ref()?;
+    let dirty = ref_slots
+        .iter()
+        .map(|slot| {
+            // A negative slot index means "no slot", which cannot be stale
+            // because there is nothing there to be stale.
+            let regions = usize::try_from(slot.slot_index)
+                .map(|s| ir.dirty_regions(s))
+                .unwrap_or(0);
+            vk::VideoReferenceIntraRefreshInfoKHR::default().dirty_intra_refresh_regions(regions)
+        })
+        .collect();
+    Some(IntraRefreshFrame {
+        info: vk::VideoEncodeIntraRefreshInfoKHR::default()
+            .intra_refresh_cycle_duration(ir.cycle_duration)
+            .intra_refresh_index(ir.index),
+        dirty,
+    })
+}
+
 pub(crate) struct CommonInitRequest<'a> {
     pub context: &'a VideoContext,
     pub config: &'a EncodeConfig,
@@ -597,6 +794,9 @@ pub(crate) struct CommonInitRequest<'a> {
     /// alongside the codec capabilities when [`EncodeConfig::rgb_input`] is
     /// set.
     pub rgb_caps: Option<RgbConversionCaps>,
+    /// What the device said about intra refresh for this profile, read from
+    /// the codec's own capability query.
+    pub intra_refresh_caps: IntraRefreshCaps,
 }
 
 /// The profile struct that turns on RGB input. When
@@ -892,6 +1092,19 @@ pub(crate) fn build_encoder_common(req: &CommonInitRequest) -> Result<CommonInit
 
     // Use the driver-reported std header version for this profile.
     let std_header_version = capabilities.std_header_version;
+    // Resolved before the session is made, because the mode is session state:
+    // a session not created for intra refresh cannot be told to do it later.
+    let intra_refresh = resolve_intra_refresh(
+        context,
+        config,
+        req.intra_refresh_caps,
+        dpb_slot_count,
+        max_active_reference_pictures as u32,
+    );
+    let mut intra_refresh_create = intra_refresh.as_ref().map(|ir| {
+        vk::VideoEncodeSessionIntraRefreshCreateInfoKHR::default().intra_refresh_mode(ir.mode)
+    });
+
     let mut rgb_session_info = rgb_session.unwrap_or_default();
     let mut session_create_info = vk::VideoSessionCreateInfoKHR::default()
         .queue_family_index(encode_queue_family)
@@ -908,6 +1121,9 @@ pub(crate) fn build_encoder_common(req: &CommonInitRequest) -> Result<CommonInit
         .std_header_version(&std_header_version);
     if rgb_session.is_some() {
         session_create_info = session_create_info.push(&mut rgb_session_info);
+    }
+    if let Some(ir) = intra_refresh_create.as_mut() {
+        session_create_info = session_create_info.push(ir);
     }
 
     let mut session = vk::VideoSessionKHR::null();
@@ -968,10 +1184,19 @@ pub(crate) fn build_encoder_common(req: &CommonInitRequest) -> Result<CommonInit
     // B-frames are not yet supported, so an I-P GOP. Set the SPS-matching
     // counters (no-ops for AV1, which keys off order hints).
     let mut gop = GopStructure::new_ip_only(config.gop_size);
+    if intra_refresh.is_some() {
+        // The refresh cycle *is* the recovery point, so a periodic key frame
+        // on top of it is the cost intra refresh exists to avoid, paid twice:
+        // once as the burst and again as the rate-control excursion that burst
+        // forces. The first picture is still an IDR -- a stream has to start
+        // somewhere -- and an explicitly requested one still works.
+        gop.set_gop_size(None);
+    }
     gop.set_max_frame_num(4);
     gop.set_max_poc_lsb(4);
 
     let common = EncoderCommon {
+        intra_refresh,
         context: context.clone(),
         config: config.clone(),
         video_queue_fn,
@@ -1061,5 +1286,91 @@ mod rate_control_support_tests {
         let cbr_only = vk::VideoEncodeRateControlModeFlagsKHR::CBR;
         assert!(rate_control_is_supported(RateControlMode::Cbr, cbr_only));
         assert!(!rate_control_is_supported(RateControlMode::Vbr, cbr_only));
+    }
+}
+
+#[cfg(test)]
+mod intra_refresh_tests {
+    use super::*;
+
+    fn state(cycle: u32, slots: usize) -> IntraRefreshState {
+        IntraRefreshState {
+            cycle_duration: cycle,
+            index: 0,
+            slot_index: vec![None; slots],
+            mode: vk::VideoEncodeIntraRefreshModeFlagsKHR::BLOCK_ROW_BASED,
+        }
+    }
+
+    /// A picture encoded at index `i` has refreshed regions `0..=i`, so
+    /// `cycle - (i + 1)` are left. Getting this wrong does not fail loudly --
+    /// the encode succeeds and the picture is subtly wrong for a whole cycle.
+    #[test]
+    fn a_reference_declares_the_regions_it_has_not_refreshed() {
+        let mut ir = state(4, 2);
+        // Nothing encoded yet: an untouched slot is clean, not stale.
+        assert_eq!(ir.dirty_regions(0), 0);
+
+        ir.wrote_slot(0, false); // encoded at index 0
+        assert_eq!(ir.dirty_regions(0), 3, "one region of four refreshed");
+        ir.advance();
+        ir.wrote_slot(1, false); // encoded at index 1
+        assert_eq!(ir.dirty_regions(1), 2);
+    }
+
+    /// The last picture of a cycle leaves nothing dirty, which is what makes
+    /// the cycle a recovery point at all.
+    #[test]
+    fn the_end_of_a_cycle_is_clean() {
+        let mut ir = state(3, 1);
+        for _ in 0..2 {
+            ir.advance();
+        }
+        assert_eq!(ir.index, 2, "last position of a three-picture cycle");
+        ir.wrote_slot(0, false);
+        assert_eq!(ir.dirty_regions(0), 0);
+    }
+
+    #[test]
+    fn a_cycle_wraps_rather_than_running_off_the_end() {
+        let mut ir = state(3, 1);
+        for _ in 0..7 {
+            ir.advance();
+            assert!(ir.index < 3, "index {} left the cycle", ir.index);
+        }
+    }
+
+    /// A key frame refreshes everything at once, so the cycle it was part way
+    /// through is finished, not merely interrupted.
+    #[test]
+    fn a_key_frame_restarts_the_cycle_and_clears_every_slot() {
+        let mut ir = state(4, 2);
+        ir.wrote_slot(0, false);
+        ir.advance();
+        ir.wrote_slot(1, false);
+        assert_ne!(ir.dirty_regions(0), 0);
+
+        ir.restart();
+        assert_eq!(ir.index, 0);
+        assert_eq!(
+            ir.dirty_regions(0),
+            0,
+            "a slot left stale across a key frame"
+        );
+        assert_eq!(ir.dirty_regions(1), 0);
+    }
+
+    /// Asking about a slot that does not exist must not panic mid-encode.
+    #[test]
+    fn an_unknown_slot_is_treated_as_clean() {
+        let ir = state(4, 1);
+        assert_eq!(ir.dirty_regions(99), 0);
+    }
+
+    #[test]
+    fn writing_a_slot_that_does_not_exist_is_ignored() {
+        let mut ir = state(4, 1);
+        ir.wrote_slot(99, false);
+        assert_eq!(ir.slot_index.len(), 1);
     }
 }

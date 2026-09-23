@@ -400,6 +400,18 @@ impl Av1 {
             .base_array_layer(0)
             .image_view_binding(input_image_view);
 
+        // See the H.264 path: each reference declares how much of it is still
+        // unrefreshed, and the two halves are split because chaining one onto
+        // a slot borrows it for as long as that slot lives.
+        let (mut refresh_info, mut refresh_dirty) =
+            match crate::encoder::codec::intra_refresh_frame(common, &reference_slots) {
+                Some(f) => (Some(f.info), f.dirty),
+                None => (None, Vec::new()),
+            };
+        for (slot, dirty) in reference_slots.iter_mut().zip(refresh_dirty.iter_mut()) {
+            *slot = (*slot).push(dirty);
+        }
+
         let mut encode_info = vk::VideoEncodeInfoKHR::default()
             .src_picture_resource(src_picture_resource)
             .dst_buffer(bitstream_buffer)
@@ -412,6 +424,11 @@ impl Av1 {
             encode_info = encode_info.reference_slots(&reference_slots);
         }
         encode_info = encode_info.push(&mut av1_picture_info);
+        if let Some(info) = refresh_info.as_mut() {
+            encode_info = encode_info
+                .flags(vk::VideoEncodeFlagsKHR::INTRA_REFRESH)
+                .push(info);
+        }
 
         unsafe {
             let device = common.device();
@@ -447,7 +464,13 @@ impl Av1 {
                 .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
         }
 
-        common.submit_frame()
+        let future = common.submit_frame();
+        crate::encoder::codec::intra_refresh_committed(
+            common,
+            common.current_dpb_slot as usize,
+            is_key_frame,
+        );
+        future
     }
 
     /// Build `ref_frame_idx`, `ref_order_hint`, `primary_ref_frame` and

@@ -356,6 +356,9 @@ pub struct DeviceFeatures {
     /// `videoEncodeRgbConversion`, from
     /// `VkPhysicalDeviceVideoEncodeRgbConversionFeaturesVALVE`.
     pub video_encode_rgb_conversion: bool,
+    /// `videoEncodeIntraRefresh`, from
+    /// `VkPhysicalDeviceVideoEncodeIntraRefreshFeaturesKHR`.
+    pub video_encode_intra_refresh: bool,
 }
 
 /// The queue families pixelforge selects for decoding on a given device.
@@ -608,6 +611,15 @@ struct VideoContextInner {
     has_push_descriptor: bool,
     has_video_encode_rgb_conversion: bool,
     has_unified_image_layouts: bool,
+    /// Whether `VK_KHR_video_encode_intra_refresh` is enabled on this device.
+    ///
+    /// Intra refresh spreads the work of a key frame across a cycle of
+    /// pictures, refreshing part of the image in each, instead of coding one
+    /// enormous picture that refreshes all of it at once. What it buys is not
+    /// compression but *evenness*: a key frame is the largest picture a stream
+    /// contains, so it is the one the rate control cannot fit and the one a
+    /// network cannot absorb.
+    has_video_encode_intra_refresh: bool,
     /// Whether this context created (and therefore must destroy) the device and
     /// instance. A context adopted from a caller's device borrows them and
     /// destroys neither.
@@ -740,6 +752,11 @@ impl VideoContext {
     /// to be sampled, copied from, or used as a reference.
     pub fn has_unified_image_layouts(&self) -> bool {
         self.inner.has_unified_image_layouts
+    }
+
+    /// Whether this device can encode with intra refresh.
+    pub fn has_video_encode_intra_refresh(&self) -> bool {
+        self.inner.has_video_encode_intra_refresh
     }
 }
 
@@ -1224,6 +1241,39 @@ impl VideoContext {
             push_ext(ash::khr::unified_image_layouts::NAME.as_ptr());
         }
 
+        // Intra refresh: an optional encode extension, queried the same way as
+        // the block above. Both the extension and the feature bit have to be
+        // there -- an extension present but its feature off means the driver
+        // parses the structs and ignores them, which is worse than absent
+        // because the stream would silently never refresh.
+        let has_intra_refresh_ext = video_encode_queue_family.is_some()
+            && selected_device_exts.as_ref().is_some_and(|exts| {
+                has_extension(exts, ash::khr::video_encode_intra_refresh::NAME)
+            });
+        let mut supported_intra_refresh =
+            vk::PhysicalDeviceVideoEncodeIntraRefreshFeaturesKHR::default();
+        if has_intra_refresh_ext {
+            let mut query =
+                vk::PhysicalDeviceFeatures2::default().push(&mut supported_intra_refresh);
+            unsafe {
+                instance.get_physical_device_features2(physical_device, &mut query);
+            }
+        }
+        let has_intra_refresh =
+            has_intra_refresh_ext && supported_intra_refresh.video_encode_intra_refresh != 0;
+        let mut intra_refresh_features =
+            vk::PhysicalDeviceVideoEncodeIntraRefreshFeaturesKHR::default()
+                .video_encode_intra_refresh(true);
+        if has_intra_refresh {
+            debug!("Video encode intra refresh available");
+            push_ext(ash::khr::video_encode_intra_refresh::NAME.as_ptr());
+        } else {
+            debug!(
+                "Video encode intra refresh unavailable (extension {}, feature {})",
+                has_intra_refresh_ext, supported_intra_refresh.video_encode_intra_refresh
+            );
+        }
+
         let mut supported_timeline_features =
             vk::PhysicalDeviceTimelineSemaphoreFeatures::default();
         let mut timeline_feature_query =
@@ -1286,6 +1336,9 @@ impl VideoContext {
 
         if has_unified_layouts {
             device_create_info = device_create_info.push(&mut unified_layout_features);
+        }
+        if has_intra_refresh {
+            device_create_info = device_create_info.push(&mut intra_refresh_features);
         }
 
         if supported_encode_codecs.contains(&Codec::AV1) {
@@ -1350,6 +1403,7 @@ impl VideoContext {
                 has_push_descriptor,
                 has_video_encode_rgb_conversion: has_rgb_conversion,
                 has_unified_image_layouts: has_unified_layouts,
+                has_video_encode_intra_refresh: has_intra_refresh,
                 owns_device: true,
                 debug_messenger,
             }),
@@ -1454,6 +1508,12 @@ impl VideoContext {
                 has_push_descriptor: false,
                 has_video_encode_rgb_conversion: false,
                 has_unified_image_layouts: declared_unified_image_layouts,
+                // An imported device was created by somebody else, so whether
+                // they asked for intra refresh is not knowable from here. Said
+                // no rather than guessed: claiming it and having the feature
+                // off means structs parsed and ignored, and a stream that
+                // silently never refreshes.
+                has_video_encode_intra_refresh: false,
                 owns_device: false,
                 // The caller owns the instance; reporting is theirs to set up.
                 debug_messenger: None,

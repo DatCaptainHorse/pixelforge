@@ -404,6 +404,22 @@ impl H264 {
             encode_ref_slots.extend_from_slice(&l0_slots);
         }
 
+        // Each reference declares how much of it is still unrefreshed, so the
+        // driver knows which parts of it the refreshed parts of this picture
+        // are forbidden to predict from. That prohibition is what makes intra
+        // refresh converge rather than drag stale data forward indefinitely.
+        // Split rather than kept whole: chaining a dirty-region struct onto a
+        // slot borrows it for as long as the slot lives, so holding both
+        // halves through one binding would keep the picture info borrowed too.
+        let (mut refresh_info, mut refresh_dirty) =
+            match crate::encoder::codec::intra_refresh_frame(common, &encode_ref_slots) {
+                Some(f) => (Some(f.info), f.dirty),
+                None => (None, Vec::new()),
+            };
+        for (slot, dirty) in encode_ref_slots.iter_mut().zip(refresh_dirty.iter_mut()) {
+            *slot = (*slot).push(dirty);
+        }
+
         let mut encode_info = vk::VideoEncodeInfoKHR::default()
             .dst_buffer(bitstream_buffer)
             .dst_buffer_offset(0)
@@ -414,6 +430,11 @@ impl H264 {
             encode_info = encode_info.reference_slots(&encode_ref_slots);
         }
         encode_info = encode_info.push(&mut h264_picture_info);
+        if let Some(info) = refresh_info.as_mut() {
+            encode_info = encode_info
+                .flags(vk::VideoEncodeFlagsKHR::INTRA_REFRESH)
+                .push(info);
+        }
 
         // Reference slots for begin coding (setup slot is marked inactive, -1).
         let mut reference_slots_for_begin = vec![setup_slot_for_begin];
@@ -557,6 +578,11 @@ impl H264 {
         }
 
         let future = common.submit_frame()?;
+        crate::encoder::codec::intra_refresh_committed(
+            common,
+            common.current_dpb_slot as usize,
+            is_idr,
+        );
         // Clear the unmark queue only after the encode is committed to the GPU.
         // If any fallible step above had failed, the MMCO ops would still live
         // in `pending_unmark_frame_nums` so a retry re-emits them — otherwise the

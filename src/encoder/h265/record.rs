@@ -506,7 +506,19 @@ impl H265 {
             common.rate_control_dirty = false;
         }
 
-        let encode_info = vk::VideoEncodeInfoKHR::default()
+        // See the H.264 path: each reference declares how much of it is still
+        // unrefreshed, and the two halves are split because chaining one onto
+        // a slot borrows it for as long as that slot lives.
+        let (mut refresh_info, mut refresh_dirty) =
+            match crate::encoder::codec::intra_refresh_frame(common, &reference_slots) {
+                Some(f) => (Some(f.info), f.dirty),
+                None => (None, Vec::new()),
+            };
+        for (slot, dirty) in reference_slots.iter_mut().zip(refresh_dirty.iter_mut()) {
+            *slot = (*slot).push(dirty);
+        }
+
+        let mut encode_info = vk::VideoEncodeInfoKHR::default()
             .flags(vk::VideoEncodeFlagsKHR::empty())
             .src_picture_resource(src_picture_resource)
             .setup_reference_slot(&setup_slot_info)
@@ -515,6 +527,11 @@ impl H265 {
             .dst_buffer_offset(0)
             .dst_buffer_range(bitstream_buffer_size as u64)
             .push(&mut h265_picture_info);
+        if let Some(info) = refresh_info.as_mut() {
+            encode_info = encode_info
+                .flags(vk::VideoEncodeFlagsKHR::INTRA_REFRESH)
+                .push(info);
+        }
 
         debug!(
             "h265 submit frame {}: idr={}, num_refs={}, cur_slot={}",
@@ -554,6 +571,12 @@ impl H265 {
                 .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
         }
 
-        common.submit_frame()
+        let future = common.submit_frame();
+        crate::encoder::codec::intra_refresh_committed(
+            common,
+            common.current_dpb_slot as usize,
+            is_idr,
+        );
+        future
     }
 }
