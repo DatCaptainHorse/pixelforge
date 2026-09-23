@@ -7,6 +7,10 @@ use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
 use tracing::{debug, info, warn};
 
+mod queues;
+use queues::QueueOverrides;
+pub use queues::{DeviceQueue, QueueRoles};
+
 /// Route validation-layer messages into `tracing`.
 ///
 /// Without a messenger the validation layer has nowhere to report to and its
@@ -60,6 +64,7 @@ pub struct VideoContextBuilder {
     /// enables unified image layouts when the device supports them, and one
     /// that adopts a caller's device assumes they were not enabled.
     unified_image_layouts: Option<bool>,
+    queues: QueueOverrides,
 }
 
 impl Default for VideoContextBuilder {
@@ -78,6 +83,7 @@ impl VideoContextBuilder {
             required_encode_codecs: Vec::new(),
             required_decode_codecs: Vec::new(),
             unified_image_layouts: None,
+            queues: QueueOverrides::default(),
         }
     }
 
@@ -111,6 +117,42 @@ impl VideoContextBuilder {
         self
     }
 
+    /// Submit video decode work to `queue` on an adopted device.
+    ///
+    /// See [`Self::with_transfer_queue`] for why this matters. Ignored by
+    /// [`Self::build`], which creates its own device and owns every queue on
+    /// it.
+    pub fn with_decode_queue(mut self, queue: DeviceQueue) -> Self {
+        self.queues.decode = Some(queue);
+        self
+    }
+
+    /// Submit uploads and readback copies to `queue` on an adopted device.
+    ///
+    /// Without this, an adopted context takes queue 0 of each family it needs,
+    /// and on most hardware queue 0 of the transfer and compute families is the
+    /// caller's own graphics queue. A `VkQueue` must not be submitted to from
+    /// two threads at once, so a caller that keeps submitting to its queue
+    /// while pixelforge works on another thread has to either create a spare
+    /// queue and give it here, or create its queue with
+    /// `VK_DEVICE_QUEUE_CREATE_INTERNALLY_SYNCHRONIZED_BIT_KHR` (see
+    /// [`DeviceRequirements::internally_synchronized_queues`]).
+    ///
+    /// The queue's family must support transfer, and `queue.index` must be
+    /// below the number of queues the caller created in that family. The
+    /// second part cannot be checked. Ignored by [`Self::build`].
+    pub fn with_transfer_queue(mut self, queue: DeviceQueue) -> Self {
+        self.queues.transfer = Some(queue);
+        self
+    }
+
+    /// Submit the colour converter's dispatches to `queue` on an adopted
+    /// device. See [`Self::with_transfer_queue`]. Ignored by [`Self::build`].
+    pub fn with_compute_queue(mut self, queue: DeviceQueue) -> Self {
+        self.queues.compute = Some(queue);
+        self
+    }
+
     /// Build the VideoContext.
     pub fn build(self) -> Result<VideoContext> {
         VideoContext::new(self)
@@ -138,10 +180,21 @@ impl VideoContextBuilder {
         if unified_image_layouts {
             extensions.push(ash::khr::unified_image_layouts::NAME);
         }
+        let queues = QueueRoles {
+            encode: None,
+            decode: Some(families.decode),
+            transfer: families.transfer,
+            compute: families.compute,
+        };
         Ok(DeviceRequirements {
-            queue_families: families.unique(),
+            queue_families: queues.unique_families(),
+            queues,
             extensions,
             unified_image_layouts,
+            internally_synchronized_queues: supports_internally_synchronized_queues(
+                instance,
+                physical_device,
+            ),
         })
     }
 
@@ -200,6 +253,7 @@ impl VideoContextBuilder {
         VideoContext::from_existing_decode(
             self.required_decode_codecs,
             self.unified_image_layouts.unwrap_or(false),
+            self.queues,
             entry,
             instance,
             physical_device,
@@ -219,6 +273,12 @@ pub struct DeviceRequirements {
     /// Queue families pixelforge needs a queue created for. Merge these with
     /// your own (deduplicated) when building the device.
     pub queue_families: Vec<u32>,
+    /// The family behind each role in [`Self::queue_families`]. An adopted
+    /// context takes queue 0 of each unless told otherwise with
+    /// [`VideoContextBuilder::with_transfer_queue`] and friends, which is
+    /// where a caller that needs its own queue to itself points pixelforge at
+    /// a spare one.
+    pub queues: QueueRoles,
     /// Device extensions pixelforge needs enabled. Merge with your own.
     pub extensions: Vec<&'static std::ffi::CStr>,
     /// Whether this device can support unified image layouts for video, which
@@ -234,6 +294,17 @@ pub struct DeviceRequirements {
     /// into a private image, which is correct but costs a full-frame GPU copy
     /// per frame.
     pub unified_image_layouts: bool,
+    /// Whether this device supports `VK_KHR_internally_synchronized_queues`.
+    ///
+    /// A queue created with `VK_DEVICE_QUEUE_CREATE_INTERNALLY_SYNCHRONIZED_BIT_KHR`
+    /// (and the `internallySynchronizedQueues` feature enabled) may be
+    /// submitted to from several threads at once, the driver doing the
+    /// locking. That makes it safe to give pixelforge the same queue the
+    /// caller uses, which is the way out on hardware with too few queues to
+    /// spare one. Pixelforge needs to be told nothing: it is the caller's
+    /// queue that has to be created this way. The extension is not in
+    /// [`Self::extensions`], since only a caller sharing its queue needs it.
+    pub internally_synchronized_queues: bool,
 }
 
 /// The queue families pixelforge selects for decoding on a given device.
@@ -241,19 +312,6 @@ struct DecodeQueueFamilies {
     decode: u32,
     transfer: u32,
     compute: u32,
-}
-
-impl DecodeQueueFamilies {
-    /// The distinct families, in a stable order.
-    fn unique(&self) -> Vec<u32> {
-        let mut out = vec![self.decode];
-        for f in [self.transfer, self.compute] {
-            if !out.contains(&f) {
-                out.push(f);
-            }
-        }
-        out
-    }
 }
 
 /// Select the decode / transfer / compute queue families on `physical_device`,
@@ -365,6 +423,29 @@ fn supports_unified_image_layouts(
     let mut query = vk::PhysicalDeviceFeatures2::default().push(&mut features);
     unsafe { instance.get_physical_device_features2(physical_device, &mut query) };
     features.unified_image_layouts != 0 && features.unified_image_layouts_video != 0
+}
+
+/// Whether `physical_device` supports `VK_KHR_internally_synchronized_queues`,
+/// extension and feature both.
+fn supports_internally_synchronized_queues(
+    instance: &ash::Instance,
+    physical_device: vk::PhysicalDevice,
+) -> bool {
+    let exts = match unsafe { instance.enumerate_device_extension_properties(physical_device) } {
+        Ok(exts) => exts,
+        Err(_) => return false,
+    };
+    let present = exts.iter().any(|ext| {
+        let name = unsafe { std::ffi::CStr::from_ptr(ext.extension_name.as_ptr()) };
+        name == ash::khr::internally_synchronized_queues::NAME
+    });
+    if !present {
+        return false;
+    }
+    let mut features = vk::PhysicalDeviceInternallySynchronizedQueuesFeaturesKHR::default();
+    let mut query = vk::PhysicalDeviceFeatures2::default().push(&mut features);
+    unsafe { instance.get_physical_device_features2(physical_device, &mut query) };
+    features.internally_synchronized_queues != 0
 }
 
 fn decode_extension_names(decode_codecs: &[Codec]) -> Vec<&'static std::ffi::CStr> {
@@ -1135,6 +1216,7 @@ impl VideoContext {
     fn from_existing_decode(
         required_decode_codecs: Vec<Codec>,
         declared_unified_image_layouts: bool,
+        queue_overrides: QueueOverrides,
         entry: ash::Entry,
         instance: ash::Instance,
         physical_device: vk::PhysicalDevice,
@@ -1151,10 +1233,34 @@ impl VideoContext {
         let memory_properties =
             unsafe { instance.get_physical_device_memory_properties(physical_device) };
 
-        // The caller created a queue for each family (from device_requirements).
-        let video_decode_queue = unsafe { device.get_device_queue(families.decode, 0) };
-        let transfer_queue = unsafe { device.get_device_queue(families.transfer, 0) };
-        let compute_queue = unsafe { device.get_device_queue(families.compute, 0) };
+        let decode = queues::resolve(
+            &instance,
+            physical_device,
+            "decode",
+            queue_overrides.decode,
+            families.decode,
+            vk::QueueFlags::VIDEO_DECODE_KHR,
+        )?;
+        let transfer = queues::resolve(
+            &instance,
+            physical_device,
+            "transfer",
+            queue_overrides.transfer,
+            families.transfer,
+            vk::QueueFlags::TRANSFER,
+        )?;
+        let compute = queues::resolve(
+            &instance,
+            physical_device,
+            "compute",
+            queue_overrides.compute,
+            families.compute,
+            vk::QueueFlags::COMPUTE,
+        )?;
+
+        let video_decode_queue = unsafe { device.get_device_queue(decode.family, decode.index) };
+        let transfer_queue = unsafe { device.get_device_queue(transfer.family, transfer.index) };
+        let compute_queue = unsafe { device.get_device_queue(compute.family, compute.index) };
 
         let supported_decode_codecs = query_decode_codecs(&entry, &instance, physical_device);
 
@@ -1173,8 +1279,8 @@ impl VideoContext {
         }
 
         info!(
-            "Adopted caller device for decode: decode family {}, transfer family {}, compute family {}",
-            families.decode, families.transfer, families.compute
+            "Adopted caller device for decode: decode queue {:?}, transfer queue {:?}, compute queue {:?}",
+            decode, transfer, compute
         );
 
         Ok(VideoContext {
@@ -1186,11 +1292,11 @@ impl VideoContext {
                 video_encode_queue_family: None,
                 video_encode_timestamp_valid_bits: 0u32,
                 video_encode_queue: None,
-                video_decode_queue_family: Some(families.decode),
+                video_decode_queue_family: Some(decode.family),
                 video_decode_queue: Some(video_decode_queue),
-                transfer_queue_family: families.transfer,
+                transfer_queue_family: transfer.family,
                 transfer_queue,
-                compute_queue_family: families.compute,
+                compute_queue_family: compute.family,
                 compute_queue,
                 memory_properties,
                 device_properties,
