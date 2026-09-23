@@ -106,6 +106,8 @@ fn create_app_device(
         .video_encode_rgb_conversion(true);
     let mut qp_map = vk::PhysicalDeviceVideoEncodeQuantizationMapFeaturesKHR::default()
         .video_encode_quantization_map(true);
+    let mut intra_refresh = vk::PhysicalDeviceVideoEncodeIntraRefreshFeaturesKHR::default()
+        .video_encode_intra_refresh(true);
     let mut unified = vk::PhysicalDeviceUnifiedImageLayoutsFeaturesKHR::default()
         .unified_image_layouts(true)
         .unified_image_layouts_video(true);
@@ -126,6 +128,9 @@ fn create_app_device(
     }
     if features.video_encode_quantization_map {
         info = info.push(&mut qp_map);
+    }
+    if features.video_encode_intra_refresh {
+        info = info.push(&mut intra_refresh);
     }
     if reqs.unified_image_layouts {
         info = info.push(&mut unified);

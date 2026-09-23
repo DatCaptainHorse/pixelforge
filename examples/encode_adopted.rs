@@ -110,6 +110,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if features.video_encode_quantization_map {
         device_info = device_info.push(&mut qp_map);
     }
+    let mut intra_refresh = vk::PhysicalDeviceVideoEncodeIntraRefreshFeaturesKHR::default()
+        .video_encode_intra_refresh(true);
+    if features.video_encode_intra_refresh {
+        device_info = device_info.push(&mut intra_refresh);
+    }
     let device = unsafe { instance.create_device(physical_device, &device_info, None)? };
 
     // --- Hand the application's device to pixelforge ---
