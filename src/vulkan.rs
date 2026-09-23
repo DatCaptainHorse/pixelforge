@@ -359,6 +359,9 @@ pub struct DeviceFeatures {
     /// `videoEncodeIntraRefresh`, from
     /// `VkPhysicalDeviceVideoEncodeIntraRefreshFeaturesKHR`.
     pub video_encode_intra_refresh: bool,
+    /// `videoEncodeQuantizationMap`, from
+    /// `VkPhysicalDeviceVideoEncodeQuantizationMapFeaturesKHR`.
+    pub video_encode_quantization_map: bool,
 }
 
 /// The queue families pixelforge selects for decoding on a given device.
@@ -620,6 +623,9 @@ struct VideoContextInner {
     /// contains, so it is the one the rate control cannot fit and the one a
     /// network cannot absorb.
     has_video_encode_intra_refresh: bool,
+    /// Whether `VK_KHR_video_encode_quantization_map` is enabled on this
+    /// device.
+    has_video_encode_quantization_map: bool,
     /// Whether this context created (and therefore must destroy) the device and
     /// instance. A context adopted from a caller's device borrows them and
     /// destroys neither.
@@ -757,6 +763,12 @@ impl VideoContext {
     /// Whether this device can encode with intra refresh.
     pub fn has_video_encode_intra_refresh(&self) -> bool {
         self.inner.has_video_encode_intra_refresh
+    }
+
+    /// Whether `VK_KHR_video_encode_quantization_map` is enabled on this
+    /// device, extension and feature bit both.
+    pub fn has_video_encode_quantization_map(&self) -> bool {
+        self.inner.has_video_encode_quantization_map
     }
 }
 
@@ -1274,6 +1286,38 @@ impl VideoContext {
             );
         }
 
+        // Quantization delta maps: a per-block QP adjustment applied on top of
+        // whatever the rate controller chose. Same extension-plus-feature
+        // shape as intra refresh above, and the same trap -- an extension
+        // present with its feature off means the driver parses the structs
+        // and ignores them, so the map would be built and uploaded every
+        // frame and change nothing.
+        let has_qp_map_ext = video_encode_queue_family.is_some()
+            && selected_device_exts.as_ref().is_some_and(|exts| {
+                has_extension(exts, ash::khr::video_encode_quantization_map::NAME)
+            });
+        let mut supported_qp_map =
+            vk::PhysicalDeviceVideoEncodeQuantizationMapFeaturesKHR::default();
+        if has_qp_map_ext {
+            let mut query = vk::PhysicalDeviceFeatures2::default().push(&mut supported_qp_map);
+            unsafe {
+                instance.get_physical_device_features2(physical_device, &mut query);
+            }
+        }
+        let has_qp_map = has_qp_map_ext && supported_qp_map.video_encode_quantization_map != 0;
+        let mut qp_map_features =
+            vk::PhysicalDeviceVideoEncodeQuantizationMapFeaturesKHR::default()
+                .video_encode_quantization_map(true);
+        if has_qp_map {
+            debug!("Video encode quantization map available");
+            push_ext(ash::khr::video_encode_quantization_map::NAME.as_ptr());
+        } else {
+            debug!(
+                "Video encode quantization map unavailable (extension {}, feature {})",
+                has_qp_map_ext, supported_qp_map.video_encode_quantization_map
+            );
+        }
+
         let mut supported_timeline_features =
             vk::PhysicalDeviceTimelineSemaphoreFeatures::default();
         let mut timeline_feature_query =
@@ -1340,6 +1384,9 @@ impl VideoContext {
         if has_intra_refresh {
             device_create_info = device_create_info.push(&mut intra_refresh_features);
         }
+        if has_qp_map {
+            device_create_info = device_create_info.push(&mut qp_map_features);
+        }
 
         if supported_encode_codecs.contains(&Codec::AV1) {
             device_create_info = device_create_info.push(&mut av1_encode_features);
@@ -1404,6 +1451,7 @@ impl VideoContext {
                 has_video_encode_rgb_conversion: has_rgb_conversion,
                 has_unified_image_layouts: has_unified_layouts,
                 has_video_encode_intra_refresh: has_intra_refresh,
+                has_video_encode_quantization_map: has_qp_map,
                 owns_device: true,
                 debug_messenger,
             }),
@@ -1514,6 +1562,7 @@ impl VideoContext {
                 // off means structs parsed and ignored, and a stream that
                 // silently never refreshes.
                 has_video_encode_intra_refresh: false,
+                has_video_encode_quantization_map: false,
                 owns_device: false,
                 // The caller owns the instance; reporting is theirs to set up.
                 debug_messenger: None,

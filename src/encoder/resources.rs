@@ -519,6 +519,219 @@ pub(crate) struct UploadParams<'a> {
 /// - Submitting the command buffer and waiting for completion
 ///
 /// Returns Ok(()) on success, or an error if any Vulkan operation fails.
+/// The quantization delta maps for one intra refresh cycle.
+///
+/// One image per cycle index, because the band's position is a pure function
+/// of that index: there are exactly `cycle_duration` distinct maps and they
+/// repeat forever. Building them once at session creation costs a few
+/// kilobytes and removes the map from the per-frame path entirely.
+pub(crate) struct QpMapImages {
+    pub images: Vec<vk::Image>,
+    pub memory: Vec<vk::DeviceMemory>,
+    pub views: Vec<vk::ImageView>,
+    pub extent: vk::Extent2D,
+}
+
+impl QpMapImages {
+    /// The view to bind for the picture at `index` in the cycle.
+    pub fn view_for(&self, index: u32) -> Option<vk::ImageView> {
+        self.views
+            .get(index as usize % self.views.len().max(1))
+            .copied()
+    }
+}
+
+/// Build and fill the per-index delta maps.
+///
+/// Linear tiling and host-visible memory, written directly. A delta map is a
+/// few kilobytes written once, so a staging buffer and a device-local copy
+/// would be machinery in exchange for nothing -- and the device offers linear
+/// for this usage, which is what makes the shortcut available rather than a
+/// gamble. Images start `PREINITIALIZED` so the host writes survive the one
+/// transition into the layout the encoder reads them in.
+pub(crate) fn create_qp_map_images(
+    context: &crate::vulkan::VideoContext,
+    profile_info: &vk::VideoProfileInfoKHR,
+    format: vk::Format,
+    extent: vk::Extent2D,
+    maps: &[Vec<i16>],
+    command_buffer: vk::CommandBuffer,
+    fence: vk::Fence,
+) -> Result<QpMapImages> {
+    let device = context.device();
+    let profiles = [*profile_info];
+    let mut out = QpMapImages {
+        images: Vec::with_capacity(maps.len()),
+        memory: Vec::with_capacity(maps.len()),
+        views: Vec::with_capacity(maps.len()),
+        extent,
+    };
+
+    for map in maps {
+        let mut profile_list = vk::VideoProfileListInfoKHR::default().profiles(&profiles);
+        let create = vk::ImageCreateInfo::default()
+            .image_type(vk::ImageType::TYPE_2D)
+            .format(format)
+            .extent(vk::Extent3D {
+                width: extent.width,
+                height: extent.height,
+                depth: 1,
+            })
+            .mip_levels(1)
+            .array_layers(1)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .tiling(vk::ImageTiling::LINEAR)
+            .usage(vk::ImageUsageFlags::VIDEO_ENCODE_QUANTIZATION_DELTA_MAP_KHR)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .initial_layout(vk::ImageLayout::PREINITIALIZED)
+            .push(&mut profile_list);
+        let image = unsafe { device.create_image(&create, None) }
+            .map_err(|e| PixelForgeError::ResourceCreation(format!("qp map image: {e}")))?;
+
+        let reqs = unsafe { device.get_image_memory_requirements(image) };
+        let type_index = context
+            .find_memory_type(
+                reqs.memory_type_bits,
+                vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+            )
+            .ok_or_else(|| {
+                PixelForgeError::ResourceCreation(
+                    "no host-visible memory for a quantization map".to_string(),
+                )
+            })?;
+        let alloc = vk::MemoryAllocateInfo::default()
+            .allocation_size(reqs.size)
+            .memory_type_index(type_index);
+        let memory = unsafe { device.allocate_memory(&alloc, None) }
+            .map_err(|e| PixelForgeError::ResourceCreation(format!("qp map memory: {e}")))?;
+        unsafe { device.bind_image_memory(image, memory, 0) }
+            .map_err(|e| PixelForgeError::ResourceCreation(format!("qp map bind: {e}")))?;
+
+        // Row pitch is the driver's, not width * 2: a linear image may be
+        // padded, and writing as though it were tight puts every row after
+        // the first at the wrong offset.
+        let layout = unsafe {
+            device.get_image_subresource_layout(
+                image,
+                vk::ImageSubresource {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    mip_level: 0,
+                    array_layer: 0,
+                },
+            )
+        };
+        // The element width is the device's: RADV asks for R16_SINT and
+        // NVIDIA for R8_SINT, and writing the wrong one puts every texel after
+        // the first at the wrong offset and runs off the end of the row.
+        let element = crate::encoder::codec::qp_map_element_bytes(format).ok_or_else(|| {
+            PixelForgeError::ResourceCreation(format!(
+                "quantization map format {format:?} has no known element width"
+            ))
+        })?;
+        unsafe {
+            let base = device
+                .map_memory(memory, 0, reqs.size, vk::MemoryMapFlags::empty())
+                .map_err(|e| PixelForgeError::ResourceCreation(format!("qp map map: {e}")))?
+                as *mut u8;
+            for row in 0..extent.height as usize {
+                let src = &map[row * extent.width as usize..][..extent.width as usize];
+                let row_base = base.add(layout.offset as usize + row * layout.row_pitch as usize);
+                match element {
+                    1 => {
+                        let dst = row_base.cast::<i8>();
+                        for (i, v) in src.iter().enumerate() {
+                            dst.add(i)
+                                .write_unaligned(crate::encoder::codec::qp_delta_as_i8(*v));
+                        }
+                    }
+                    _ => {
+                        let dst = row_base.cast::<i16>();
+                        std::ptr::copy_nonoverlapping(src.as_ptr(), dst, extent.width as usize);
+                    }
+                }
+            }
+            device.unmap_memory(memory);
+        }
+
+        let view_info = vk::ImageViewCreateInfo::default()
+            .image(image)
+            .view_type(vk::ImageViewType::TYPE_2D)
+            .format(format)
+            .subresource_range(vk::ImageSubresourceRange {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                base_mip_level: 0,
+                level_count: 1,
+                base_array_layer: 0,
+                layer_count: 1,
+            });
+        let view = unsafe { device.create_image_view(&view_info, None) }
+            .map_err(|e| PixelForgeError::ResourceCreation(format!("qp map view: {e}")))?;
+
+        out.images.push(image);
+        out.memory.push(memory);
+        out.views.push(view);
+    }
+
+    // One submission transitions the lot. HOST_WRITE is named as the source
+    // access so the writes above are visible to the encoder.
+    unsafe {
+        device
+            .reset_command_buffer(command_buffer, vk::CommandBufferResetFlags::empty())
+            .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
+        let begin = vk::CommandBufferBeginInfo::default()
+            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+        device
+            .begin_command_buffer(command_buffer, &begin)
+            .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
+        let barriers: Vec<vk::ImageMemoryBarrier> = out
+            .images
+            .iter()
+            .map(|image| {
+                vk::ImageMemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::HOST_WRITE)
+                    .dst_access_mask(vk::AccessFlags::empty())
+                    .old_layout(vk::ImageLayout::PREINITIALIZED)
+                    .new_layout(vk::ImageLayout::VIDEO_ENCODE_QUANTIZATION_MAP_KHR)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .image(*image)
+                    .subresource_range(vk::ImageSubresourceRange {
+                        aspect_mask: vk::ImageAspectFlags::COLOR,
+                        base_mip_level: 0,
+                        level_count: 1,
+                        base_array_layer: 0,
+                        layer_count: 1,
+                    })
+            })
+            .collect();
+        device.cmd_pipeline_barrier(
+            command_buffer,
+            vk::PipelineStageFlags::HOST,
+            vk::PipelineStageFlags::TOP_OF_PIPE,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &barriers,
+        );
+        device
+            .end_command_buffer(command_buffer)
+            .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
+        let buffers = [command_buffer];
+        let submit = vk::SubmitInfo::default().command_buffers(&buffers);
+        device
+            .reset_fences(&[fence])
+            .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
+        device
+            .queue_submit(context.transfer_queue(), &[submit], fence)
+            .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
+        device
+            .wait_for_fences(&[fence], true, u64::MAX)
+            .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
+    }
+
+    Ok(out)
+}
+
 pub(crate) fn upload_image_to_input(
     context: &crate::vulkan::VideoContext,
     params: &UploadParams<'_>,

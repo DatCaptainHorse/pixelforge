@@ -152,10 +152,21 @@ impl Av1 {
                 .std_operating_points(std::slice::from_ref(&operating_point));
 
         let mut quality_info = vk::VideoEncodeQualityLevelInfoKHR::default().quality_level(0);
-        let session_params_create_info = vk::VideoSessionParametersCreateInfoKHR::default()
+        let mut session_params_create_info = vk::VideoSessionParametersCreateInfoKHR::default()
             .video_session(common.session)
             .push(&mut quality_info)
             .push(&mut av1_session_params_create_info);
+
+        // The texel size belongs to the session parameters, not the session,
+        // so parameters rebuilt later have to be told it again or they
+        // disagree with the maps already allocated.
+        let mut qp_map_params = common.qp_map.as_ref().map(|m| {
+            vk::VideoEncodeQuantizationMapSessionParametersCreateInfoKHR::default()
+                .quantization_map_texel_size(m.texel_size)
+        });
+        if let Some(info) = qp_map_params.as_mut() {
+            session_params_create_info = session_params_create_info.push(info);
+        }
 
         unsafe {
             common

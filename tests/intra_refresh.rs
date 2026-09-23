@@ -66,6 +66,14 @@ fn refresh_shape() -> Option<IntraRefreshShape> {
     }
 }
 
+/// The QP adjustment applied inside the refresh band, on the codec's own
+/// scale. Zero turns the delta map off entirely, which is the control.
+fn qp_delta() -> Option<i32> {
+    std::env::var("PIXELFORGE_QP_DELTA")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+}
+
 fn refresh_mode() -> IntraRefresh {
     if std::env::var("PIXELFORGE_LIMIT_PREDICTION").is_ok() {
         IntraRefresh::Recovering
@@ -148,6 +156,7 @@ fn run_codec(
     .with_gop_size(GOP_FRAMES)
     .with_intra_refresh(refresh)
     .with_intra_refresh_mode(refresh_shape())
+    .with_intra_refresh_qp_delta(qp_delta())
     .with_max_reference_frames(max_refs)
     .with_b_frames(0);
 

@@ -105,6 +105,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if features.video_encode_rgb_conversion {
         device_info = device_info.push(&mut rgb);
     }
+    let mut qp_map = vk::PhysicalDeviceVideoEncodeQuantizationMapFeaturesKHR::default()
+        .video_encode_quantization_map(true);
+    if features.video_encode_quantization_map {
+        device_info = device_info.push(&mut qp_map);
+    }
     let device = unsafe { instance.create_device(physical_device, &device_info, None)? };
 
     // --- Hand the application's device to pixelforge ---

@@ -21,7 +21,7 @@ use crate::encoder::gop::{GopFrameType, GopPosition, GopStructure};
 use crate::encoder::pipeline::{EncodeFuture, EncodePipeline, PipelineConfig, SlotPacketMetadata};
 use crate::encoder::resources::{
     EncoderTeardown, UploadParams, align_up, allocate_session_memory, create_command_resources,
-    create_dpb_images, destroy_encoder_resources, get_video_format, lcm,
+    create_dpb_images, create_qp_map_images, destroy_encoder_resources, get_video_format, lcm,
     query_supported_video_formats, upload_image_to_input,
 };
 use crate::encoder::{
@@ -76,6 +76,8 @@ pub(crate) struct EncoderCommon {
     /// `None` means key frames, which is what every stream did before this
     /// existed and what a device without the extension still does.
     pub intra_refresh: Option<IntraRefreshState>,
+    /// The per-cycle-index quantization delta maps, when the band gets one.
+    pub qp_map: Option<QpMapState>,
 
     pub dpb_images: Vec<vk::Image>,
     pub dpb_image_memories: Vec<vk::DeviceMemory>,
@@ -565,6 +567,20 @@ impl<C: VideoCodec> Drop for CodecEncoder<C> {
 
             common.pipeline.destroy(device);
 
+            // Before the pools and the session, so nothing still references
+            // these when they go.
+            if let Some(map) = common.qp_map.as_ref() {
+                for &view in &map.images.views {
+                    device.destroy_image_view(view, None);
+                }
+                for &image in &map.images.images {
+                    device.destroy_image(image, None);
+                }
+                for &memory in &map.images.memory {
+                    device.free_memory(memory, None);
+                }
+            }
+
             destroy_encoder_resources(
                 device,
                 &common.video_queue_fn,
@@ -762,6 +778,275 @@ pub(crate) fn av1_refresh_block(sizes: vk::VideoEncodeAV1SuperblockSizeFlagsKHR)
         }
     }
     128
+}
+
+/// What one profile offers for quantization delta maps.
+///
+/// Copied out of the Vulkan query so it outlives that call's pointer chain,
+/// the same reason [`IntraRefreshCaps`] exists. The delta bounds are on the
+/// codec's own scale -- QP for H.264 and H.265, the far wider q-index for AV1
+/// -- so a value meaningful for one is not meaningful for another.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct QpMapCaps {
+    pub min_delta: i32,
+    pub max_delta: i32,
+    pub max_extent: vk::Extent2D,
+}
+
+/// The shape of a quantization delta map, and where the refresh band falls in
+/// it.
+///
+/// A delta map is a small image carrying one signed QP adjustment per texel,
+/// applied on top of whatever the rate controller chose. The texel is the
+/// driver's own granularity and need not match the codec's block, so the band
+/// is worked out in pixels and then resolved to texels -- a texel carries the
+/// delta if it overlaps the band at all. Marking only the first texel of each
+/// block would leave most of the band at the normal QP wherever the driver's
+/// texel is the finer of the two.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct QpMapGeometry {
+    pub coded_width: u32,
+    pub coded_height: u32,
+    pub texel_width: u32,
+    pub texel_height: u32,
+    /// The codec block the sweep advances in -- macroblock, CTB or superblock.
+    pub block: u32,
+}
+
+impl QpMapGeometry {
+    /// The map image's size in texels.
+    pub fn extent(&self) -> (u32, u32) {
+        (
+            self.coded_width.div_ceil(self.texel_width.max(1)).max(1),
+            self.coded_height.div_ceil(self.texel_height.max(1)).max(1),
+        )
+    }
+
+    /// The map for one picture of a sweep: `delta` inside the band about to be
+    /// refreshed, zero everywhere else.
+    ///
+    /// The band is the same span the driver is about to intra-code, derived
+    /// the way the spec defines it: the blocks are divided into `cycle`
+    /// regions and this picture takes region `index`. Freshly intra-coded
+    /// blocks carry no accumulated refinement, so at the rate controller's
+    /// chosen QP they land visibly below neighbours that have been refined
+    /// across the whole cycle; a negative delta spends the difference back.
+    pub fn refresh_map(&self, along_columns: bool, index: u32, cycle: u32, delta: i16) -> Vec<i16> {
+        let (map_w, map_h) = self.extent();
+        let mut map = vec![0i16; (map_w as usize) * (map_h as usize)];
+        if delta == 0 || cycle == 0 {
+            return map;
+        }
+        let block = self.block.max(1);
+        let span = if along_columns {
+            self.coded_width
+        } else {
+            self.coded_height
+        };
+        let blocks = span.div_ceil(block).max(1);
+        // Rounded up, matching how the region offset is computed from the
+        // cycle: a region that does not quite cover its share leaves blocks
+        // the sweep never reaches.
+        let region_blocks = blocks.div_ceil(cycle);
+        let first_block = region_blocks.saturating_mul(index);
+        if first_block >= blocks {
+            // A cycle longer than the picture has regions. The cycle is
+            // clamped before it gets here, so this is the uneven-division
+            // tail rather than a misconfiguration.
+            return map;
+        }
+        let last_block = (first_block + region_blocks).min(blocks);
+        let (start_px, end_px) = (first_block * block, (last_block * block).min(span));
+
+        let texel = if along_columns {
+            self.texel_width
+        } else {
+            self.texel_height
+        }
+        .max(1);
+        // Half-open in pixels, so a texel counts when any part of it is in the
+        // band.
+        let first_texel = start_px / texel;
+        let last_texel = end_px.div_ceil(texel);
+
+        for t in first_texel..last_texel {
+            if along_columns {
+                if t >= map_w {
+                    break;
+                }
+                for row in 0..map_h {
+                    map[(row * map_w + t) as usize] = delta;
+                }
+            } else {
+                if t >= map_h {
+                    break;
+                }
+                for col in 0..map_w {
+                    map[(t * map_w + col) as usize] = delta;
+                }
+            }
+        }
+        map
+    }
+}
+
+/// The built delta maps, and the texel size the session parameters were
+/// created with.
+///
+/// The texel size is kept because session parameters have to be told it and
+/// are rebuilt independently of this -- a colour-description change makes new
+/// parameters, and they must agree with the maps already allocated.
+pub(crate) struct QpMapState {
+    pub images: crate::encoder::resources::QpMapImages,
+    pub texel_size: vk::Extent2D,
+}
+
+/// How wide one entry of a delta map is, for the format the device asked for.
+///
+/// `None` for anything this does not know how to write. Refusing is the point:
+/// the alternative is writing a guessed stride into a real image, which
+/// corrupts the map and overruns each row without failing anywhere visible.
+pub(crate) fn qp_map_element_bytes(format: vk::Format) -> Option<usize> {
+    match format {
+        vk::Format::R8_SINT => Some(1),
+        vk::Format::R16_SINT => Some(2),
+        _ => None,
+    }
+}
+
+/// A delta narrowed to one byte, saturating.
+///
+/// Every delta this crate produces fits comfortably; saturating rather than
+/// casting matters anyway, because a wrapped value flips sign and would
+/// coarsen exactly the band it was meant to sharpen.
+pub(crate) fn qp_delta_as_i8(delta: i16) -> i8 {
+    delta.clamp(i8::MIN as i16, i8::MAX as i16) as i8
+}
+
+/// A quantization delta map as it will actually be used, once the device has
+/// been asked.
+pub(crate) struct QpMapPlan {
+    pub format: vk::Format,
+    pub texel_size: vk::Extent2D,
+    pub geometry: QpMapGeometry,
+    /// Clamped to the device's range, on the codec's own scale.
+    pub delta: i16,
+    pub along_columns: bool,
+    pub cycle: u32,
+}
+
+/// Decide whether the refresh band gets a delta map, and what is in it.
+///
+/// `None` whenever anything is missing -- no refresh to band, no device
+/// support, no delta-map format for this profile, or a delta of zero -- and
+/// says why only when something was asked for and refused. A map that cannot
+/// be built is not an error: the encode proceeds without one, exactly as it
+/// did before this existed.
+#[allow(clippy::too_many_arguments)]
+fn resolve_qp_map(
+    context: &VideoContext,
+    config: &EncodeConfig,
+    caps: QpMapCaps,
+    refresh: Option<&IntraRefreshState>,
+    refresh_block: u32,
+    profile_info: &vk::VideoProfileInfoKHR,
+    coded_width: u32,
+    coded_height: u32,
+) -> Option<QpMapPlan> {
+    let refresh = refresh?;
+    let wanted = config.resolved_intra_refresh_qp_delta();
+    if wanted == 0 {
+        return None;
+    }
+    if !context.has_video_encode_quantization_map() {
+        debug!("intra refresh band delta wanted, but this device has no quantization map");
+        return None;
+    }
+    if caps.min_delta == 0 && caps.max_delta == 0 {
+        debug!("intra refresh band delta wanted, but this profile reports no delta range");
+        return None;
+    }
+    let (format, texel_size, _tiling) =
+        crate::video::query_quantization_map_format(context, profile_info)?;
+
+    if qp_map_element_bytes(format).is_none() {
+        debug!(
+            "quantization map format {format:?} is not one this can write; \
+             encoding without a map"
+        );
+        return None;
+    }
+
+    let geometry = QpMapGeometry {
+        coded_width,
+        coded_height,
+        texel_width: texel_size.width,
+        texel_height: texel_size.height,
+        block: refresh_block,
+    };
+    let (map_w, map_h) = geometry.extent();
+    if map_w > caps.max_extent.width || map_h > caps.max_extent.height {
+        debug!(
+            "quantization map would be {map_w}x{map_h} and the device allows {}x{}; \
+             encoding without one",
+            caps.max_extent.width, caps.max_extent.height
+        );
+        return None;
+    }
+
+    let delta = wanted.clamp(caps.min_delta, caps.max_delta);
+    if delta == 0 {
+        // Measured on NVIDIA, whose range is 0..=51: a negative delta has
+        // nowhere to go there, and a map of zeros would be bound on every
+        // frame to express nothing. Spending fewer bits on the band is not
+        // the same request inverted, so this declines rather than
+        // substituting one.
+        debug!(
+            "intra refresh band delta {wanted} clamps to zero in the device range \
+             {}..={}; encoding without a map",
+            caps.min_delta, caps.max_delta
+        );
+        return None;
+    }
+    if delta != wanted {
+        debug!(
+            "intra refresh band delta {wanted} is outside the device range \
+             {}..={}; using {delta}",
+            caps.min_delta, caps.max_delta
+        );
+    }
+    // Only a block sweep has a band this can locate. Per-picture partition
+    // ties the regions to the slice or tile layout, which this neither sets
+    // nor can read back -- a map built as though it swept rows would lower QP
+    // on stripes unrelated to what is actually being refreshed, which is worse
+    // than no map at all because it takes the bits from somewhere to do it.
+    // Measured on NVIDIA, which offers that mode and no other.
+    let along_columns = match refresh.mode {
+        vk::VideoEncodeIntraRefreshModeFlagsKHR::BLOCK_COLUMN_BASED => true,
+        vk::VideoEncodeIntraRefreshModeFlagsKHR::BLOCK_BASED
+        | vk::VideoEncodeIntraRefreshModeFlagsKHR::BLOCK_ROW_BASED => false,
+        other => {
+            debug!(
+                "intra refresh band delta wanted, but {other:?} does not say where the \
+                 band is; encoding without a map"
+            );
+            return None;
+        }
+    };
+    debug!(
+        "intra refresh band delta {delta} over a {map_w}x{map_h} map, texel {}x{}, {}",
+        texel_size.width,
+        texel_size.height,
+        if along_columns { "columns" } else { "rows" },
+    );
+    Some(QpMapPlan {
+        format,
+        texel_size,
+        geometry,
+        delta: delta as i16,
+        along_columns,
+        cycle: refresh.cycle_duration,
+    })
 }
 
 /// Which refresh shape to sweep with when the caller has no preference.
@@ -1105,6 +1390,8 @@ pub(crate) struct CommonInitRequest<'a> {
     /// What the device said about intra refresh for this profile, read from
     /// the codec's own capability query.
     pub intra_refresh_caps: IntraRefreshCaps,
+    /// What the device said about quantization delta maps for this profile.
+    pub qp_map_caps: QpMapCaps,
 }
 
 /// The profile struct that turns on RGB input. When
@@ -1432,11 +1719,28 @@ pub(crate) fn build_encoder_common(req: &CommonInitRequest) -> Result<CommonInit
     let mut intra_refresh_create = intra_refresh.as_ref().map(|ir| {
         vk::VideoEncodeSessionIntraRefreshCreateInfoKHR::default().intra_refresh_mode(ir.mode)
     });
+    // Resolved before the session is made, because allowing a delta map is
+    // session state: a session not created for one cannot be given one later.
+    let qp_map_plan = resolve_qp_map(
+        context,
+        config,
+        req.qp_map_caps,
+        intra_refresh.as_ref(),
+        req.refresh_block,
+        req.profile_info,
+        aligned_width,
+        aligned_height,
+    );
+    let session_flags = if qp_map_plan.is_some() {
+        vk::VideoSessionCreateFlagsKHR::ALLOW_ENCODE_QUANTIZATION_DELTA_MAP
+    } else {
+        vk::VideoSessionCreateFlagsKHR::empty()
+    };
 
     let mut rgb_session_info = rgb_session.unwrap_or_default();
     let mut session_create_info = vk::VideoSessionCreateInfoKHR::default()
         .queue_family_index(encode_queue_family)
-        .flags(vk::VideoSessionCreateFlagsKHR::empty())
+        .flags(session_flags)
         .video_profile(req.profile_info)
         .picture_format(picture_format)
         .max_coded_extent(vk::Extent2D {
@@ -1494,6 +1798,37 @@ pub(crate) fn build_encoder_common(req: &CommonInitRequest) -> Result<CommonInit
     let upload_queue_family = context.transfer_queue_family();
     let cmd = create_command_resources(context, encode_queue_family, upload_queue_family)?;
 
+    // One map per cycle index: the band's position is a pure function of the
+    // index, so the whole set is known here and never has to be touched again.
+    let qp_map = match qp_map_plan {
+        Some(plan) => {
+            let maps: Vec<Vec<i16>> = (0..plan.cycle)
+                .map(|index| {
+                    plan.geometry
+                        .refresh_map(plan.along_columns, index, plan.cycle, plan.delta)
+                })
+                .collect();
+            let (map_w, map_h) = plan.geometry.extent();
+            let images = create_qp_map_images(
+                context,
+                req.profile_info,
+                plan.format,
+                vk::Extent2D {
+                    width: map_w,
+                    height: map_h,
+                },
+                &maps,
+                cmd.upload_command_buffer,
+                cmd.upload_fence,
+            )?;
+            Some(QpMapState {
+                images,
+                texel_size: plan.texel_size,
+            })
+        }
+        None => None,
+    };
+
     let pipeline = EncodePipeline::new(&PipelineConfig {
         context,
         aligned_width,
@@ -1525,6 +1860,7 @@ pub(crate) fn build_encoder_common(req: &CommonInitRequest) -> Result<CommonInit
 
     let common = EncoderCommon {
         intra_refresh,
+        qp_map,
         context: context.clone(),
         config: config.clone(),
         video_queue_fn,
@@ -2008,5 +2344,172 @@ mod preferred_mode_tests {
             ),
             None
         );
+    }
+}
+
+#[cfg(test)]
+mod qp_map_tests {
+    use super::*;
+
+    /// 1080p H.265: 64x64 CTBs, so 30 block columns. A 30-picture column
+    /// sweep refreshes one block column per picture. With a 64x64 map texel
+    /// the map is 30x17 and exactly one texel column carries the delta.
+    #[test]
+    fn a_column_sweep_marks_one_texel_column() {
+        let geom = QpMapGeometry {
+            coded_width: 1920,
+            coded_height: 1080,
+            texel_width: 64,
+            texel_height: 64,
+            block: 64,
+        };
+        assert_eq!(geom.extent(), (30, 17));
+        let map = geom.refresh_map(true, 0, 30, -4);
+        assert_eq!(map.len(), 30 * 17);
+        // Column 0 of every row carries it, nothing else does.
+        for row in 0..17 {
+            assert_eq!(map[row * 30], -4, "row {row} column 0");
+            for col in 1..30 {
+                assert_eq!(map[row * 30 + col], 0, "row {row} column {col}");
+            }
+        }
+    }
+
+    /// The band moves with the index, which is the whole point -- a static
+    /// map would darken one stripe forever instead of following the sweep.
+    #[test]
+    fn the_band_moves_with_the_refresh_index() {
+        let geom = QpMapGeometry {
+            coded_width: 1920,
+            coded_height: 1080,
+            texel_width: 64,
+            texel_height: 64,
+            block: 64,
+        };
+        for index in [0u32, 7, 29] {
+            let map = geom.refresh_map(true, index, 30, -4);
+            let marked: Vec<usize> = (0..30).filter(|c| map[*c] != 0).collect();
+            assert_eq!(marked, vec![index as usize], "index {index}");
+        }
+    }
+
+    /// A row sweep marks a horizontal band instead, and 1080 over 64 is 17
+    /// rows against the 30 columns -- the asymmetry the shape default exists
+    /// for.
+    #[test]
+    fn a_row_sweep_marks_one_texel_row() {
+        let geom = QpMapGeometry {
+            coded_width: 1920,
+            coded_height: 1080,
+            texel_width: 64,
+            texel_height: 64,
+            block: 64,
+        };
+        let map = geom.refresh_map(false, 3, 17, -4);
+        for col in 0..30 {
+            assert_eq!(map[3 * 30 + col], -4, "row 3 column {col}");
+            assert_eq!(map[col], 0, "row 0 column {col}");
+        }
+    }
+
+    /// A map texel finer than a codec block means several texels per block,
+    /// and every one of them overlapping the band has to carry the delta --
+    /// marking only the first would leave most of the band at the normal QP.
+    #[test]
+    fn a_finer_texel_marks_every_texel_the_band_covers() {
+        let geom = QpMapGeometry {
+            coded_width: 1920,
+            coded_height: 1080,
+            texel_width: 16,
+            texel_height: 16,
+            block: 64,
+        };
+        assert_eq!(geom.extent(), (120, 68));
+        let map = geom.refresh_map(true, 1, 30, -4);
+        // One 64-wide block at offset 64 is texel columns 4..8.
+        let marked: Vec<usize> = (0..120).filter(|c| map[*c] != 0).collect();
+        assert_eq!(marked, vec![4, 5, 6, 7]);
+    }
+
+    /// A cycle shorter than the block count gives each picture more than one
+    /// block, and the map has to cover all of them.
+    #[test]
+    fn a_short_cycle_marks_a_wider_band() {
+        let geom = QpMapGeometry {
+            coded_width: 1920,
+            coded_height: 1080,
+            texel_width: 64,
+            texel_height: 64,
+            block: 64,
+        };
+        // 30 block columns over a 10-picture cycle is 3 per picture.
+        let map = geom.refresh_map(true, 2, 10, -4);
+        let marked: Vec<usize> = (0..30).filter(|c| map[*c] != 0).collect();
+        assert_eq!(marked, vec![6, 7, 8]);
+    }
+
+    /// The last step of a sweep that does not divide evenly must not run off
+    /// the end of the map.
+    #[test]
+    fn the_final_band_is_clipped_to_the_picture() {
+        let geom = QpMapGeometry {
+            coded_width: 1920,
+            coded_height: 1080,
+            texel_width: 64,
+            texel_height: 64,
+            block: 64,
+        };
+        // 17 rows over a 7-picture cycle is 3 per picture; the last starts at
+        // 18, which is past the end.
+        let map = geom.refresh_map(false, 6, 7, -4);
+        assert_eq!(map.len(), 30 * 17);
+        assert!(map.iter().all(|v| *v == 0), "nothing to mark past the edge");
+    }
+
+    /// A delta of zero is the same as no map, and saying so lets the caller
+    /// turn the feature off without a separate switch.
+    #[test]
+    fn a_zero_delta_marks_nothing() {
+        let geom = QpMapGeometry {
+            coded_width: 1920,
+            coded_height: 1080,
+            texel_width: 64,
+            texel_height: 64,
+            block: 64,
+        };
+        assert!(geom.refresh_map(true, 0, 30, 0).iter().all(|v| *v == 0));
+    }
+}
+
+#[cfg(test)]
+mod qp_map_format_tests {
+    use super::*;
+
+    /// The delta map's element is the device's choice, not ours: RADV asks for
+    /// `R16_SINT` and NVIDIA for `R8_SINT`. Writing the wrong width puts every
+    /// texel after the first at the wrong offset and runs past the row.
+    #[test]
+    fn a_known_format_reports_its_element_width() {
+        assert_eq!(qp_map_element_bytes(vk::Format::R8_SINT), Some(1));
+        assert_eq!(qp_map_element_bytes(vk::Format::R16_SINT), Some(2));
+    }
+
+    /// An unknown format is refused rather than guessed at. Guessing here
+    /// writes into an image of the wrong stride, which corrupts silently.
+    #[test]
+    fn an_unknown_format_is_refused() {
+        assert_eq!(qp_map_element_bytes(vk::Format::R32_SINT), None);
+        assert_eq!(qp_map_element_bytes(vk::Format::R8G8B8A8_UNORM), None);
+    }
+
+    /// An eight-bit map cannot carry the full QP range, but every delta this
+    /// crate produces is small; the saturation is stated rather than wrapped,
+    /// because a wrapped delta flips sign and brightens what it meant to
+    /// sharpen.
+    #[test]
+    fn an_eight_bit_element_saturates_rather_than_wrapping() {
+        assert_eq!(qp_delta_as_i8(-4), -4);
+        assert_eq!(qp_delta_as_i8(-200), i8::MIN);
+        assert_eq!(qp_delta_as_i8(200), i8::MAX);
     }
 }

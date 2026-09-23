@@ -75,7 +75,10 @@ struct IntraRefreshRow {
     /// the picture's block-row count, whichever is smaller. The device figure
     /// alone is misleading — it is generous enough that the picture is almost
     /// always the real limit, and it is the one nothing else reports.
-    usable_row_cycle: u32,
+    ///
+    /// `None` where the device sweeps no blocks, in which case the picture's
+    /// block rows bound nothing and the number would be fiction.
+    usable_row_cycle: Option<u32>,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -272,6 +275,10 @@ fn report_codec(
 
         let mut encode_caps = vk::VideoEncodeCapabilitiesKHR::default();
         let mut intra_caps = vk::VideoEncodeIntraRefreshCapabilitiesKHR::default();
+        let mut qp_map_caps = vk::VideoEncodeQuantizationMapCapabilitiesKHR::default();
+        let mut qp_h264 = vk::VideoEncodeH264QuantizationMapCapabilitiesKHR::default();
+        let mut qp_h265 = vk::VideoEncodeH265QuantizationMapCapabilitiesKHR::default();
+        let mut qp_av1 = vk::VideoEncodeAV1QuantizationMapCapabilitiesKHR::default();
         let mut h264_caps = vk::VideoEncodeH264CapabilitiesKHR::default();
         let mut h265_caps = vk::VideoEncodeH265CapabilitiesKHR::default();
         let mut av1_caps = vk::VideoEncodeAV1CapabilitiesKHR::default();
@@ -284,10 +291,11 @@ fn report_codec(
         if ask_intra {
             caps = caps.push(&mut intra_caps);
         }
+        caps = caps.push(&mut qp_map_caps);
         match codec {
-            Codec::H264 => caps = caps.push(&mut h264_caps),
-            Codec::H265 => caps = caps.push(&mut h265_caps),
-            Codec::AV1 => caps = caps.push(&mut av1_caps),
+            Codec::H264 => caps = caps.push(&mut h264_caps).push(&mut qp_h264),
+            Codec::H265 => caps = caps.push(&mut h265_caps).push(&mut qp_h265),
+            Codec::AV1 => caps = caps.push(&mut av1_caps).push(&mut qp_av1),
         }
 
         let result = unsafe {
@@ -347,6 +355,19 @@ fn report_codec(
             }
         };
 
+        let delta = match codec {
+            Codec::H264 => Some((qp_h264.min_qp_delta, qp_h264.max_qp_delta)),
+            Codec::H265 => Some((qp_h265.min_qp_delta, qp_h265.max_qp_delta)),
+            Codec::AV1 => Some((qp_av1.min_q_index_delta, qp_av1.max_q_index_delta)),
+        };
+        print_quantization_map(
+            video_queue_fn,
+            physical_device,
+            &profile_info,
+            &qp_map_caps,
+            delta,
+        );
+
         print_quality_levels(
             video_encode_fn,
             physical_device,
@@ -363,9 +384,20 @@ fn report_codec(
             max_cycle: intra_caps.max_intra_refresh_cycle_duration,
             max_active_refs: intra_caps.max_intra_refresh_active_reference_pictures,
             constrained_intra_pred: constrained,
+            // Only meaningful for a block sweep. Where the regions follow the
+            // partitioning instead, the picture's block rows bound nothing.
             usable_row_cycle: intra_caps
-                .max_intra_refresh_cycle_duration
-                .min(reference.height.div_ceil(block.max(1)).max(1)),
+                .intra_refresh_modes
+                .intersects(
+                    vk::VideoEncodeIntraRefreshModeFlagsKHR::BLOCK_ROW_BASED
+                        | vk::VideoEncodeIntraRefreshModeFlagsKHR::BLOCK_COLUMN_BASED
+                        | vk::VideoEncodeIntraRefreshModeFlagsKHR::BLOCK_BASED,
+                )
+                .then(|| {
+                    intra_caps
+                        .max_intra_refresh_cycle_duration
+                        .min(reference.height.div_ceil(block.max(1)).max(1))
+                }),
         });
     }
 }
@@ -548,16 +580,47 @@ fn print_intra_refresh(
         yes_no(caps.non_rectangular_intra_refresh_regions != 0)
     );
 
-    let block = block.max(1);
-    let blocks_wide = reference.width.div_ceil(block).max(1);
-    let blocks_tall = reference.height.div_ceil(block).max(1);
-    println!(
-        "      At {}x{} in {block}x{block} {block_source}: {blocks_wide} wide x {blocks_tall} tall",
-        reference.width, reference.height,
-    );
+    use vk::VideoEncodeIntraRefreshModeFlagsKHR as Mode;
+    let sweeps: Vec<(&str, u32)> = {
+        let block = block.max(1);
+        let wide = reference.width.div_ceil(block).max(1);
+        let tall = reference.height.div_ceil(block).max(1);
+        let mut v = Vec::new();
+        // Block-based is a sweep whose direction the implementation picks, so
+        // it is reported against both bounds rather than one.
+        if caps
+            .intra_refresh_modes
+            .intersects(Mode::BLOCK_ROW_BASED | Mode::BLOCK_BASED)
+        {
+            v.push(("row sweep", tall));
+        }
+        if caps
+            .intra_refresh_modes
+            .intersects(Mode::BLOCK_COLUMN_BASED | Mode::BLOCK_BASED)
+        {
+            v.push(("column sweep", wide));
+        }
+        if !v.is_empty() {
+            println!(
+                "      At {}x{} in {block}x{block} {block_source}: {wide} wide x {tall} tall",
+                reference.width, reference.height,
+            );
+        }
+        v
+    };
+    if sweeps.is_empty() {
+        // Per-picture partition ties the regions to the slice or tile layout,
+        // so the block arithmetic above describes nothing here: how many
+        // regions there are is a property of the partitioning, which this
+        // does not set and cannot read back. Measured on NVIDIA, which offers
+        // this mode and no other.
+        println!("      regions follow the picture's partitioning, not a block sweep —");
+        println!("      the block counts and cycle bounds below do not apply");
+        return;
+    }
 
     let cap = caps.max_intra_refresh_cycle_duration;
-    for (label, regions) in [("row sweep", blocks_tall), ("column sweep", blocks_wide)] {
+    for (label, regions) in sweeps {
         // Two different failures, and they are not symmetric. Too few regions
         // for the device cap only means the finest sweep is unavailable; a
         // cycle longer than the region count is a cycle that cannot be served.
@@ -574,6 +637,82 @@ fn print_intra_refresh(
                 regions.div_ceil(cap.max(1)),
             );
         }
+    }
+}
+
+/// What the device offers for quantization delta maps on this profile.
+///
+/// A delta map carries one signed QP adjustment per texel, applied on top of
+/// whatever the rate controller chose, which makes it the only mechanism that
+/// can treat part of a picture differently from the rest. The texel size is
+/// the device's own granularity and is the number that decides whether a
+/// region can be targeted precisely: a texel coarser than the thing being
+/// targeted cannot express it.
+fn print_quantization_map(
+    video_queue_fn: &ash::khr::video_queue::Instance,
+    physical_device: vk::PhysicalDevice,
+    profile: &vk::VideoProfileInfoKHR<'_>,
+    map_caps: &vk::VideoEncodeQuantizationMapCapabilitiesKHR,
+    delta: Option<(i32, i32)>,
+) {
+    println!("    Quantization delta map");
+    let extent = map_caps.max_quantization_map_extent;
+    if extent.width == 0 || extent.height == 0 {
+        println!("      not offered for this profile");
+        return;
+    }
+    println!(
+        "      Max map extent:      {}x{}",
+        extent.width, extent.height
+    );
+    match delta {
+        Some((lo, hi)) => println!("      Delta range:         {lo}..={hi}"),
+        None => println!("      Delta range:         not reported"),
+    }
+
+    let profiles = [*profile];
+    let mut list = vk::VideoProfileListInfoKHR::default().profiles(&profiles);
+    let info = vk::PhysicalDeviceVideoFormatInfoKHR::default()
+        .image_usage(vk::ImageUsageFlags::VIDEO_ENCODE_QUANTIZATION_DELTA_MAP_KHR)
+        .push(&mut list);
+    let mut count = 0u32;
+    let result = unsafe {
+        (video_queue_fn
+            .fp()
+            .get_physical_device_video_format_properties_khr)(
+            physical_device,
+            &info,
+            &mut count,
+            std::ptr::null_mut(),
+        )
+    };
+    if result != vk::Result::SUCCESS || count == 0 {
+        println!("      no delta-map image format offered");
+        return;
+    }
+    let mut map_props =
+        vec![vk::VideoFormatQuantizationMapPropertiesKHR::default(); count as usize];
+    let mut props = vec![vk::VideoFormatPropertiesKHR::default(); count as usize];
+    for (p, m) in props.iter_mut().zip(map_props.iter_mut()) {
+        p.p_next = m as *mut _ as *mut std::ffi::c_void;
+    }
+    unsafe {
+        let _ = (video_queue_fn
+            .fp()
+            .get_physical_device_video_format_properties_khr)(
+            physical_device,
+            &info,
+            &mut count,
+            props.as_mut_ptr(),
+        );
+    }
+    println!("      Map formats:");
+    for (p, m) in props.iter().zip(map_props.iter()).take(count as usize) {
+        let t = m.quantization_map_texel_size;
+        println!(
+            "        {:?}  {:?}  texel {}x{}",
+            p.format, p.image_tiling, t.width, t.height
+        );
     }
 }
 
@@ -920,9 +1059,9 @@ fn print_intra_refresh_summary(rows: &[IntraRefreshRow], reference: Reference) {
             Some(false) => "NO",
             None => "n/a",
         };
-        let usable = match row.modes {
-            Some(m) if !m.is_empty() => format!("{}", row.usable_row_cycle),
-            _ => "-".to_string(),
+        let usable = match row.usable_row_cycle {
+            Some(c) => format!("{c}"),
+            None => "n/a".to_string(),
         };
         println!(
             "  {:<6} {:<14} {:<10} {:<8} {:<8} {:<7} {}",
@@ -941,6 +1080,7 @@ fn print_intra_refresh_summary(rows: &[IntraRefreshRow], reference: Reference) {
         reference.width, reference.height,
     );
     println!("  row sweep. A cycle set above it asks for regions the picture cannot supply.");
+    println!("  n/a there means the device sweeps no blocks, so block rows bound nothing.");
     println!(
         "  c.i.p. is constrained_intra_pred: without it a refreshed region may predict from an"
     );
