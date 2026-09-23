@@ -72,6 +72,7 @@ impl QueueRoles {
 /// queue 0 of the family pixelforge selects.
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct QueueOverrides {
+    pub encode: Option<DeviceQueue>,
     pub decode: Option<DeviceQueue>,
     pub transfer: Option<DeviceQueue>,
     pub compute: Option<DeviceQueue>,

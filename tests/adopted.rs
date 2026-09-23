@@ -12,11 +12,16 @@ use ash::vk;
 use ash::vk::TaggedStructure;
 #[allow(dead_code)]
 mod common;
+use common::source::create_src_image;
 use common::{Readback, decode_stream};
 
 use pixelforge::decoder::{DecodeConfig, Decoder};
 use pixelforge::encoder::Codec;
 use pixelforge::vulkan::{DeviceQueue, DeviceRequirements, VideoContext, VideoContextBuilder};
+use pixelforge::{
+    ColorConverter, ColorConverterConfig, ColorRange, ColorSpec, EncodeConfig, Encoder,
+    InputFormat, OutputFormat, RateControlMode,
+};
 
 /// An instance and device the test owns, destroyed on drop after everything
 /// built on them.
@@ -63,8 +68,7 @@ fn instance_1_1() -> Result<(ash::Entry, ash::Instance), Box<dyn std::error::Err
 }
 
 /// Create the application's device from `reqs`, keeping queue 0 of every
-/// family for itself wherever the family has a second queue. Returns the
-/// queue pixelforge should use for each of `roles`.
+/// family for itself wherever the family has a second queue.
 fn create_app_device(
     entry: ash::Entry,
     instance: ash::Instance,
@@ -86,11 +90,18 @@ fn create_app_device(
         .collect();
     let ext_ptrs: Vec<_> = reqs.extensions.iter().map(|e| e.as_ptr()).collect();
 
-    // The KHR feature structs, since this device is not 1.3: the promoted
+    // The per-feature structs, since this device is not 1.3: the promoted
     // struct types are the same types under their extension names.
-    let mut sync2 = vk::PhysicalDeviceSynchronization2Features::default().synchronization2(true);
-    let mut timeline =
-        vk::PhysicalDeviceTimelineSemaphoreFeatures::default().timeline_semaphore(true);
+    let features = reqs.features;
+    let mut sync2 = vk::PhysicalDeviceSynchronization2Features::default()
+        .synchronization2(features.synchronization2);
+    let mut timeline = vk::PhysicalDeviceTimelineSemaphoreFeatures::default()
+        .timeline_semaphore(features.timeline_semaphore);
+    let mut ycbcr = vk::PhysicalDeviceSamplerYcbcrConversionFeatures::default()
+        .sampler_ycbcr_conversion(features.sampler_ycbcr_conversion);
+    let mut ycbcr_444 =
+        vk::PhysicalDeviceYcbcr2Plane444FormatsFeaturesEXT::default().ycbcr2plane444_formats(true);
+    let mut av1 = vk::PhysicalDeviceVideoEncodeAV1FeaturesKHR::default().video_encode_av1(true);
     let mut unified = vk::PhysicalDeviceUnifiedImageLayoutsFeaturesKHR::default()
         .unified_image_layouts(true)
         .unified_image_layouts_video(true);
@@ -98,7 +109,14 @@ fn create_app_device(
         .queue_create_infos(&queue_infos)
         .enabled_extension_names(&ext_ptrs)
         .push(&mut sync2)
-        .push(&mut timeline);
+        .push(&mut timeline)
+        .push(&mut ycbcr);
+    if features.ycbcr_2plane_444_formats {
+        info = info.push(&mut ycbcr_444);
+    }
+    if features.video_encode_av1 {
+        info = info.push(&mut av1);
+    }
     if reqs.unified_image_layouts {
         info = info.push(&mut unified);
     }
@@ -138,6 +156,17 @@ fn decode_all(
     Ok(frames)
 }
 
+/// The GPU a context pixelforge created for itself would pick, found on
+/// `instance` by name so an adopted context can be compared against it.
+fn same_gpu(instance: &ash::Instance, own: &VideoContext) -> vk::PhysicalDevice {
+    let name = own.device_properties().device_name;
+    unsafe { instance.enumerate_physical_devices() }
+        .expect("physical devices")
+        .into_iter()
+        .find(|&pd| unsafe { instance.get_physical_device_properties(pd) }.device_name == name)
+        .expect("the GPU the own context used")
+}
+
 #[test]
 #[ignore = "requires a Vulkan Video device"]
 fn decode_on_a_vulkan_1_1_device() -> Result<(), Box<dyn std::error::Error>> {
@@ -148,16 +177,11 @@ fn decode_on_a_vulkan_1_1_device() -> Result<(), Box<dyn std::error::Error>> {
         .require_decode(Codec::H264)
         .build()?;
     let expected = decode_all(&own, &stream)?;
-    let own_name = own.device_properties().device_name;
-    drop(own);
 
     let (entry, instance) = instance_1_1()?;
     let builder = VideoContextBuilder::new().require_decode(Codec::H264);
-    // The same GPU the own context picked, so the frames are comparable.
-    let physical_device = unsafe { instance.enumerate_physical_devices()? }
-        .into_iter()
-        .find(|&pd| unsafe { instance.get_physical_device_properties(pd) }.device_name == own_name)
-        .expect("the GPU the own context used");
+    let physical_device = same_gpu(&instance, &own);
+    drop(own);
     let reqs = builder.decode_device_requirements(&entry, &instance, physical_device)?;
     let app = create_app_device(entry, instance, physical_device, &reqs)?;
 
@@ -180,6 +204,138 @@ fn decode_on_a_vulkan_1_1_device() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(actual.len(), expected.len(), "frame count");
     for (i, (a, e)) in actual.iter().zip(&expected).enumerate() {
         assert!(a == e, "frame {i} differs from the own-context decode");
+    }
+    Ok(())
+}
+
+const ENCODE_WIDTH: u32 = 320;
+const ENCODE_HEIGHT: u32 = 240;
+const ENCODE_FRAMES: u32 = 8;
+
+/// A BGRA frame that moves with `n`, so the encoder has motion to code.
+fn moving_frame(n: u32) -> Vec<u8> {
+    let mut data = Vec::with_capacity((ENCODE_WIDTH * ENCODE_HEIGHT * 4) as usize);
+    for y in 0..ENCODE_HEIGHT {
+        for x in 0..ENCODE_WIDTH {
+            let (sx, sy) = (x + n * 3, y + n);
+            let r = (sx ^ sy) as u8;
+            let g = sx.wrapping_mul(2).wrapping_add(sy) as u8;
+            let b = (sy * 3) as u8;
+            data.extend_from_slice(&[b, g, r, 255]);
+        }
+    }
+    data
+}
+
+/// Convert and encode `ENCODE_FRAMES` frames as H.264 on `context`, the way a
+/// capture pipeline would: an RGB image goes through the colour converter
+/// straight into the encoder's input.
+fn encode_all(context: &VideoContext) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let mut encoder = Encoder::new(
+        context.clone(),
+        EncodeConfig::h264(ENCODE_WIDTH, ENCODE_HEIGHT)
+            .with_rate_control(RateControlMode::Cqp)
+            .with_quality_level(22)
+            .with_frame_rate(30, 1)
+            .with_b_frames(0),
+    )?;
+    let mut converter = ColorConverter::new(
+        context.clone(),
+        ColorConverterConfig::new(
+            ENCODE_WIDTH,
+            ENCODE_HEIGHT,
+            InputFormat::BGRA,
+            OutputFormat::NV12,
+            ColorSpec::Srgb,
+            ColorSpec::Srgb,
+            ColorRange::Limited,
+        ),
+    )?;
+    let mut stream = Vec::new();
+    for n in 0..ENCODE_FRAMES {
+        let src =
+            unsafe { create_src_image(context, ENCODE_WIDTH, ENCODE_HEIGHT, &moving_frame(n))? };
+        converter.convert(
+            src.image,
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            encoder.input_image(),
+        )?;
+        let packet = pollster::block_on(encoder.encode(encoder.input_image())?)?;
+        stream.extend_from_slice(&packet.data);
+    }
+    Ok(stream)
+}
+
+/// Luma PSNR between two NV12 frames of the encode size.
+fn luma_psnr(a: &[u8], b: &[u8]) -> f64 {
+    let n = (ENCODE_WIDTH * ENCODE_HEIGHT) as usize;
+    let mse = a[..n]
+        .iter()
+        .zip(&b[..n])
+        .map(|(&x, &y)| (x as f64 - y as f64).powi(2))
+        .sum::<f64>()
+        / n as f64;
+    if mse == 0.0 {
+        f64::INFINITY
+    } else {
+        10.0 * (255.0f64 * 255.0 / mse).log10()
+    }
+}
+
+#[test]
+#[ignore = "requires a Vulkan Video device"]
+fn encode_on_a_vulkan_1_1_device() -> Result<(), Box<dyn std::error::Error>> {
+    let own = VideoContextBuilder::new()
+        .enable_validation(validation_requested())
+        .require_encode(Codec::H264)
+        .require_decode(Codec::H264)
+        .build()?;
+    let expected = encode_all(&own)?;
+
+    let (entry, instance) = instance_1_1()?;
+    let builder = VideoContextBuilder::new().require_encode(Codec::H264);
+    let physical_device = same_gpu(&instance, &own);
+    let reqs = builder.encode_device_requirements(&entry, &instance, physical_device)?;
+    assert!(
+        reqs.extensions.contains(&ash::khr::push_descriptor::NAME),
+        "the converter needs push descriptors, which every driver this runs on has"
+    );
+    let app = create_app_device(entry, instance, physical_device, &reqs)?;
+    let context = builder
+        .with_encode_queue(spare(&app, reqs.queues.encode.unwrap()))
+        .with_transfer_queue(spare(&app, reqs.queues.transfer))
+        .with_compute_queue(spare(&app, reqs.queues.compute))
+        .build_from_existing_encode(
+            app.entry.clone(),
+            app.instance.clone(),
+            app.physical_device,
+            app.device.clone(),
+        )?;
+    let actual = encode_all(&context)?;
+    drop(context);
+
+    // Both streams decoded by the same decoder, so any difference is the
+    // encode's. Hardware encoders are not always bit-exact run to run, so the
+    // comparison is a quality floor rather than equality.
+    let expected_frames = decode_all(&own, &expected)?;
+    let actual_frames = decode_all(&own, &actual)?;
+    assert_eq!(actual_frames.len(), ENCODE_FRAMES as usize, "frame count");
+    assert_eq!(expected_frames.len(), actual_frames.len(), "frame count");
+    let psnrs: Vec<f64> = actual_frames
+        .iter()
+        .zip(&expected_frames)
+        .map(|(a, e)| luma_psnr(a, e))
+        .collect();
+    println!(
+        "adopted vs own encode, luma PSNR per frame: {:?}; streams bit-identical: {}",
+        psnrs,
+        actual == expected
+    );
+    for (i, psnr) in psnrs.iter().enumerate() {
+        assert!(
+            *psnr >= 45.0,
+            "frame {i}: {psnr:.2} dB against the own-context encode"
+        );
     }
     Ok(())
 }
