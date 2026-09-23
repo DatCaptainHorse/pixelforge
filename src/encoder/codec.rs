@@ -663,6 +663,13 @@ pub(crate) fn build_encoder_common(req: &CommonInitRequest) -> Result<CommonInit
                     .to_string(),
             ));
         }
+        Some(_) if config.color_description.is_some_and(|desc| desc.full_range) => {
+            return Err(PixelForgeError::InvalidInput(
+                "RGB input is limited range only: the driver writes limited range whatever \
+                 it is asked, so a full-range stream would be mislabelled"
+                    .to_string(),
+            ));
+        }
         Some(_) => {
             let caps = req.rgb_caps.ok_or_else(|| {
                 PixelForgeError::NoSuitableDevice(
