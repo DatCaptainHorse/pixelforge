@@ -371,8 +371,12 @@ pub struct ColorConverter {
     // Sampler for texelFetch on the source image.
     sampler: vk::Sampler,
 
-    // Cached ImageView for the source image (avoids per-frame recreation).
-    cached_src_view: Option<(vk::Image, vk::ImageView)>,
+    // The view the last conversion read its source through, destroyed once
+    // that conversion is done. A view is made per conversion rather than
+    // cached by image handle: a driver may give a new image a destroyed
+    // one's handle, and a cache would then read the new image through a view
+    // of the old one.
+    src_view: Option<vk::ImageView>,
 
     // Output buffer (compute shader writes here).
     output_buffer: vk::Buffer,
@@ -798,14 +802,9 @@ impl ColorConverter {
         target_image: vk::Image,
         wait: &[TimelinePoint],
     ) -> Result<TimelinePoint> {
-        // Before anything is reused, the view below included: switching source
-        // images destroys the cached view, which the previous conversion may
-        // still be reading.
+        // Before anything is reused, and before the previous view goes.
         self.wait_idle()?;
-
-        // Get or create ImageView for the source image (must happen before
-        // borrowing device immutably, since this takes &mut self).
-        let src_view = self.get_or_create_src_view(src_image)?;
+        let src_view = self.create_src_view(src_image)?;
 
         let device = self.context.device();
 
@@ -1096,7 +1095,7 @@ impl ColorConverter {
     }
 
     /// Wait on the CPU for the last conversion submitted, if it is still
-    /// running.
+    /// running, and destroy the view it read its source through.
     fn wait_idle(&mut self) -> Result<()> {
         if self.in_flight {
             unsafe {
@@ -1107,23 +1106,15 @@ impl ColorConverter {
             .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
             self.in_flight = false;
         }
+        if let Some(view) = self.src_view.take() {
+            unsafe { self.context.device().destroy_image_view(view, None) };
+        }
         Ok(())
     }
 
-    /// Get or create an ImageView for the source image.
-    fn get_or_create_src_view(&mut self, src_image: vk::Image) -> Result<vk::ImageView> {
-        // Return cached view if it matches the current source image.
-        if let Some((cached_image, cached_view)) = self.cached_src_view {
-            if cached_image == src_image {
-                return Ok(cached_view);
-            }
-            // Different image — destroy the old view.
-            unsafe {
-                self.context.device().destroy_image_view(cached_view, None);
-            }
-        }
-
-        // Create a new ImageView for the source image.
+    /// Create the view this conversion reads `src_image` through. It lives
+    /// until the conversion is done, see [`Self::wait_idle`].
+    fn create_src_view(&mut self, src_image: vk::Image) -> Result<vk::ImageView> {
         let view_info = vk::ImageViewCreateInfo::default()
             .image(src_image)
             .view_type(vk::ImageViewType::TYPE_2D)
@@ -1139,7 +1130,7 @@ impl ColorConverter {
         let view = unsafe { self.context.device().create_image_view(&view_info, None) }
             .map_err(|e| PixelForgeError::ResourceCreation(format!("source image view: {}", e)))?;
 
-        self.cached_src_view = Some((src_image, view));
+        self.src_view = Some(view);
         Ok(view)
     }
 }
@@ -1151,11 +1142,6 @@ impl Drop for ColorConverter {
         unsafe {
             let device = self.context.device();
             self.timeline.destroy(device);
-
-            // Destroy cached source image view.
-            if let Some((_, view)) = self.cached_src_view.take() {
-                device.destroy_image_view(view, None);
-            }
 
             // Destroy sampler.
             device.destroy_sampler(self.sampler, None);

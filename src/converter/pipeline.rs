@@ -171,7 +171,7 @@ pub fn create_converter(
         pipeline_layout,
         pipeline,
         sampler,
-        cached_src_view: None,
+        src_view: None,
         output_buffer,
         output_memory,
         output_buffer_size: output_size,
