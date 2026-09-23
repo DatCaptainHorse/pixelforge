@@ -11,9 +11,9 @@ use std::ptr;
 pub(crate) use crate::video::gcd;
 pub(crate) use crate::video::{
     VideoImageParams, align_up, allocate_command_buffers, allocate_session_memory,
-    create_bitstream_buffer, create_buffer_with_device_address, create_command_pool,
-    create_dpb_images as create_dpb_images_shared, create_fence, create_video_image,
-    find_memory_type, get_video_format, lcm, map_bitstream_buffer, query_supported_video_formats,
+    create_bitstream_buffer, create_command_pool, create_dpb_images as create_dpb_images_shared,
+    create_fence, create_video_image, find_memory_type, get_video_format, lcm,
+    map_bitstream_buffer, query_supported_video_formats,
 };
 
 /// Create the encoder's DPB images.
