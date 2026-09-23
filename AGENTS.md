@@ -119,15 +119,25 @@ run it after touching submission or barrier code.
 
 The RGB input path (`EncodeConfig::with_rgb_input`) needs
 `VK_VALVE_video_encode_rgb_conversion`, which today only RADV has.
-`tests/rgb_encode.rs` compares it against the colour converter and skips on
-other devices, so a green run elsewhere says nothing about it.
+`tests/rgb_encode.rs` compares it against the colour converter, checks its
+levels absolutely, and skips on other devices, so a green run elsewhere says
+nothing about it. Under validation it draws two messages that are the layer's,
+not pixelforge's: the layer does not model that extension, so it rejects the
+RGB profile struct in a query pool's profile chain (the spec requires that
+chain to match the session's) and checks the RGB input view against the plain
+format features rather than the video profile's.
 
 Make sure there are no Vulkan validation layer errors during execution. Enable
 them with `PIXELFORGE_VALIDATION=1`; the layer's messages are routed through
 `tracing`, so pair it with `RUST_LOG=warn` (or `debug` for the layer's own
-chatter). Without `VK_LAYER_KHRONOS_validation` installed, pixelforge logs a
-warning and carries on with validation disabled, so absence of errors means
-nothing if the layer is missing.
+chatter). An integration test needs a subscriber installed for any of it to
+show: `common::init_logging()` installs one, and a new test that builds a
+context has to call it or install its own, or its validation messages go
+nowhere. They are captured like any test output,
+so run with `--nocapture` to see a passing test's. Without
+`VK_LAYER_KHRONOS_validation` installed, pixelforge logs a warning and carries
+on with validation disabled, so absence of errors means nothing if the layer is
+missing.
 
 Run the ignored tests once without validation as well. The layer gives every
 object a unique handle, while drivers reuse the handles of destroyed objects
