@@ -297,14 +297,14 @@ fn encode_all(
         let target = encoder.input_image();
         let future = match handoff {
             Handoff::Cpu => {
-                converter.convert(src.image, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL, target)?;
+                converter.convert(src.image, vk::ImageLayout::GENERAL, target)?;
                 encoder.encode(target)?
             }
             Handoff::Gpu => {
                 let ready = TimelinePoint::new(rendered, u64::from(n) + 1);
                 let converted = converter.convert_async(
                     src.image,
-                    vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                    vk::ImageLayout::GENERAL,
                     target,
                     &[ready],
                 )?;

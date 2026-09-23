@@ -11,7 +11,7 @@
 
 #[allow(dead_code)]
 mod common;
-use common::source::{SrcImage, create_src_image, one_shot};
+use common::source::{SrcImage, create_src_image};
 use common::{Readback, decode_stream};
 
 use ash::vk;
@@ -60,39 +60,10 @@ fn moving_frame(n: u32) -> Vec<u8> {
     data
 }
 
-/// Upload frame `n` and leave it in `GENERAL`, which is where
-/// [`Encoder::encode`] expects a source it copies from.
+/// Upload frame `n`. It is left in `GENERAL`, which is where [`Encoder::encode`]
+/// expects a source it copies from.
 fn source(context: &VideoContext, n: u32) -> Result<SrcImage, Box<dyn std::error::Error>> {
-    let src = unsafe { create_src_image(context, WIDTH, HEIGHT, &moving_frame(n))? };
-    unsafe {
-        one_shot(context, |cb| {
-            let barrier = vk::ImageMemoryBarrier::default()
-                .old_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-                .new_layout(vk::ImageLayout::GENERAL)
-                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .image(src.image)
-                .subresource_range(vk::ImageSubresourceRange {
-                    aspect_mask: vk::ImageAspectFlags::COLOR,
-                    base_mip_level: 0,
-                    level_count: 1,
-                    base_array_layer: 0,
-                    layer_count: 1,
-                })
-                .src_access_mask(vk::AccessFlags::SHADER_READ)
-                .dst_access_mask(vk::AccessFlags::TRANSFER_READ);
-            context.device().cmd_pipeline_barrier(
-                cb,
-                vk::PipelineStageFlags::ALL_COMMANDS,
-                vk::PipelineStageFlags::ALL_COMMANDS,
-                vk::DependencyFlags::empty(),
-                &[],
-                &[],
-                &[barrier],
-            );
-        })?;
-    }
-    Ok(src)
+    Ok(unsafe { create_src_image(context, WIDTH, HEIGHT, &moving_frame(n))? })
 }
 
 fn encode_config(codec: Codec) -> EncodeConfig {
