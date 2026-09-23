@@ -80,7 +80,12 @@ pub unsafe fn host_buffer(
 }
 
 /// Upload `pixels`, tightly packed BGRA8, as a `width` x `height` image left in
-/// `SHADER_READ_ONLY_OPTIMAL`, ready for the colour converter.
+/// `GENERAL`.
+///
+/// `GENERAL` because that is where the colour converter leaves its source after
+/// every conversion, so it is the layout the image is in for every conversion
+/// after the first. Starting it anywhere else means a second conversion told
+/// the wrong layout.
 pub unsafe fn create_src_image(
     context: &VideoContext,
     width: u32,
@@ -179,7 +184,7 @@ pub unsafe fn create_src_image(
             );
             let to_read = vk::ImageMemoryBarrier::default()
                 .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-                .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                .new_layout(vk::ImageLayout::GENERAL)
                 .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .image(image)
