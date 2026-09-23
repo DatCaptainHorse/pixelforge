@@ -110,12 +110,30 @@ rebuilt, and getting that wrong is silent rather than loud. Build the reference 
 resolution-changing stream to its first size and a whole-stream reference will
 not compare.
 
+Pixelforge can also run on a device the caller created, for decode and for
+encode. `tests/adopted.rs` builds one from a Vulkan 1.1 instance, as an
+application that never asked for 1.3 would, hands pixelforge spare queues, and
+checks the output against a context pixelforge created itself. It needs no
+ffmpeg. Anything that reaches a core 1.2 or 1.3 entry point panics there, so
+run it after touching submission or barrier code.
+
+The RGB input path (`EncodeConfig::with_rgb_input`) needs
+`VK_VALVE_video_encode_rgb_conversion`, which today only RADV has.
+`tests/rgb_encode.rs` compares it against the colour converter and skips on
+other devices, so a green run elsewhere says nothing about it.
+
 Make sure there are no Vulkan validation layer errors during execution. Enable
 them with `PIXELFORGE_VALIDATION=1`; the layer's messages are routed through
 `tracing`, so pair it with `RUST_LOG=warn` (or `debug` for the layer's own
 chatter). Without `VK_LAYER_KHRONOS_validation` installed, pixelforge logs a
 warning and carries on with validation disabled, so absence of errors means
 nothing if the layer is missing.
+
+Run the ignored tests once without validation as well. The layer gives every
+object a unique handle, while drivers reuse the handles of destroyed objects
+freely, so anything that remembers state by handle can pass with validation
+on and fail without it. That has happened: the converter once cached an image
+view by image handle, and only RADV without validation showed it.
 
 ## Code Style
 - Follow `rustfmt.toml` formatting rules
