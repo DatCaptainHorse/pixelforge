@@ -337,21 +337,12 @@ impl ColorConverterConfig {
     /// and this format, and with [`Self::color_description`], then hand it the
     /// RGB images directly and skip the converter.
     ///
-    /// Limited range only. RADV, the one driver with the extension so far,
-    /// reports full range as supported and writes limited range regardless,
-    /// so a full-range stream would carry limited-range samples and every
-    /// player would show it washed out. See
-    /// [`EncodeConfig::with_rgb_input`](crate::EncodeConfig::with_rgb_input).
-    ///
     /// Whether the driver accepts the format for a particular codec and
     /// profile is only known when the encoder is created, so if
     /// [`Encoder::new`](crate::Encoder::new) refuses it, fall back to the
     /// converter.
     pub fn rgb_encode_input(&self, context: &VideoContext) -> Option<InputFormat> {
-        if !context.has_video_encode_rgb_conversion()
-            || self.source != self.target
-            || self.range.is_full()
-        {
+        if !context.has_video_encode_rgb_conversion() || self.source != self.target {
             return None;
         }
         let matches = match self.output_format {

@@ -537,11 +537,6 @@ impl EncodeConfig {
     /// [`ColorConverterConfig::rgb_encode_input`](crate::ColorConverterConfig::rgb_encode_input)
     /// decides for you.
     ///
-    /// Limited range only: [`Encoder::new`] refuses a full-range description.
-    /// RADV reports full range as supported and writes limited range anyway,
-    /// measured on an RX 9060 XT with Mesa 26.3, so a full-range stream would
-    /// carry limited-range samples under a full-range label.
-    ///
     /// With this set, [`Encoder::input_image`] is an RGB image, and
     /// [`Encoder::encode`] copies an RGB source into it.
     pub fn with_rgb_input(mut self, format: crate::converter::InputFormat) -> Self {

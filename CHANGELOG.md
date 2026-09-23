@@ -122,9 +122,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `EncodeConfig::with_rgb_input` hands RGB frames to the encoder and lets it
   apply the YUV matrix itself, through `VK_VALVE_video_encode_rgb_conversion`.
   `ColorConverterConfig::rgb_encode_input` says when a conversion can be done
-  that way instead of by the shader. Limited range only: RADV, the one driver
-  with the extension so far, writes limited range even when asked for full.
-  Based on the approach in #14.
+  that way instead of by the shader. Based on the approach in #14.
 
 ### Changed
 

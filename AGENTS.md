@@ -119,9 +119,8 @@ run it after touching submission or barrier code.
 
 The RGB input path (`EncodeConfig::with_rgb_input`) needs
 `VK_VALVE_video_encode_rgb_conversion`, which today only RADV has.
-`tests/rgb_encode.rs` compares it against the colour converter, checks its
-levels absolutely, and skips on other devices, so a green run elsewhere says
-nothing about it. Under validation it draws two messages that are the layer's,
+`tests/rgb_encode.rs` compares it against the colour converter and skips on
+other devices, so a green run elsewhere says nothing about it. Under validation it draws two messages that are the layer's,
 not pixelforge's: the layer does not model that extension, so it rejects the
 RGB profile struct in a query pool's profile chain (the spec requires that
 chain to match the session's) and checks the RGB input view against the plain
