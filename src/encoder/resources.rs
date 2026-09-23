@@ -626,7 +626,7 @@ pub(crate) fn upload_image_to_input(
 ///
 /// The command buffer must be in recording state.
 pub(crate) unsafe fn record_dpb_barriers(
-    device: &ash::Device,
+    sync2: &ash::khr::synchronization2::Device,
     command_buffer: vk::CommandBuffer,
     dpb_images: &[vk::Image],
     use_layered_dpb: bool,
@@ -710,7 +710,7 @@ pub(crate) unsafe fn record_dpb_barriers(
     }
 
     let dependency = vk::DependencyInfo::default().image_memory_barriers(&all_barriers);
-    unsafe { device.cmd_pipeline_barrier2(command_buffer, &dependency) };
+    unsafe { sync2.cmd_pipeline_barrier2(command_buffer, &dependency) };
 }
 
 /// Prepare an encode command buffer for recording.
@@ -810,6 +810,7 @@ pub(crate) unsafe fn record_post_encode_dpb_barrier(
 /// The command buffer must have been ended.
 pub(crate) unsafe fn submit_encode_only(
     device: &ash::Device,
+    sync2: &ash::khr::synchronization2::Device,
     command_buffer: vk::CommandBuffer,
     fence: vk::Fence,
     encode_queue: vk::Queue,
@@ -850,7 +851,7 @@ pub(crate) unsafe fn submit_encode_only(
     }
 
     unsafe {
-        device
+        sync2
             .queue_submit2(encode_queue, &[submit_info], fence)
             .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
     }

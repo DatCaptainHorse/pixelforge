@@ -128,9 +128,11 @@ impl EncoderCommon {
         let encode_queue = self.context.video_encode_queue().ok_or_else(|| {
             PixelForgeError::NoSuitableDevice("No video encode queue available".to_string())
         })?;
-        let future = self
-            .pipeline
-            .submit_current(self.context.device(), encode_queue)?;
+        let future = self.pipeline.submit_current(
+            self.context.device(),
+            self.context.sync2(),
+            encode_queue,
+        )?;
         self.dpb_slot_active[self.current_dpb_slot as usize] = true;
         Ok(future)
     }
