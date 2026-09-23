@@ -342,6 +342,9 @@ pub struct EncodeConfig {
     /// Color description for VUI signaling.
     /// Defaults to BT.709 (full-range) when `None`.
     pub color_description: Option<ColorDescription>,
+    /// Take RGB input and let the encoder convert it to YUV itself, through
+    /// `VK_VALVE_video_encode_rgb_conversion`. See [`Self::with_rgb_input`].
+    pub rgb_input: Option<crate::converter::InputFormat>,
     /// Usage hint for encoding.
     pub encode_usage_hint: EncodeUsageHint,
     /// Content hint for encoding.
@@ -373,6 +376,7 @@ impl EncodeConfig {
             virtual_buffer_size_ms: 1000,
             initial_virtual_buffer_size_ms: 1000,
             color_description: None,
+            rgb_input: None,
             encode_usage_hint: EncodeUsageHint::Default,
             encode_content_hint: EncodeContentHint::Default,
             encoder_tuning_mode: EncoderTuningMode::Default,
@@ -401,6 +405,7 @@ impl EncodeConfig {
             virtual_buffer_size_ms: 1000,
             initial_virtual_buffer_size_ms: 1000,
             color_description: None,
+            rgb_input: None,
             encode_usage_hint: EncodeUsageHint::Default,
             encode_content_hint: EncodeContentHint::Default,
             encoder_tuning_mode: EncoderTuningMode::Default,
@@ -429,6 +434,7 @@ impl EncodeConfig {
             virtual_buffer_size_ms: 1000,
             initial_virtual_buffer_size_ms: 1000,
             color_description: None,
+            rgb_input: None,
             encode_usage_hint: EncodeUsageHint::Default,
             encode_content_hint: EncodeContentHint::Default,
             encoder_tuning_mode: EncoderTuningMode::Default,
@@ -514,6 +520,27 @@ impl EncodeConfig {
     /// Set the color description for VUI signaling.
     pub fn with_color_description(mut self, desc: ColorDescription) -> Self {
         self.color_description = Some(desc);
+        self
+    }
+
+    /// Take `format` RGB images as input and convert them to YUV in the
+    /// encoder itself, with no colour conversion shader.
+    ///
+    /// Needs `VK_VALVE_video_encode_rgb_conversion` (see
+    /// [`VideoContext::has_video_encode_rgb_conversion`]), and a driver that
+    /// accepts `format` as encode input for this codec, profile and bit depth;
+    /// [`Encoder::new`] fails otherwise. The YUV matrix and range come from
+    /// [`Self::color_description`], so set that to what the stream should
+    /// carry. The hardware applies only the matrix: a source that needs a
+    /// transfer function or gamut change still has to go through
+    /// [`ColorConverter`](crate::ColorConverter), which
+    /// [`ColorConverterConfig::rgb_encode_input`](crate::ColorConverterConfig::rgb_encode_input)
+    /// decides for you.
+    ///
+    /// With this set, [`Encoder::input_image`] is an RGB image, and
+    /// [`Encoder::encode`] copies an RGB source into it.
+    pub fn with_rgb_input(mut self, format: crate::converter::InputFormat) -> Self {
+        self.rgb_input = Some(format);
         self
     }
 

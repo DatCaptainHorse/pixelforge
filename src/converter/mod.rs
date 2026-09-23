@@ -325,6 +325,37 @@ impl ColorConverterConfig {
         )
     }
 
+    /// The RGB input to give the encoder instead of running this conversion,
+    /// when the encoder can do it itself.
+    ///
+    /// `Some` when `context` has `VK_VALVE_video_encode_rgb_conversion` and
+    /// the conversion is nothing but the YUV matrix: source and target are the
+    /// same space, so no transfer function or gamut change is involved, the
+    /// output is 4:2:0, and the input is 8-bit for an 8-bit output or
+    /// `ABGR2101010` for a 10-bit one. Build the encoder with
+    /// [`EncodeConfig::with_rgb_input`](crate::EncodeConfig::with_rgb_input)
+    /// and this format, and with [`Self::color_description`], then hand it the
+    /// RGB images directly and skip the converter.
+    ///
+    /// Whether the driver accepts the format for a particular codec and
+    /// profile is only known when the encoder is created, so if
+    /// [`Encoder::new`](crate::Encoder::new) refuses it, fall back to the
+    /// converter.
+    pub fn rgb_encode_input(&self, context: &VideoContext) -> Option<InputFormat> {
+        if !context.has_video_encode_rgb_conversion() || self.source != self.target {
+            return None;
+        }
+        let matches = match self.output_format {
+            OutputFormat::NV12 => matches!(
+                self.input_format,
+                InputFormat::BGRx | InputFormat::BGRA | InputFormat::RGBx | InputFormat::RGBA
+            ),
+            OutputFormat::P010 => self.input_format == InputFormat::ABGR2101010,
+            _ => false,
+        };
+        matches.then_some(self.input_format)
+    }
+
     /// Whether the shader can get from this source to this target.
     ///
     /// Anything that would need tone mapping or a forward gamma encode is not

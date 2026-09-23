@@ -11,6 +11,7 @@ use super::queues::{self, QueueOverrides};
 use super::{
     DeviceFeatures, DeviceRequirements, QueueRoles, VideoContext, VideoContextBuilder,
     VideoContextInner, scan_queue_families, supports_internally_synchronized_queues,
+    supports_rgb_conversion,
 };
 use crate::encoder::Codec;
 use crate::error::{PixelForgeError, Result};
@@ -36,6 +37,7 @@ struct EncodePlan {
     push_descriptor: bool,
     ycbcr_2plane_444: bool,
     sampler_ycbcr_conversion: bool,
+    rgb_conversion: bool,
 }
 
 impl EncodePlan {
@@ -111,6 +113,8 @@ impl EncodePlan {
             push_descriptor: has(ash::khr::push_descriptor::NAME),
             ycbcr_2plane_444: has(ash::ext::ycbcr_2plane_444_formats::NAME),
             sampler_ycbcr_conversion: ycbcr.sampler_ycbcr_conversion != 0,
+            rgb_conversion: has(ash::valve::video_encode_rgb_conversion::NAME)
+                && supports_rgb_conversion(instance, physical_device),
         })
     }
 
@@ -137,6 +141,9 @@ impl EncodePlan {
         if self.ycbcr_2plane_444 {
             names.push(ash::ext::ycbcr_2plane_444_formats::NAME);
         }
+        if self.rgb_conversion {
+            names.push(ash::valve::video_encode_rgb_conversion::NAME);
+        }
         names
     }
 
@@ -147,6 +154,7 @@ impl EncodePlan {
             sampler_ycbcr_conversion: self.sampler_ycbcr_conversion,
             ycbcr_2plane_444_formats: self.ycbcr_2plane_444,
             video_encode_av1: self.codecs.contains(&Codec::AV1),
+            video_encode_rgb_conversion: self.rgb_conversion,
         }
     }
 
@@ -173,6 +181,8 @@ impl VideoContextBuilder {
     /// The colour converter needs `VK_KHR_push_descriptor`, which is included
     /// whenever the device has it. On a device without it, encoding from YUV
     /// input still works and only the converter is unavailable.
+    /// `VK_VALVE_video_encode_rgb_conversion` is included the same way, for
+    /// [`EncodeConfig::with_rgb_input`](crate::EncodeConfig::with_rgb_input).
     pub fn encode_device_requirements(
         &self,
         entry: &ash::Entry,
@@ -314,6 +324,7 @@ impl VideoContext {
                 supported_encode_codecs: plan.codecs.clone(),
                 supported_decode_codecs: Vec::new(),
                 has_push_descriptor: plan.push_descriptor,
+                has_video_encode_rgb_conversion: plan.rgb_conversion,
                 has_unified_image_layouts: false,
                 owns_device: false,
                 // The caller owns the instance; reporting is theirs to set up.

@@ -171,6 +171,97 @@ pub(crate) fn create_command_resources(
     })
 }
 
+/// Clear an RGB input image to opaque black and leave it in
+/// `VIDEO_ENCODE_SRC_KHR`.
+///
+/// The YUV path fills each plane from a staging buffer; an RGB image has a
+/// single colour plane, so a clear does it.
+pub(crate) fn clear_rgb_input_image(
+    context: &VideoContext,
+    params: &ClearImageParams,
+) -> Result<()> {
+    let device = context.device();
+    let cb = params.command_buffer;
+    let range = vk::ImageSubresourceRange {
+        aspect_mask: vk::ImageAspectFlags::COLOR,
+        base_mip_level: 0,
+        level_count: 1,
+        base_array_layer: 0,
+        layer_count: 1,
+    };
+    let err = |e: vk::Result| PixelForgeError::CommandBuffer(e.to_string());
+    unsafe {
+        device
+            .reset_command_buffer(cb, vk::CommandBufferResetFlags::empty())
+            .map_err(err)?;
+        device
+            .begin_command_buffer(
+                cb,
+                &vk::CommandBufferBeginInfo::default()
+                    .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+            )
+            .map_err(err)?;
+        let to_transfer = vk::ImageMemoryBarrier::default()
+            .old_layout(vk::ImageLayout::UNDEFINED)
+            .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .image(params.image)
+            .subresource_range(range)
+            .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE);
+        device.cmd_pipeline_barrier(
+            cb,
+            vk::PipelineStageFlags::TOP_OF_PIPE,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &[to_transfer],
+        );
+        device.cmd_clear_color_image(
+            cb,
+            params.image,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            &vk::ClearColorValue {
+                float32: [0.0, 0.0, 0.0, 1.0],
+            },
+            &[range],
+        );
+        let to_encode = vk::ImageMemoryBarrier::default()
+            .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+            .new_layout(vk::ImageLayout::VIDEO_ENCODE_SRC_KHR)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .image(params.image)
+            .subresource_range(range)
+            .src_access_mask(vk::AccessFlags::TRANSFER_WRITE);
+        device.cmd_pipeline_barrier(
+            cb,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &[to_encode],
+        );
+        device.end_command_buffer(cb).map_err(err)?;
+        let cbs = [cb];
+        device.reset_fences(&[params.fence]).map_err(err)?;
+        device
+            .queue_submit(
+                params.queue,
+                &[vk::SubmitInfo::default().command_buffers(&cbs)],
+                params.fence,
+            )
+            .map_err(err)?;
+        device
+            .wait_for_fences(&[params.fence], true, u64::MAX)
+            .map_err(err)?;
+        device.reset_fences(&[params.fence]).map_err(err)?;
+    }
+    Ok(())
+}
+
 /// Create DPB images for video encoding.
 ///
 /// When `use_layered` is true (required when the driver does not support
@@ -408,6 +499,8 @@ pub(crate) struct UploadParams<'a> {
     pub pixel_format: PixelFormat,
     /// The current layout of the input image.
     pub input_image_layout: vk::ImageLayout,
+    /// Whether both images are single-plane RGB rather than YUV.
+    pub rgb: bool,
     /// The queue to submit transfer operations to.
     pub upload_queue: vk::Queue,
     /// Caller work the copy must wait for.
@@ -544,6 +637,28 @@ pub(crate) fn upload_image_to_input(
         },
     };
 
+    // An RGB input image has one colour plane, copied whole.
+    let rgb_copy_region = vk::ImageCopy {
+        src_subresource: vk::ImageSubresourceLayers {
+            aspect_mask: vk::ImageAspectFlags::COLOR,
+            mip_level: 0,
+            base_array_layer: 0,
+            layer_count: 1,
+        },
+        dst_subresource: vk::ImageSubresourceLayers {
+            aspect_mask: vk::ImageAspectFlags::COLOR,
+            mip_level: 0,
+            base_array_layer: 0,
+            layer_count: 1,
+        },
+        ..y_copy_region
+    };
+    let regions: &[vk::ImageCopy] = if params.rgb {
+        &[rgb_copy_region]
+    } else {
+        &[y_copy_region, uv_copy_region]
+    };
+
     unsafe {
         device.cmd_copy_image(
             params.upload_command_buffer,
@@ -551,7 +666,7 @@ pub(crate) fn upload_image_to_input(
             vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
             params.dst_image,
             vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-            &[y_copy_region, uv_copy_region],
+            regions,
         );
     }
 
