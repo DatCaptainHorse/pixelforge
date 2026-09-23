@@ -24,6 +24,7 @@ use crate::encoder::resources::{
 };
 use crate::encoder::{ColorDescription, EncodeConfig, FrameType, RateControlMode};
 use crate::error::{PixelForgeError, Result};
+use crate::sync::TimelinePoint;
 use crate::vulkan::VideoContext;
 
 /// Per-encoder state shared by every codec.
@@ -72,6 +73,9 @@ pub(crate) struct EncoderCommon {
     pub upload_command_pool: vk::CommandPool,
     pub upload_command_buffer: vk::CommandBuffer,
     pub upload_fence: vk::Fence,
+    /// Caller work this frame's first submission must wait for. The upload
+    /// takes them when it copies, otherwise the encode submission does.
+    pub pending_waits: Vec<TimelinePoint>,
 }
 
 impl EncoderCommon {
@@ -100,6 +104,7 @@ impl EncoderCommon {
         if src_image == dst_image {
             return Ok(());
         }
+        let waits = std::mem::take(&mut self.pending_waits);
 
         let params = UploadParams {
             upload_command_buffer: self.upload_command_buffer,
@@ -111,6 +116,7 @@ impl EncoderCommon {
             pixel_format: self.config.pixel_format,
             input_image_layout,
             upload_queue: self.context.transfer_queue(),
+            waits: &waits,
         };
         upload_image_to_input(&self.context, &params)?;
         self.pipeline.current_mut().input_image_layout = vk::ImageLayout::VIDEO_ENCODE_SRC_KHR;
@@ -128,10 +134,12 @@ impl EncoderCommon {
         let encode_queue = self.context.video_encode_queue().ok_or_else(|| {
             PixelForgeError::NoSuitableDevice("No video encode queue available".to_string())
         })?;
+        let waits = std::mem::take(&mut self.pending_waits);
         let future = self.pipeline.submit_current(
             self.context.device(),
             self.context.sync2(),
             encode_queue,
+            &waits,
         )?;
         self.dpb_slot_active[self.current_dpb_slot as usize] = true;
         Ok(future)
@@ -314,9 +322,16 @@ impl<C: VideoCodec> CodecEncoder<C> {
         self.common.pipeline.input_image()
     }
 
-    /// Encode one frame, returning a future for its packet. See [`crate::Encoder::encode`].
-    pub fn encode(&mut self, src_image: vk::Image) -> Result<EncodeFuture> {
+    /// Encode one frame once `wait` is reached, returning a future for its
+    /// packet. See [`crate::Encoder::encode_after`].
+    pub fn encode_after(
+        &mut self,
+        src_image: vk::Image,
+        wait: &[TimelinePoint],
+    ) -> Result<EncodeFuture> {
         let plan = self.common.begin_frame();
+        self.common.pending_waits.clear();
+        self.common.pending_waits.extend_from_slice(wait);
         self.common.upload(src_image)?;
 
         let setup = self.codec.begin_picture(&mut self.common, &plan)?;
@@ -715,6 +730,7 @@ pub(crate) fn build_encoder_common(req: &CommonInitRequest) -> Result<CommonInit
         upload_command_pool: cmd.upload_command_pool,
         upload_command_buffer: cmd.upload_command_buffer,
         upload_fence: cmd.upload_fence,
+        pending_waits: Vec::new(),
     };
 
     Ok(CommonInit {

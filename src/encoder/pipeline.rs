@@ -47,6 +47,7 @@ use crate::encoder::resources::{
 };
 use crate::encoder::{BitDepth, EncodedPacket, FrameType, PixelFormat};
 use crate::error::{PixelForgeError, Result};
+use crate::sync::TimelinePoint;
 use crate::video::{SlotSync, TimelineChain};
 use crate::vulkan::VideoContext;
 
@@ -359,6 +360,7 @@ impl EncodePipeline {
         device: &ash::Device,
         sync2: &ash::khr::synchronization2::Device,
         encode_queue: vk::Queue,
+        external_waits: &[TimelinePoint],
     ) -> Result<EncodeFuture> {
         let wait = self.timeline.wait();
         let signal = self.timeline.pending_signal();
@@ -394,6 +396,18 @@ impl EncodePipeline {
             )
         };
 
+        // The previous encode, which shares the DPB, then whatever the caller
+        // asked this frame to wait for.
+        let waits: Vec<vk::SemaphoreSubmitInfo> = wait
+            .into_iter()
+            .map(|(semaphore, value)| {
+                vk::SemaphoreSubmitInfo::default()
+                    .semaphore(semaphore)
+                    .value(value)
+                    .stage_mask(vk::PipelineStageFlags2::VIDEO_ENCODE_KHR)
+            })
+            .chain(external_waits.iter().map(TimelinePoint::wait_info))
+            .collect();
         unsafe {
             submit_encode_only(
                 device,
@@ -401,7 +415,7 @@ impl EncodePipeline {
                 command_buffer,
                 fence,
                 encode_queue,
-                wait,
+                &waits,
                 Some(signal),
             )?;
         }
