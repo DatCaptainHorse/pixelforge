@@ -17,6 +17,8 @@
 //!   once is undefined, so these examples drive the decoder and the readback
 //!   from the same thread.
 
+pub mod source;
+
 use ash::vk;
 use pixelforge::decoder::{DecodedFrame, Decoder, FramePoll};
 use pixelforge::encoder::BitDepth;
