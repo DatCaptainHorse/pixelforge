@@ -351,6 +351,24 @@ pub struct EncodeConfig {
     /// P-frames. Setting it equal to `virtual_buffer_size_ms` gives
     /// IDR frames maximum headroom.
     pub initial_virtual_buffer_size_ms: u32,
+    /// Pictures in one intra refresh cycle, or `None` for periodic key frames.
+    ///
+    /// Intra refresh replaces the key frame with a cycle: each picture codes
+    /// one slice of the image as intra, and after a full cycle every part has
+    /// been refreshed, so a decoder joining anywhere is correct within one
+    /// cycle. The same recovery, spread evenly.
+    ///
+    /// What it is *for* is that evenness. A key frame is the largest picture a
+    /// stream contains -- measured here at 1080p, up to 141 kB against a 4 kB
+    /// delta frame -- so it is the one the rate control cannot fit and the one
+    /// a network cannot absorb. Sizing the rate-control buffer small enough to
+    /// track a bitrate quickly starves key frames (one came out at 2114 bytes,
+    /// which every picture in the group then predicts from); sizing it large
+    /// enough for key frames makes the encoder slow to obey a new bitrate. A
+    /// stream with no key frames is not subject to that trade.
+    ///
+    /// Ignored, with a warning, where the device cannot do it.
+    pub intra_refresh_cycle: Option<u32>,
     /// Color description for VUI signaling.
     /// Defaults to BT.709 (full-range) when `None`.
     pub color_description: Option<ColorDescription>,
@@ -386,6 +404,7 @@ impl EncodeConfig {
             gop_size: DEFAULT_GOP_SIZE,
             b_frame_count: 0, // Start without B-frames for simplicity.
             max_reference_frames: DEFAULT_MAX_REFERENCE_FRAMES,
+            intra_refresh_cycle: None,
             virtual_buffer_size_ms: 1000,
             initial_virtual_buffer_size_ms: 1000,
             color_description: None,
@@ -416,6 +435,7 @@ impl EncodeConfig {
             gop_size: DEFAULT_GOP_SIZE,
             b_frame_count: 0, // Start without B-frames for simplicity.
             max_reference_frames: DEFAULT_MAX_REFERENCE_FRAMES,
+            intra_refresh_cycle: None,
             virtual_buffer_size_ms: 1000,
             initial_virtual_buffer_size_ms: 1000,
             color_description: None,
@@ -446,6 +466,7 @@ impl EncodeConfig {
             gop_size: DEFAULT_GOP_SIZE,
             b_frame_count: 0, // Start without B-frames for simplicity.
             max_reference_frames: DEFAULT_MAX_REFERENCE_FRAMES,
+            intra_refresh_cycle: None,
             virtual_buffer_size_ms: 1000,
             initial_virtual_buffer_size_ms: 1000,
             color_description: None,
@@ -532,6 +553,16 @@ impl EncodeConfig {
     /// Set the VBV/HRD virtual buffer size in milliseconds.
     /// Smaller values produce more uniform frame sizes at the cost of
     /// quality variation during scene changes.
+    /// Encode with intra refresh over `cycle` pictures instead of key frames.
+    ///
+    /// A cycle length is a trade between how quickly a decoder joining the
+    /// stream becomes correct and how much of each picture is intra-coded: a
+    /// short cycle recovers fast and costs bitrate, a long one the reverse.
+    pub fn with_intra_refresh(mut self, cycle: Option<u32>) -> Self {
+        self.intra_refresh_cycle = cycle.filter(|c| *c > 1);
+        self
+    }
+
     pub fn with_virtual_buffer_size_ms(mut self, ms: u32) -> Self {
         self.virtual_buffer_size_ms = ms;
         self
