@@ -193,10 +193,22 @@ impl H264 {
         // Chain quality level info (required by AMD RADV; matches FFmpeg).
         let mut quality_level_info = vk::VideoEncodeQualityLevelInfoKHR::default().quality_level(0);
 
-        let params_create_info = vk::VideoSessionParametersCreateInfoKHR::default()
+        let mut params_create_info = vk::VideoSessionParametersCreateInfoKHR::default()
             .video_session(common.session)
             .push(&mut h264_params_create_info)
             .push(&mut quality_level_info);
+
+        // The texel size belongs to the session parameters, not the session,
+        // so parameters rebuilt later -- a colour-description change makes new
+        // ones -- have to be told it again or they disagree with the maps
+        // already allocated.
+        let mut qp_map_params = common.qp_map.as_ref().map(|m| {
+            vk::VideoEncodeQuantizationMapSessionParametersCreateInfoKHR::default()
+                .quantization_map_texel_size(m.texel_size)
+        });
+        if let Some(info) = qp_map_params.as_mut() {
+            params_create_info = params_create_info.push(info);
+        }
 
         let mut session_params = vk::VideoSessionParametersKHR::null();
         let result = unsafe {

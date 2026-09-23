@@ -104,6 +104,8 @@ fn create_app_device(
     let mut av1 = vk::PhysicalDeviceVideoEncodeAV1FeaturesKHR::default().video_encode_av1(true);
     let mut rgb = vk::PhysicalDeviceVideoEncodeRgbConversionFeaturesVALVE::default()
         .video_encode_rgb_conversion(true);
+    let mut qp_map = vk::PhysicalDeviceVideoEncodeQuantizationMapFeaturesKHR::default()
+        .video_encode_quantization_map(true);
     let mut unified = vk::PhysicalDeviceUnifiedImageLayoutsFeaturesKHR::default()
         .unified_image_layouts(true)
         .unified_image_layouts_video(true);
@@ -121,6 +123,9 @@ fn create_app_device(
     }
     if features.video_encode_rgb_conversion {
         info = info.push(&mut rgb);
+    }
+    if features.video_encode_quantization_map {
+        info = info.push(&mut qp_map);
     }
     if reqs.unified_image_layouts {
         info = info.push(&mut unified);

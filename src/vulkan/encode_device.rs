@@ -39,6 +39,7 @@ struct EncodePlan {
     sampler_ycbcr_conversion: bool,
     rgb_conversion: bool,
     intra_refresh: bool,
+    quantization_map: bool,
 }
 
 impl EncodePlan {
@@ -107,6 +108,15 @@ impl EncodePlan {
             let mut query = vk::PhysicalDeviceFeatures2::default().push(&mut intra_refresh);
             unsafe { instance.get_physical_device_features2(physical_device, &mut query) };
         }
+        let mut qp_map = vk::PhysicalDeviceVideoEncodeQuantizationMapFeaturesKHR::default();
+        // Below Vulkan 1.3 the quantization map extension also depends on
+        // VK_KHR_format_feature_flags2, so it counts only with that present.
+        let has_qp_map = has(ash::khr::video_encode_quantization_map::NAME)
+            && has(ash::khr::format_feature_flags2::NAME);
+        if has_qp_map {
+            let mut query = vk::PhysicalDeviceFeatures2::default().push(&mut qp_map);
+            unsafe { instance.get_physical_device_features2(physical_device, &mut query) };
+        }
 
         Ok(Self {
             families: EncodeQueueFamilies {
@@ -126,6 +136,7 @@ impl EncodePlan {
             // silently never refreshes.
             intra_refresh: has(ash::khr::video_encode_intra_refresh::NAME)
                 && intra_refresh.video_encode_intra_refresh != 0,
+            quantization_map: has_qp_map && qp_map.video_encode_quantization_map != 0,
         })
     }
 
@@ -158,6 +169,10 @@ impl EncodePlan {
         if self.intra_refresh {
             names.push(ash::khr::video_encode_intra_refresh::NAME);
         }
+        if self.quantization_map {
+            names.push(ash::khr::video_encode_quantization_map::NAME);
+            names.push(ash::khr::format_feature_flags2::NAME);
+        }
         names
     }
 
@@ -170,6 +185,7 @@ impl EncodePlan {
             video_encode_av1: self.codecs.contains(&Codec::AV1),
             video_encode_rgb_conversion: self.rgb_conversion,
             video_encode_intra_refresh: self.intra_refresh,
+            video_encode_quantization_map: self.quantization_map,
         }
     }
 
@@ -341,6 +357,7 @@ impl VideoContext {
                 has_push_descriptor: plan.push_descriptor,
                 has_video_encode_rgb_conversion: plan.rgb_conversion,
                 has_video_encode_intra_refresh: plan.intra_refresh,
+                has_video_encode_quantization_map: plan.quantization_map,
                 has_unified_image_layouts: false,
                 owns_device: false,
                 // The caller owns the instance; reporting is theirs to set up.

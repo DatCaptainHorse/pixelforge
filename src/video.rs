@@ -221,6 +221,79 @@ pub(crate) struct VideoFormatSupport {
     pub create_flags: vk::ImageCreateFlags,
 }
 
+/// The image format and texel granularity a quantization delta map must use
+/// for this profile.
+///
+/// The texel size is the device's, not ours: it is how many pixels one entry
+/// of the map covers, and it need not match the codec block the refresh sweep
+/// advances in. Returned together with the format because a map image is
+/// wrong without both, and querying them apart invites one being refreshed
+/// while the other is not.
+///
+/// `None` when the device offers no delta-map format for this profile, which
+/// is a normal answer and not an error -- the caller encodes without a map.
+pub(crate) fn query_quantization_map_format(
+    context: &VideoContext,
+    profile_info: &vk::VideoProfileInfoKHR,
+) -> Option<(vk::Format, vk::Extent2D, vk::ImageTiling)> {
+    let video_queue_fn = ash::khr::video_queue::Instance::load(context.entry(), context.instance());
+    let profiles = [*profile_info];
+    let mut profile_list = vk::VideoProfileListInfoKHR::default().profiles(&profiles);
+    let format_info = vk::PhysicalDeviceVideoFormatInfoKHR::default()
+        .image_usage(vk::ImageUsageFlags::VIDEO_ENCODE_QUANTIZATION_DELTA_MAP_KHR)
+        .push(&mut profile_list);
+
+    let physical_device = context.physical_device();
+    let mut count = 0u32;
+    let result = unsafe {
+        (video_queue_fn
+            .fp()
+            .get_physical_device_video_format_properties_khr)(
+            physical_device,
+            &format_info,
+            &mut count,
+            ptr::null_mut(),
+        )
+    };
+    if result != vk::Result::SUCCESS || count == 0 {
+        return None;
+    }
+
+    // The texel size arrives per format, chained to that format's own
+    // properties, so the two arrays have to be linked entry by entry before
+    // the second call rather than read back afterwards.
+    let mut map_props =
+        vec![vk::VideoFormatQuantizationMapPropertiesKHR::default(); count as usize];
+    let mut props = vec![vk::VideoFormatPropertiesKHR::default(); count as usize];
+    for (p, m) in props.iter_mut().zip(map_props.iter_mut()) {
+        p.p_next = m as *mut _ as *mut std::ffi::c_void;
+    }
+    let result = unsafe {
+        (video_queue_fn
+            .fp()
+            .get_physical_device_video_format_properties_khr)(
+            physical_device,
+            &format_info,
+            &mut count,
+            props.as_mut_ptr(),
+        )
+    };
+    if result != vk::Result::SUCCESS || count == 0 {
+        return None;
+    }
+    // Linear preferred where it is offered: a delta map is a few kilobytes
+    // written once per session, so the cost of optimal tiling is a staging
+    // buffer and a copy to save nothing measurable.
+    let pick = (0..count as usize)
+        .find(|i| props[*i].image_tiling == vk::ImageTiling::LINEAR)
+        .unwrap_or(0);
+    let texel = map_props[pick].quantization_map_texel_size;
+    if texel.width == 0 || texel.height == 0 {
+        return None;
+    }
+    Some((props[pick].format, texel, props[pick].image_tiling))
+}
+
 pub(crate) fn query_supported_video_formats(
     context: &VideoContext,
     profile_info: &vk::VideoProfileInfoKHR,

@@ -430,10 +430,33 @@ impl H264 {
             encode_info = encode_info.reference_slots(&encode_ref_slots);
         }
         encode_info = encode_info.push(&mut h264_picture_info);
+        // The map for this picture, which is the one whose band is about to be
+        // intra-coded. The maps are built per cycle index at session creation,
+        // so this is a lookup rather than any per-frame work.
+        let mut qp_map_info = common.qp_map.as_ref().and_then(|m| {
+            let index = common.intra_refresh.as_ref()?.index;
+            let view = m.images.view_for(index)?;
+            Some(
+                vk::VideoEncodeQuantizationMapInfoKHR::default()
+                    .quantization_map(view)
+                    .quantization_map_extent(m.images.extent),
+            )
+        });
+        // Accumulated rather than assigned: `flags` replaces, so setting the
+        // refresh bit and then the map bit would drop the first one.
+        let mut encode_flags = vk::VideoEncodeFlagsKHR::empty();
+        if refresh_info.is_some() {
+            encode_flags |= vk::VideoEncodeFlagsKHR::INTRA_REFRESH;
+        }
+        if qp_map_info.is_some() {
+            encode_flags |= vk::VideoEncodeFlagsKHR::WITH_QUANTIZATION_DELTA_MAP;
+        }
+        encode_info = encode_info.flags(encode_flags);
         if let Some(info) = refresh_info.as_mut() {
-            encode_info = encode_info
-                .flags(vk::VideoEncodeFlagsKHR::INTRA_REFRESH)
-                .push(info);
+            encode_info = encode_info.push(info);
+        }
+        if let Some(info) = qp_map_info.as_mut() {
+            encode_info = encode_info.push(info);
         }
 
         // Reference slots for begin coding (setup slot is marked inactive, -1).

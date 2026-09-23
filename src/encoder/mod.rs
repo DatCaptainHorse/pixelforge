@@ -36,6 +36,25 @@ pub const DEFAULT_GOP_SIZE: u32 = 30;
 /// nothing about the usage hint suggests a live path.
 pub const DEFAULT_VIRTUAL_BUFFER_MS: u32 = 1000;
 
+/// QP adjustment applied inside the intra refresh band, on the H.264/H.265
+/// scale.
+///
+/// Negative, because the band is the part that needs *more* bits: its blocks
+/// are freshly intra-coded and carry none of the refinement their neighbours
+/// have accumulated across the cycle, so at the rate controller's chosen QP
+/// they land visibly below the rest of the picture.
+///
+/// Provisional. It is a perceptual trade with no closed form -- under a
+/// bitrate target the bits spent here come out of the rest of the frame -- so
+/// the right value is whatever measures and looks best, and this is a starting
+/// point rather than a derived one.
+pub const DEFAULT_INTRA_REFRESH_QP_DELTA: i32 = -4;
+
+/// How much wider AV1's q-index scale is than the QP scale the other two use:
+/// 0..255 against 0..51. A delta meaningful for one is five times too small
+/// for the other.
+const AV1_Q_INDEX_SCALE: i32 = 5;
+
 /// Default QP (quantization parameter) for H.264.
 pub const DEFAULT_H264_QP: u32 = 26;
 
@@ -421,6 +440,12 @@ pub struct EncodeConfig {
     /// `None` follows `virtual_buffer_size_ms`, giving key frames the whole
     /// buffer to spend.
     pub initial_virtual_buffer_size_ms: Option<u32>,
+    /// QP adjustment inside the intra refresh band, or `None` for
+    /// [`DEFAULT_INTRA_REFRESH_QP_DELTA`] on the codec's own scale.
+    ///
+    /// Ignored where there is no intra refresh to band, and where the device
+    /// has no quantization delta map to express it with.
+    pub intra_refresh_qp_delta: Option<i32>,
     /// Whether to replace periodic key frames with an intra refresh cycle,
     /// and what the cycle is for. `None` keeps periodic key frames.
     ///
@@ -483,6 +508,7 @@ impl EncodeConfig {
             b_frame_count: 0, // Start without B-frames for simplicity.
             max_reference_frames: DEFAULT_MAX_REFERENCE_FRAMES,
             intra_refresh: None,
+            intra_refresh_qp_delta: None,
             intra_refresh_mode: None,
             virtual_buffer_size_ms: None,
             initial_virtual_buffer_size_ms: None,
@@ -515,6 +541,7 @@ impl EncodeConfig {
             b_frame_count: 0, // Start without B-frames for simplicity.
             max_reference_frames: DEFAULT_MAX_REFERENCE_FRAMES,
             intra_refresh: None,
+            intra_refresh_qp_delta: None,
             intra_refresh_mode: None,
             virtual_buffer_size_ms: None,
             initial_virtual_buffer_size_ms: None,
@@ -547,6 +574,7 @@ impl EncodeConfig {
             b_frame_count: 0, // Start without B-frames for simplicity.
             max_reference_frames: DEFAULT_MAX_REFERENCE_FRAMES,
             intra_refresh: None,
+            intra_refresh_qp_delta: None,
             intra_refresh_mode: None,
             virtual_buffer_size_ms: None,
             initial_virtual_buffer_size_ms: None,
@@ -653,6 +681,27 @@ impl EncodeConfig {
     pub fn resolved_initial_virtual_buffer_ms(&self) -> u32 {
         self.initial_virtual_buffer_size_ms
             .unwrap_or_else(|| self.resolved_virtual_buffer_ms())
+    }
+
+    /// The delta this encode will apply inside the refresh band, on the
+    /// codec's own scale.
+    ///
+    /// AV1's default is scaled up because its q-index range is five times the
+    /// QP range H.264 and H.265 use; an explicit value is taken as given,
+    /// since a caller naming a number for a codec means that codec's number.
+    pub fn resolved_intra_refresh_qp_delta(&self) -> i32 {
+        match self.intra_refresh_qp_delta {
+            Some(delta) => delta,
+            None if self.codec == Codec::AV1 => DEFAULT_INTRA_REFRESH_QP_DELTA * AV1_Q_INDEX_SCALE,
+            None => DEFAULT_INTRA_REFRESH_QP_DELTA,
+        }
+    }
+
+    /// Set the QP adjustment applied inside the intra refresh band; see the
+    /// field. Clamped to what the device allows.
+    pub fn with_intra_refresh_qp_delta(mut self, delta: Option<i32>) -> Self {
+        self.intra_refresh_qp_delta = delta;
+        self
     }
 
     /// Replace periodic key frames with an intra refresh cycle, or `None` to

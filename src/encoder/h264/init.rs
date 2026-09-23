@@ -78,16 +78,28 @@ impl H264 {
         // wanted for the log either way, and a driver that does not know the
         // struct leaves it at its defaults rather than failing.
         let mut intra_refresh_caps = vk::VideoEncodeIntraRefreshCapabilitiesKHR::default();
+        // Chained on the same terms as intra refresh: a driver that does not
+        // know these leaves them at their defaults, and a zero delta range
+        // reads correctly as "no delta map here".
+        let mut qp_map_caps = vk::VideoEncodeQuantizationMapCapabilitiesKHR::default();
+        let mut qp_map_codec_caps = vk::VideoEncodeH264QuantizationMapCapabilitiesKHR::default();
         let mut capabilities = vk::VideoCapabilitiesKHR::default()
             .push(&mut encode_caps)
             .push(&mut h264_caps)
-            .push(&mut intra_refresh_caps);
+            .push(&mut intra_refresh_caps)
+            .push(&mut qp_map_caps)
+            .push(&mut qp_map_codec_caps);
         let mut rgb_caps = vk::VideoEncodeRgbConversionCapabilitiesVALVE::default();
         if config.rgb_input.is_some() {
             capabilities = capabilities.push(&mut rgb_caps);
         }
         let caps = query_video_caps(&context, &profile_info, &mut capabilities)?;
         let rgb_caps = config.rgb_input.map(|_| RgbConversionCaps::from(&rgb_caps));
+        let qp_map_plan = crate::encoder::codec::QpMapCaps {
+            min_delta: qp_map_codec_caps.min_qp_delta,
+            max_delta: qp_map_codec_caps.max_qp_delta,
+            max_extent: qp_map_caps.max_quantization_map_extent,
+        };
         let intra_refresh_plan = crate::encoder::codec::IntraRefreshCaps {
             modes: intra_refresh_caps.intra_refresh_modes,
             max_cycle_duration: intra_refresh_caps.max_intra_refresh_cycle_duration,
@@ -120,6 +132,7 @@ impl H264 {
             allow_layered_dpb: true,
             rgb_caps,
             intra_refresh_caps: intra_refresh_plan,
+            qp_map_caps: qp_map_plan,
         })?;
         let active_reference_count = init.active_reference_count;
         let common = init.common;
