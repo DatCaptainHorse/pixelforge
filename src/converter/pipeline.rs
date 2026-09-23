@@ -140,6 +140,7 @@ pub fn create_converter(
 
     let push_descriptor =
         ash::khr::push_descriptor::Device::load(context.instance(), context.device());
+    let timeline = crate::video::TimelineChain::new(&context)?;
 
     // Create command pool for compute queue.
     let pool_info = vk::CommandPoolCreateInfo::default()
@@ -177,6 +178,8 @@ pub fn create_converter(
         command_pool,
         command_buffer,
         fence,
+        in_flight: false,
+        timeline,
         push_descriptor,
     })
 }

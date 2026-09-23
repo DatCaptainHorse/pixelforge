@@ -1,5 +1,6 @@
 use crate::encoder::{BitDepth, PixelFormat};
 use crate::error::{PixelForgeError, Result};
+use crate::sync::TimelinePoint;
 use crate::vulkan::VideoContext;
 use ash::vk::TaggedStructure;
 use ash::vk::{self, Handle};
@@ -390,7 +391,7 @@ pub(crate) fn clear_input_image(context: &VideoContext, params: &ClearImageParam
 }
 
 /// Parameters for uploading an image to the encoder's input image.
-pub(crate) struct UploadParams {
+pub(crate) struct UploadParams<'a> {
     /// The command buffer to use for the upload.
     pub upload_command_buffer: vk::CommandBuffer,
     /// The fence to use for synchronization.
@@ -409,6 +410,8 @@ pub(crate) struct UploadParams {
     pub input_image_layout: vk::ImageLayout,
     /// The queue to submit transfer operations to.
     pub upload_queue: vk::Queue,
+    /// Caller work the copy must wait for.
+    pub waits: &'a [TimelinePoint],
 }
 
 /// Upload an image to the encoder's input image via GPU-to-GPU copy.
@@ -425,7 +428,7 @@ pub(crate) struct UploadParams {
 /// Returns Ok(()) on success, or an error if any Vulkan operation fails.
 pub(crate) fn upload_image_to_input(
     context: &crate::vulkan::VideoContext,
-    params: &UploadParams,
+    params: &UploadParams<'_>,
 ) -> Result<()> {
     let device = context.device();
 
@@ -601,11 +604,20 @@ pub(crate) fn upload_image_to_input(
     unsafe { device.end_command_buffer(params.upload_command_buffer) }
         .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
 
-    let submit_info = vk::SubmitInfo::default()
-        .command_buffers(std::slice::from_ref(&params.upload_command_buffer));
+    let command_buffers =
+        [vk::CommandBufferSubmitInfo::default().command_buffer(params.upload_command_buffer)];
+    let waits: Vec<vk::SemaphoreSubmitInfo> =
+        params.waits.iter().map(TimelinePoint::wait_info).collect();
+    let submit_info = vk::SubmitInfo2::default()
+        .wait_semaphore_infos(&waits)
+        .command_buffer_infos(&command_buffers);
 
-    unsafe { device.queue_submit(params.upload_queue, &[submit_info], params.upload_fence) }
-        .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
+    unsafe {
+        context
+            .sync2()
+            .queue_submit2(params.upload_queue, &[submit_info], params.upload_fence)
+    }
+    .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
 
     unsafe { device.wait_for_fences(&[params.upload_fence], true, u64::MAX) }
         .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
@@ -810,21 +822,12 @@ pub(crate) unsafe fn submit_encode_only(
     command_buffer: vk::CommandBuffer,
     fence: vk::Fence,
     encode_queue: vk::Queue,
-    wait_timeline: Option<(vk::Semaphore, u64)>,
+    wait_infos: &[vk::SemaphoreSubmitInfo<'_>],
     signal_timeline: Option<(vk::Semaphore, u64)>,
 ) -> Result<()> {
     let command_buffer_info = vk::CommandBufferSubmitInfo::default().command_buffer(command_buffer);
     let command_buffer_infos = [command_buffer_info];
 
-    let wait_infos: Vec<vk::SemaphoreSubmitInfo> = wait_timeline
-        .into_iter()
-        .map(|(semaphore, value)| {
-            vk::SemaphoreSubmitInfo::default()
-                .semaphore(semaphore)
-                .value(value)
-                .stage_mask(vk::PipelineStageFlags2::VIDEO_ENCODE_KHR)
-        })
-        .collect();
     let signal_infos: Vec<vk::SemaphoreSubmitInfo> = signal_timeline
         .into_iter()
         .map(|(semaphore, value)| {
@@ -836,7 +839,7 @@ pub(crate) unsafe fn submit_encode_only(
         .collect();
 
     let submit_info = vk::SubmitInfo2::default()
-        .wait_semaphore_infos(&wait_infos)
+        .wait_semaphore_infos(wait_infos)
         .command_buffer_infos(&command_buffer_infos)
         .signal_semaphore_infos(&signal_infos);
 

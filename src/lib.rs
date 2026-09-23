@@ -307,6 +307,7 @@ pub mod decoder;
 pub mod encoder;
 pub mod error;
 pub mod image;
+pub mod sync;
 pub(crate) mod video;
 pub mod vulkan;
 
@@ -332,6 +333,7 @@ pub use encoder::{
 };
 pub use error::PixelForgeError;
 pub use image::InputImage;
+pub use sync::TimelinePoint;
 pub use vulkan::VideoContextBuilder;
 
 /// Re-export VideoContext for convenience.

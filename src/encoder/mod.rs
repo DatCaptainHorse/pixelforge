@@ -42,6 +42,7 @@ pub const DEFAULT_H265_QP: u32 = 28;
 pub const DEFAULT_MAX_REFERENCE_FRAMES: u32 = 4;
 
 use crate::error::Result;
+use crate::sync::TimelinePoint;
 use crate::vulkan::VideoContext;
 
 /// Video codec types.
@@ -571,7 +572,11 @@ pub struct EncodedPacket {
 /// behind a single boxed pointer instead of an enum that re-dispatches by hand.
 trait EncoderApi: Send {
     fn input_image(&self) -> vk::Image;
-    fn encode(&mut self, src_image: vk::Image) -> Result<EncodeFuture>;
+    fn encode_after(
+        &mut self,
+        src_image: vk::Image,
+        wait: &[TimelinePoint],
+    ) -> Result<EncodeFuture>;
     fn flush(&mut self) -> Result<()>;
     fn request_idr(&mut self);
     fn invalidate_reference_frames(&mut self, first_lost_display_order: u64);
@@ -582,8 +587,12 @@ impl<C: codec::VideoCodec> EncoderApi for codec::CodecEncoder<C> {
     fn input_image(&self) -> vk::Image {
         codec::CodecEncoder::input_image(self)
     }
-    fn encode(&mut self, src_image: vk::Image) -> Result<EncodeFuture> {
-        codec::CodecEncoder::encode(self, src_image)
+    fn encode_after(
+        &mut self,
+        src_image: vk::Image,
+        wait: &[TimelinePoint],
+    ) -> Result<EncodeFuture> {
+        codec::CodecEncoder::encode_after(self, src_image, wait)
     }
     fn flush(&mut self) -> Result<()> {
         codec::CodecEncoder::flush(self)
@@ -663,7 +672,22 @@ impl Encoder {
     /// # }
     /// ```
     pub fn encode(&mut self, src_image: vk::Image) -> Result<EncodeFuture> {
-        self.0.encode(src_image)
+        self.0.encode_after(src_image, &[])
+    }
+
+    /// Encode a frame once GPU work the caller submitted has finished.
+    ///
+    /// Like [`Self::encode`], but the frame's first GPU submission waits for
+    /// every point in `wait` before touching `src_image`. Pass the point
+    /// returned by [`ColorConverter::convert_async`](crate::ColorConverter::convert_async)
+    /// to encode what it converted without waiting for the conversion on the
+    /// CPU, or a point the caller's own rendering signals.
+    pub fn encode_after(
+        &mut self,
+        src_image: vk::Image,
+        wait: &[TimelinePoint],
+    ) -> Result<EncodeFuture> {
+        self.0.encode_after(src_image, wait)
     }
 
     /// Wait for all in-flight frames to finish encoding (end-of-stream barrier).

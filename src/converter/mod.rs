@@ -10,6 +10,8 @@ mod pipeline;
 
 use crate::encoder::ColorDescription;
 use crate::error::{PixelForgeError, Result};
+use crate::sync::TimelinePoint;
+use crate::video::TimelineChain;
 use crate::vulkan::VideoContext;
 use ash::vk;
 use tracing::debug;
@@ -384,6 +386,12 @@ pub struct ColorConverter {
     command_pool: vk::CommandPool,
     command_buffer: vk::CommandBuffer,
     fence: vk::Fence,
+    /// Whether a conversion was submitted and `fence` not yet waited on. The
+    /// command buffer, output buffer and cached source view are all reused
+    /// by the next conversion, so it waits for this one first.
+    in_flight: bool,
+    /// Signalled by each conversion, for [`Self::convert_async`] to hand out.
+    timeline: TimelineChain,
 }
 
 impl ColorConverter {
@@ -757,6 +765,43 @@ impl ColorConverter {
         target_image: vk::Image,
     ) -> Result<()> {
         let start = std::time::Instant::now();
+        self.convert_async(src_image, src_layout, target_image, &[])?;
+        self.wait_idle()?;
+        debug!("ColorConverter::convert() took {:?}", start.elapsed());
+        Ok(())
+    }
+
+    /// Convert like [`Self::convert`], but without waiting on the CPU.
+    ///
+    /// The conversion waits on the GPU for every point in `wait` before
+    /// reading `src_image`, and returns the point it signals when done. Pass
+    /// that to [`Encoder::encode_after`](crate::Encoder::encode_after) to
+    /// encode the result, and wait on it before writing `src_image` again.
+    ///
+    /// On a device shared with the caller, where the caller renders or copies
+    /// into `src_image` itself, this is the whole handover: the caller's
+    /// submission signals a [`TimelinePoint`], the conversion waits on it, the
+    /// encode waits on the conversion. If the caller's queue is in another
+    /// family than [`VideoContext::compute_queue_family`], create `src_image`
+    /// with `VK_SHARING_MODE_CONCURRENT` across both, and pass the layout it
+    /// is actually in as `src_layout`: `UNDEFINED` is taken to mean a
+    /// first-time external-memory import and acquires ownership from
+    /// `VK_QUEUE_FAMILY_EXTERNAL`, which an image that never left the device
+    /// does not have to give.
+    ///
+    /// The next call to either method waits for this conversion to finish
+    /// before recording, since both reuse the same command buffer.
+    pub fn convert_async(
+        &mut self,
+        src_image: vk::Image,
+        src_layout: vk::ImageLayout,
+        target_image: vk::Image,
+        wait: &[TimelinePoint],
+    ) -> Result<TimelinePoint> {
+        // Before anything is reused, the view below included: switching source
+        // images destroys the cached view, which the previous conversion may
+        // still be reading.
+        self.wait_idle()?;
 
         // Get or create ImageView for the source image (must happen before
         // borrowing device immutably, since this takes &mut self).
@@ -1021,27 +1066,47 @@ impl ColorConverter {
                 .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
         }
 
-        // Submit and wait.
+        let waits: Vec<vk::SemaphoreSubmitInfo> =
+            wait.iter().map(TimelinePoint::wait_info).collect();
+        let (semaphore, value) = self.timeline.pending_signal();
+        let signals = [vk::SemaphoreSubmitInfo::default()
+            .semaphore(semaphore)
+            .value(value)
+            .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)];
+        let command_buffers =
+            [vk::CommandBufferSubmitInfo::default().command_buffer(self.command_buffer)];
+        let submit_info = vk::SubmitInfo2::default()
+            .wait_semaphore_infos(&waits)
+            .command_buffer_infos(&command_buffers)
+            .signal_semaphore_infos(&signals);
+
         unsafe {
             device
                 .reset_fences(&[self.fence])
                 .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
-
-            let command_buffers = [self.command_buffer];
-            let submit_info = vk::SubmitInfo::default().command_buffers(&command_buffers);
-
-            device
-                .queue_submit(self.context.compute_queue(), &[submit_info], self.fence)
-                .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
-
-            device
-                .wait_for_fences(&[self.fence], true, u64::MAX)
+            self.context
+                .sync2()
+                .queue_submit2(self.context.compute_queue(), &[submit_info], self.fence)
                 .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
         }
+        self.timeline.commit();
+        self.in_flight = true;
 
-        let elapsed = start.elapsed();
-        debug!("ColorConverter::convert() took {:?}", elapsed);
+        Ok(TimelinePoint::new(semaphore, value))
+    }
 
+    /// Wait on the CPU for the last conversion submitted, if it is still
+    /// running.
+    fn wait_idle(&mut self) -> Result<()> {
+        if self.in_flight {
+            unsafe {
+                self.context
+                    .device()
+                    .wait_for_fences(&[self.fence], true, u64::MAX)
+            }
+            .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
+            self.in_flight = false;
+        }
         Ok(())
     }
 
@@ -1081,8 +1146,11 @@ impl ColorConverter {
 
 impl Drop for ColorConverter {
     fn drop(&mut self) {
+        // Nothing below may be destroyed while a conversion still uses it.
+        let _ = self.wait_idle();
         unsafe {
             let device = self.context.device();
+            self.timeline.destroy(device);
 
             // Destroy cached source image view.
             if let Some((_, view)) = self.cached_src_view.take() {
