@@ -73,9 +73,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let ext_ptrs: Vec<_> = reqs.extensions.iter().map(|e| e.as_ptr()).collect();
 
-    // `reqs.features` says which feature bits to turn on. An application that
-    // already chains `VkPhysicalDeviceVulkan13Features` would set them there;
-    // this one has nothing else, so it uses the individual structs.
+    // `reqs.features` says which feature bits to turn on, and every one it
+    // sets has to be: pixelforge takes what the requirements list as enabled,
+    // since Vulkan cannot be asked afterwards. An application that already
+    // chains `VkPhysicalDeviceVulkan13Features` would set them there; this one
+    // has nothing else, so it uses the individual structs.
     let features = reqs.features;
     let mut sync2 = vk::PhysicalDeviceSynchronization2Features::default()
         .synchronization2(features.synchronization2);
@@ -93,6 +95,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .push(&mut ycbcr);
     if features.ycbcr_2plane_444_formats {
         device_info = device_info.push(&mut ycbcr_444);
+    }
+    let mut av1 = vk::PhysicalDeviceVideoEncodeAV1FeaturesKHR::default().video_encode_av1(true);
+    if features.video_encode_av1 {
+        device_info = device_info.push(&mut av1);
+    }
+    let mut rgb = vk::PhysicalDeviceVideoEncodeRgbConversionFeaturesVALVE::default()
+        .video_encode_rgb_conversion(true);
+    if features.video_encode_rgb_conversion {
+        device_info = device_info.push(&mut rgb);
     }
     let device = unsafe { instance.create_device(physical_device, &device_info, None)? };
 
