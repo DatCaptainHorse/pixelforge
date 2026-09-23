@@ -26,6 +26,7 @@ const HEIGHT: u32 = 240;
 const FRAMES: u32 = 8;
 
 fn context(codec: Codec) -> Result<VideoContext, Box<dyn std::error::Error>> {
+    common::init_logging();
     let mut builder = VideoContextBuilder::new()
         .enable_validation(std::env::var("PIXELFORGE_VALIDATION").is_ok())
         .require_encode(codec);

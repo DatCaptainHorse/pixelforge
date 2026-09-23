@@ -200,6 +200,7 @@ fn encoders(
 }
 
 fn context() -> Result<VideoContext, Box<dyn std::error::Error>> {
+    common::init_logging();
     Ok(VideoContextBuilder::new()
         .app_name("pixelforge-color-conversion")
         .require_encode(Codec::H264)

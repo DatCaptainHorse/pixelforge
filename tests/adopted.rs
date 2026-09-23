@@ -175,6 +175,7 @@ fn same_gpu(instance: &ash::Instance, own: &VideoContext) -> vk::PhysicalDevice 
 #[test]
 #[ignore = "requires a Vulkan Video device"]
 fn decode_on_a_vulkan_1_1_device() -> Result<(), Box<dyn std::error::Error>> {
+    common::init_logging();
     let stream = std::fs::read("tests/data/bframes.264")?;
 
     let own = VideoContextBuilder::new()
@@ -352,6 +353,7 @@ fn luma_psnr(a: &[u8], b: &[u8]) -> f64 {
 #[test]
 #[ignore = "requires a Vulkan Video device"]
 fn encode_on_a_vulkan_1_1_device() -> Result<(), Box<dyn std::error::Error>> {
+    common::init_logging();
     let own = VideoContextBuilder::new()
         .enable_validation(validation_requested())
         .require_encode(Codec::H264)
