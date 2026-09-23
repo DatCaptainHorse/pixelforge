@@ -22,6 +22,9 @@
 //! `ANV_DEBUG=video-encode,video-decode` is set, and the test will skip rather
 //! than fail without it.
 
+#[allow(dead_code)]
+mod common;
+
 use pixelforge::{
     Codec, EncodeBitDepth, EncodeConfig, Encoder, InputImage, PixelFormat, RateControlMode,
     VideoContextBuilder,
@@ -71,6 +74,7 @@ fn retuning_bitrate_takes_effect_without_a_keyframe() -> Result<(), Box<dyn std:
         return Ok(());
     };
 
+    common::init_logging();
     let context = VideoContextBuilder::new()
         .app_name("Live Rate Control")
         .enable_validation(cfg!(debug_assertions))
@@ -252,6 +256,7 @@ fn turning_off_periodic_keyframes_takes_effect() -> Result<(), Box<dyn std::erro
         println!("skipped: no raw clip at {DEFAULT_CLIP} (set PIXELFORGE_TEST_CLIP)");
         return Ok(());
     };
+    common::init_logging();
     let context = VideoContextBuilder::new()
         .app_name("Live GOP")
         .enable_validation(cfg!(debug_assertions))
