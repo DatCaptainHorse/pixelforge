@@ -15,6 +15,8 @@ pub(crate) struct BitReader<'a> {
     bit_pos: u32,
     /// Number of consecutive zero bytes seen (for emulation prevention).
     zero_run: u32,
+    /// Bits handed out so far, not counting emulation-prevention bytes.
+    consumed: u64,
 }
 
 impl<'a> BitReader<'a> {
@@ -24,7 +26,23 @@ impl<'a> BitReader<'a> {
             byte_pos: 0,
             bit_pos: 0,
             zero_run: 0,
+            consumed: 0,
         }
+    }
+
+    /// Bits read so far, as the syntax counts them: emulation-prevention bytes
+    /// are not part of it.
+    pub fn position(&self) -> u64 {
+        self.consumed
+    }
+
+    /// Skip `n` bits.
+    pub fn skip(&mut self, mut n: u32) -> Result<()> {
+        while n > 0 {
+            self.bit()?;
+            n -= 1;
+        }
+        Ok(())
     }
 
     /// Read a single bit.
@@ -53,6 +71,7 @@ impl<'a> BitReader<'a> {
         let byte = self.data[self.byte_pos];
         let bit = (byte >> (7 - self.bit_pos)) & 1;
         self.bit_pos += 1;
+        self.consumed += 1;
         if self.bit_pos == 8 {
             self.bit_pos = 0;
             self.byte_pos += 1;

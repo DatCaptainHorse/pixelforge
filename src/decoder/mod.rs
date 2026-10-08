@@ -46,6 +46,8 @@ pub(crate) mod common;
 pub(crate) mod frames;
 /// H.264 decoding.
 pub mod h264;
+/// H.265 decoding.
+pub(crate) mod h265;
 pub(crate) mod pipeline;
 /// Readback and copies, all of which run on the transfer queue.
 pub(crate) mod transfer;
@@ -116,8 +118,17 @@ pub struct DecodeConfig {
 impl DecodeConfig {
     /// Create an H.264 decode configuration.
     pub fn h264() -> Self {
+        Self::new(Codec::H264)
+    }
+
+    /// Create an H.265 decode configuration.
+    pub fn h265() -> Self {
+        Self::new(Codec::H265)
+    }
+
+    fn new(codec: Codec) -> Self {
         Self {
-            codec: Codec::H264,
+            codec,
             output_depth: DEFAULT_OUTPUT_DEPTH,
             consumer_queue_family: None,
             framing: Framing::FrameAligned,
@@ -401,6 +412,7 @@ impl Decoder {
         }
         let mut inner: Box<dyn DecoderApi> = match config.codec {
             Codec::H264 => Box::new(h264::H264Decoder::create(context, &config)?),
+            Codec::H265 => Box::new(h265::H265Decoder::create(context, &config)?),
             other => {
                 return Err(PixelForgeError::CodecNotSupported(format!(
                     "{:?} decoding is not implemented yet",

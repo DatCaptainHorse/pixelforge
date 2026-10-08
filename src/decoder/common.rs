@@ -747,6 +747,26 @@ impl DecoderCommon {
         Ok(())
     }
 
+    /// Swap the active session's parameters for new ones, keeping the session
+    /// and its images. For a change that does not alter what the session was
+    /// built for, such as a new PPS.
+    pub fn replace_session_params(
+        &mut self,
+        make_params: impl FnOnce(&Self, vk::VideoSessionKHR) -> Result<vk::VideoSessionParametersKHR>,
+    ) -> Result<()> {
+        // Pictures in flight were recorded against the old parameters.
+        self.pipeline.wait_all_free();
+        let session = self.session()?.session;
+        let new_params = make_params(self, session)?;
+        let session = self.session.as_mut().expect("checked above");
+        let old = std::mem::replace(&mut session.session_params, new_params);
+        unsafe {
+            self.video_queue_fn
+                .destroy_video_session_parameters(old, None);
+        }
+        Ok(())
+    }
+
     pub fn destroy_session(&mut self) {
         // Let every in-flight decode finish and its future resolve before the
         // session, DPB images and slots they refer to stop existing.

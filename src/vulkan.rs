@@ -548,6 +548,15 @@ fn supports_rgb_conversion(instance: &ash::Instance, physical_device: vk::Physic
     features.video_encode_rgb_conversion != 0
 }
 
+/// The device extension that provides decoding of `codec`.
+fn decode_extension_name(codec: Codec) -> &'static std::ffi::CStr {
+    match codec {
+        Codec::H264 => ash::khr::video_decode_h264::NAME,
+        Codec::H265 => ash::khr::video_decode_h265::NAME,
+        Codec::AV1 => ash::khr::video_decode_av1::NAME,
+    }
+}
+
 fn decode_extension_names(decode_codecs: &[Codec]) -> Vec<&'static std::ffi::CStr> {
     // Synchronization2 and timeline semaphores are core in 1.3 and 1.2, but
     // are listed anyway: enabling a promoted extension is harmless, and on a
@@ -562,6 +571,12 @@ fn decode_extension_names(decode_codecs: &[Codec]) -> Vec<&'static std::ffi::CSt
     if decode_codecs.contains(&Codec::H264) {
         names.push(ash::khr::video_decode_h264::NAME);
     }
+    if decode_codecs.contains(&Codec::H265) {
+        names.push(ash::khr::video_decode_h265::NAME);
+    }
+    if decode_codecs.contains(&Codec::AV1) {
+        names.push(ash::khr::video_decode_av1::NAME);
+    }
     names
 }
 
@@ -571,11 +586,12 @@ fn query_decode_codecs(
     instance: &ash::Instance,
     physical_device: vk::PhysicalDevice,
 ) -> Vec<Codec> {
-    let mut codecs = Vec::new();
-    if VideoContext::check_h264_decode_support(entry, instance, physical_device) {
-        codecs.push(Codec::H264);
-    }
-    codecs
+    [Codec::H264, Codec::H265]
+        .into_iter()
+        .filter(|&codec| {
+            VideoContext::check_decode_support(entry, instance, physical_device, codec)
+        })
+        .collect()
 }
 
 /// Inner struct holding the actual Vulkan resources.
@@ -1004,11 +1020,13 @@ impl VideoContext {
                     })
                 };
 
-                if has_extension(ash::khr::video_decode_h264::NAME)
-                    && Self::check_h264_decode_support(&entry, &instance, physical_device)
-                {
-                    decode_codecs.push(Codec::H264);
-                    debug!("Device {} supports H.264 decode", device_name);
+                for codec in [Codec::H264, Codec::H265] {
+                    if has_extension(decode_extension_name(codec))
+                        && Self::check_decode_support(&entry, &instance, physical_device, codec)
+                    {
+                        decode_codecs.push(codec);
+                        debug!("Device {} supports {:?} decode", device_name, codec);
+                    }
                 }
             }
 
@@ -1147,8 +1165,8 @@ impl VideoContext {
         if video_decode_queue_family.is_some() && !supported_decode_codecs.is_empty() {
             push_ext(ash::khr::video_decode_queue::NAME.as_ptr());
 
-            if supported_decode_codecs.contains(&Codec::H264) {
-                push_ext(ash::khr::video_decode_h264::NAME.as_ptr());
+            for &codec in &supported_decode_codecs {
+                push_ext(decode_extension_name(codec).as_ptr());
             }
         }
 
@@ -1637,33 +1655,67 @@ impl VideoContext {
         }
     }
 
-    /// Check if a codec is supported for encoding.
-    fn check_h264_decode_support(
+    /// Whether `physical_device` can decode `codec`, judged by querying the
+    /// capabilities of a representative profile: 8-bit 4:2:0, the most widely
+    /// supported one. Says nothing about higher profiles; those are checked
+    /// against the stream's own profile when a decoder meets it.
+    fn check_decode_support(
         entry: &ash::Entry,
         instance: &ash::Instance,
         physical_device: vk::PhysicalDevice,
+        codec: Codec,
     ) -> bool {
+        let name = decode_extension_name(codec);
+        let has_extension =
+            unsafe { instance.enumerate_device_extension_properties(physical_device) }
+                .unwrap_or_default()
+                .iter()
+                .any(
+                    |ext| unsafe { std::ffi::CStr::from_ptr(ext.extension_name.as_ptr()) } == name,
+                );
+        if !has_extension {
+            return false;
+        }
+
         let video_queue = ash::khr::video_queue::Instance::load(entry, instance);
 
-        // H.264 decode profile: High profile, progressive, 8-bit 4:2:0.
         let mut h264_profile = vk::VideoDecodeH264ProfileInfoKHR::default()
             .std_profile_idc(
                 ash::vk::native::StdVideoH264ProfileIdc_STD_VIDEO_H264_PROFILE_IDC_HIGH,
             )
             .picture_layout(vk::VideoDecodeH264PictureLayoutFlagsKHR::PROGRESSIVE);
+        let mut h265_profile = vk::VideoDecodeH265ProfileInfoKHR::default().std_profile_idc(
+            ash::vk::native::StdVideoH265ProfileIdc_STD_VIDEO_H265_PROFILE_IDC_MAIN,
+        );
+        let mut av1_profile = vk::VideoDecodeAV1ProfileInfoKHR::default()
+            .std_profile(ash::vk::native::StdVideoAV1Profile_STD_VIDEO_AV1_PROFILE_MAIN);
 
+        let operation = match codec {
+            Codec::H264 => vk::VideoCodecOperationFlagsKHR::DECODE_H264,
+            Codec::H265 => vk::VideoCodecOperationFlagsKHR::DECODE_H265,
+            Codec::AV1 => vk::VideoCodecOperationFlagsKHR::DECODE_AV1,
+        };
         let profile_info = vk::VideoProfileInfoKHR::default()
-            .video_codec_operation(vk::VideoCodecOperationFlagsKHR::DECODE_H264)
+            .video_codec_operation(operation)
             .chroma_subsampling(vk::VideoChromaSubsamplingFlagsKHR::TYPE_420)
             .luma_bit_depth(vk::VideoComponentBitDepthFlagsKHR::TYPE_8)
-            .chroma_bit_depth(vk::VideoComponentBitDepthFlagsKHR::TYPE_8)
-            .push(&mut h264_profile);
+            .chroma_bit_depth(vk::VideoComponentBitDepthFlagsKHR::TYPE_8);
+        let profile_info = match codec {
+            Codec::H264 => profile_info.push(&mut h264_profile),
+            Codec::H265 => profile_info.push(&mut h265_profile),
+            Codec::AV1 => profile_info.push(&mut av1_profile),
+        };
 
         let mut h264_capabilities = vk::VideoDecodeH264CapabilitiesKHR::default();
+        let mut h265_capabilities = vk::VideoDecodeH265CapabilitiesKHR::default();
+        let mut av1_capabilities = vk::VideoDecodeAV1CapabilitiesKHR::default();
         let mut decode_capabilities = vk::VideoDecodeCapabilitiesKHR::default();
-        let mut capabilities = vk::VideoCapabilitiesKHR::default()
-            .push(&mut h264_capabilities)
-            .push(&mut decode_capabilities);
+        let capabilities = vk::VideoCapabilitiesKHR::default().push(&mut decode_capabilities);
+        let mut capabilities = match codec {
+            Codec::H264 => capabilities.push(&mut h264_capabilities),
+            Codec::H265 => capabilities.push(&mut h265_capabilities),
+            Codec::AV1 => capabilities.push(&mut av1_capabilities),
+        };
 
         let result = unsafe {
             (video_queue.fp().get_physical_device_video_capabilities_khr)(
@@ -1676,19 +1728,25 @@ impl VideoContext {
         match result {
             vk::Result::SUCCESS => {
                 debug!(
-                    "H.264 decode supported: max {}x{}, {} DPB slots",
+                    "{:?} decode supported: max {}x{}, {} DPB slots",
+                    codec,
                     capabilities.max_coded_extent.width,
                     capabilities.max_coded_extent.height,
                     capabilities.max_dpb_slots
                 );
                 true
             }
-            vk::Result::ERROR_VIDEO_PROFILE_CODEC_NOT_SUPPORTED_KHR => {
-                debug!("H.264 decode not supported on this device");
+            vk::Result::ERROR_VIDEO_PROFILE_CODEC_NOT_SUPPORTED_KHR
+            | vk::Result::ERROR_VIDEO_PROFILE_OPERATION_NOT_SUPPORTED_KHR
+            | vk::Result::ERROR_VIDEO_PROFILE_FORMAT_NOT_SUPPORTED_KHR => {
+                debug!("{:?} decode not supported on this device", codec);
                 false
             }
             _ => {
-                warn!("Failed to query H.264 decode capabilities: {:?}", result);
+                warn!(
+                    "Failed to query {:?} decode capabilities: {:?}",
+                    codec, result
+                );
                 false
             }
         }
