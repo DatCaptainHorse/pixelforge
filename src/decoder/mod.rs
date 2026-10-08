@@ -38,6 +38,7 @@
 //! stream this crate's encoder produces — and typical output from x264, NVENC
 //! and friends, including B-pyramid — decodes correctly.
 
+pub(crate) mod annexb;
 pub(crate) mod bitreader;
 /// The Vulkan video session and the per-decoder state every codec shares.
 pub(crate) mod common;

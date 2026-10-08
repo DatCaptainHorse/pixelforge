@@ -110,6 +110,72 @@ pub(crate) struct SessionPlan {
     pub dpb_usage: vk::ImageUsageFlags,
 }
 
+/// What the device reports it can decode for one profile.
+///
+/// The codec queries capabilities itself, since the query is chained with a
+/// codec-specific struct, and copies the answers here.
+pub(crate) struct DecodeCaps {
+    pub max_coded_extent: vk::Extent2D,
+    pub picture_access_granularity: vk::Extent2D,
+    pub max_dpb_slots: u32,
+    pub max_active_reference_pictures: u32,
+    pub flags: vk::VideoCapabilityFlagsKHR,
+    pub decode_flags: vk::VideoDecodeCapabilityFlagsKHR,
+    pub std_header_version: vk::ExtensionProperties,
+    pub min_bitstream_buffer_offset_alignment: u64,
+    pub min_bitstream_buffer_size_alignment: u64,
+}
+
+impl DecodeCaps {
+    /// Read the common capabilities. `decode_flags` is left empty: it lives in
+    /// the chained [`vk::VideoDecodeCapabilitiesKHR`], which the caller reads
+    /// once the chain is no longer borrowed and stores with
+    /// [`Self::with_decode_flags`].
+    pub fn new(caps: &vk::VideoCapabilitiesKHR) -> Self {
+        Self {
+            max_coded_extent: caps.max_coded_extent,
+            picture_access_granularity: caps.picture_access_granularity,
+            max_dpb_slots: caps.max_dpb_slots,
+            max_active_reference_pictures: caps.max_active_reference_pictures,
+            flags: caps.flags,
+            decode_flags: vk::VideoDecodeCapabilityFlagsKHR::empty(),
+            std_header_version: caps.std_header_version,
+            min_bitstream_buffer_offset_alignment: caps.min_bitstream_buffer_offset_alignment,
+            min_bitstream_buffer_size_alignment: caps.min_bitstream_buffer_size_alignment,
+        }
+    }
+}
+
+impl DecodeCaps {
+    pub fn with_decode_flags(mut self, flags: vk::VideoDecodeCapabilityFlagsKHR) -> Self {
+        self.decode_flags = flags;
+        self
+    }
+}
+
+/// What a stream needs of the session, in the codec's own terms.
+pub(crate) struct StreamNeeds<'a> {
+    /// Codec name for messages, such as `H.264`.
+    pub codec: &'static str,
+    pub profile_info: &'a vk::VideoProfileInfoKHR<'a>,
+    pub pixel_format: PixelFormat,
+    pub bit_depth: BitDepth,
+    /// Coded dimensions, before alignment to the device's granularity.
+    pub width: u32,
+    pub height: u32,
+    /// How many pictures the stream keeps as references at once, which is what
+    /// the DPB must hold besides the picture being decoded.
+    pub references: u32,
+    /// How many of them a single picture may predict from at once.
+    pub active_references: u32,
+    /// The most DPB slots the codec itself can address.
+    pub slot_cap: u32,
+    /// How many pictures may wait for their turn in display order.
+    pub reorder_depth: usize,
+    /// How many decoded frames the caller may hold, from the configuration.
+    pub output_depth: usize,
+}
+
 /// One DPB image and everything that lives and dies with it.
 ///
 /// Held behind an `Arc` shared with every frame decoded into it, so a session
@@ -373,6 +439,184 @@ impl DecoderCommon {
         self.session
             .as_ref()
             .ok_or_else(|| PixelForgeError::InvalidInput("decode: no active session".to_string()))
+    }
+
+    /// Decide the shape of a session from what the stream needs and what the
+    /// device offers: picture format, DPB size, how many slots are spare for
+    /// pinning, and whether pictures can be handed out in place.
+    ///
+    /// Also records the device's bitstream buffer alignment, which staging
+    /// needs from here on.
+    pub fn plan_session(&mut self, caps: &DecodeCaps, needs: &StreamNeeds) -> Result<SessionPlan> {
+        use crate::video::{align_up, get_video_format, query_supported_video_formats};
+        use tracing::debug;
+
+        let codec = needs.codec;
+        let coded_width = align_up(needs.width, caps.picture_access_granularity.width.max(1));
+        let coded_height = align_up(needs.height, caps.picture_access_granularity.height.max(1));
+        if coded_width > caps.max_coded_extent.width || coded_height > caps.max_coded_extent.height
+        {
+            return Err(PixelForgeError::InvalidInput(format!(
+                "{codec} decode: stream is {}x{}, device maximum is {}x{}",
+                coded_width,
+                coded_height,
+                caps.max_coded_extent.width,
+                caps.max_coded_extent.height
+            )));
+        }
+
+        self.bitstream_offset_alignment = caps.min_bitstream_buffer_offset_alignment.max(1);
+        self.bitstream_size_alignment = caps.min_bitstream_buffer_size_alignment.max(1);
+
+        let coincide = caps
+            .decode_flags
+            .contains(vk::VideoDecodeCapabilityFlagsKHR::DPB_AND_OUTPUT_COINCIDE);
+        debug!("{codec} decode capability flags: {:?}", caps.decode_flags);
+        let use_layered_dpb = !caps
+            .flags
+            .contains(vk::VideoCapabilityFlagsKHR::SEPARATE_REFERENCE_IMAGES);
+
+        // The stream needs its references plus the current picture. On top of
+        // that come the spare slots, which is what lets a picture stay pinned
+        // in place past the decode that produced it instead of being copied
+        // out: `reorder_depth` of them for pictures waiting their turn in
+        // display order, and `output_depth` for frames the caller is holding.
+        // The device caps bound the total.
+        let required = (needs.references + 1).max(2);
+        let slot_limit = caps.max_dpb_slots.min(needs.slot_cap);
+        if required > slot_limit {
+            return Err(PixelForgeError::InvalidInput(format!(
+                "{codec} decode: stream needs {} DPB slots, device supports {}",
+                required, caps.max_dpb_slots
+            )));
+        }
+        // Spare slots only buy something when pictures can be pinned. Without
+        // that they are handed out as copies, which needs no DPB slot at all,
+        // so asking for spares would just reserve memory nothing uses.
+        let pinnable = coincide && self.context.has_unified_image_layouts();
+        let wanted_spare = if pinnable {
+            needs.reorder_depth + needs.output_depth
+        } else {
+            0
+        };
+        let slot_count = (required + wanted_spare as u32).min(slot_limit) as usize;
+        let spare_slots = slot_count - required as usize;
+        if spare_slots < wanted_spare {
+            debug!(
+                "{codec} decode: {} of {} spare DPB slots available \
+                 (reorder depth {} plus {} output slots; the stream's references \
+                 need {} of the device's {}); pictures beyond that are copied",
+                spare_slots,
+                wanted_spare,
+                needs.reorder_depth,
+                needs.output_depth,
+                required,
+                caps.max_dpb_slots
+            );
+        }
+
+        // Only the reference pictures are ever active at once: the current
+        // picture and the output reservation are not references.
+        let max_active_references = needs
+            .active_references
+            .min(required - 1)
+            .min(caps.max_active_reference_pictures);
+        if max_active_references < needs.active_references.min(required - 1) {
+            return Err(PixelForgeError::InvalidInput(format!(
+                "{codec} decode: stream needs {} active reference pictures, device supports {}",
+                needs.active_references.min(required - 1),
+                caps.max_active_reference_pictures
+            )));
+        }
+
+        // Pick a picture format the device actually supports for decode.
+        //
+        // Ask for SAMPLED as well: a coincident DPB image is what the caller
+        // receives, and SAMPLED is what lets them read it in a shader instead
+        // of copying it out first. Fall back to the plain usage if the device
+        // reports no sampleable format, which costs the caller a copy but keeps
+        // decoding working. With a distinct output image nothing asks, since
+        // those pictures reach the caller as pool copies, which are sampleable
+        // whatever the device says about video images.
+        let base_usage = if coincide {
+            vk::ImageUsageFlags::VIDEO_DECODE_DPB_KHR
+                | vk::ImageUsageFlags::VIDEO_DECODE_DST_KHR
+                | vk::ImageUsageFlags::TRANSFER_SRC
+        } else {
+            vk::ImageUsageFlags::VIDEO_DECODE_DPB_KHR
+        };
+        let sampled_usage = base_usage | vk::ImageUsageFlags::SAMPLED;
+        let sampled_formats = if coincide {
+            query_supported_video_formats(&self.context, needs.profile_info, sampled_usage)
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let (dpb_usage, sampleable, supported) = if sampled_formats.is_empty() {
+            let formats =
+                query_supported_video_formats(&self.context, needs.profile_info, base_usage)?;
+            (base_usage, false, formats)
+        } else {
+            (sampled_usage, true, sampled_formats)
+        };
+        let preferred = get_video_format(needs.pixel_format, needs.bit_depth);
+        let chosen = supported
+            .iter()
+            .find(|f| f.format == preferred)
+            .or_else(|| supported.first())
+            .copied()
+            .ok_or_else(|| {
+                PixelForgeError::CodecNotSupported(format!(
+                    "{codec} decode: no supported picture format for this profile"
+                ))
+            })?;
+        let picture_format = chosen.format;
+
+        // MUTABLE_FORMAT lets a consumer view the picture's planes separately,
+        // which is the only way to read a multi-planar image without a
+        // sampler-YCbCr conversion, and the only way at all for a renderer
+        // whose shaders come from a toolchain that cannot express one (naga and
+        // therefore wgpu, among others). It is opportunistic: the driver
+        // enumerates which creation flags it accepts for this profile, format
+        // and usage, and DPB-only images on both RADV and ANV accept none.
+        //
+        // Naming the plane formats keeps a driver from having to assume the
+        // image might be reinterpreted as anything, which is what would
+        // otherwise cost it compression.
+        let plane_views = chosen
+            .create_flags
+            .contains(vk::ImageCreateFlags::MUTABLE_FORMAT);
+        let image_flags = if plane_views {
+            vk::ImageCreateFlags::MUTABLE_FORMAT
+        } else {
+            vk::ImageCreateFlags::empty()
+        };
+        let view_formats: Vec<vk::Format> = if plane_views {
+            let mut list = vec![picture_format];
+            list.extend(crate::video::plane_view_formats(picture_format));
+            list
+        } else {
+            Vec::new()
+        };
+
+        Ok(SessionPlan {
+            coded_width,
+            coded_height,
+            picture_format,
+            bit_depth: needs.bit_depth,
+            pixel_format: needs.pixel_format,
+            slot_count,
+            spare_slots,
+            max_active_references,
+            coincide,
+            pinnable,
+            sampleable,
+            plane_views,
+            image_flags,
+            view_formats,
+            use_layered_dpb,
+            dpb_usage,
+        })
     }
 
     /// Create the session, its DPB images and (when needed) a distinct output

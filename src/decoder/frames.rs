@@ -42,6 +42,10 @@ pub(crate) struct DecodedPicture {
     pub pts: u64,
     pub display_order: i32,
     pub is_keyframe: bool,
+    /// The picture starts a new coded video sequence, where display order
+    /// restarts. Every IDR does; a keyframe that merely lets decoding begin
+    /// there (an H.265 CRA in mid-stream) does not.
+    pub starts_sequence: bool,
 }
 
 /// An image in the frame pool, by index.
@@ -378,7 +382,7 @@ impl ReorderBuffer {
         let mut out = Vec::new();
         // Display order restarts at a keyframe, so the previous sequence must be
         // fully drained before this picture, which belongs to the new one.
-        if picture.is_keyframe {
+        if picture.starts_sequence {
             out.extend(self.drain_all());
         }
 
@@ -427,7 +431,13 @@ impl ReorderBuffer {
         // single decode call can emit many. Staying within `spare_slots` is what
         // guarantees the codec always has a slot to decode into, so a caller who
         // holds frames gets copies rather than a decoder that cannot proceed.
-        if session.pinnable && session.slot_pins.count() < session.spare_slots {
+        // A slot is pinned at most once: pins are one bit each, so a second
+        // frame pinning the same slot (AV1 can show a picture twice) would be
+        // released by whichever frame dropped first. That one is copied.
+        if session.pinnable
+            && session.slot_pins.count() < session.spare_slots
+            && !session.slot_pins.is_pinned(picture.slot)
+        {
             session.slot_pins.pin(picture.slot);
             let (entry, _, _) = session.dpb_entry(picture.slot);
             return Ok(Retained::Slot {
