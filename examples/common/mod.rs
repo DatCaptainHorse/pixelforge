@@ -54,6 +54,112 @@ where
     Ok(())
 }
 
+/// What an input file holds, worked out from its extension: `.264`/`.h264`,
+/// `.265`/`.h265`/`.hevc`, `.obu`/`.av1` (a raw OBU stream) or `.ivf` (AV1 in an
+/// IVF container).
+pub struct Input {
+    pub codec: pixelforge::encoder::Codec,
+    ivf: bool,
+}
+
+impl Input {
+    pub fn from_path(path: &str) -> Self {
+        use pixelforge::encoder::Codec;
+        let extension = std::path::Path::new(path)
+            .extension()
+            .and_then(|e| e.to_str());
+        let codec = match extension {
+            Some("265" | "h265" | "hevc") => Codec::H265,
+            Some("obu" | "av1" | "ivf") => Codec::AV1,
+            _ => Codec::H264,
+        };
+        Self {
+            codec,
+            ivf: extension == Some("ivf"),
+        }
+    }
+
+    /// A decode configuration for this input. A raw stream may cut anywhere
+    /// and needs framing; an IVF packet is one whole temporal unit and does
+    /// not.
+    pub fn config(&self) -> pixelforge::decoder::DecodeConfig {
+        use pixelforge::decoder::DecodeConfig;
+        use pixelforge::encoder::Codec;
+        let config = match self.codec {
+            Codec::H264 => DecodeConfig::h264(),
+            Codec::H265 => DecodeConfig::h265(),
+            Codec::AV1 => DecodeConfig::av1(),
+        };
+        if self.ivf {
+            config
+        } else {
+            config.with_byte_stream()
+        }
+    }
+
+    /// Feed `file` to `decoder`, calling `on_frame` for every frame it emits.
+    pub fn decode<F>(
+        &self,
+        decoder: &mut Decoder,
+        file: &[u8],
+        on_frame: F,
+    ) -> Result<(), Box<dyn std::error::Error>>
+    where
+        F: FnMut(DecodedFrame) -> Result<(), Box<dyn std::error::Error>>,
+    {
+        if self.ivf {
+            decode_packets(decoder, &ivf_packets(file)?, on_frame)
+        } else {
+            decode_stream(decoder, file, on_frame)
+        }
+    }
+}
+
+/// The packets of an IVF file: the container libaom and ffmpeg write AV1 in,
+/// one temporal unit to a packet.
+pub fn ivf_packets(file: &[u8]) -> Result<Vec<&[u8]>, Box<dyn std::error::Error>> {
+    if file.len() < 32 || &file[..4] != b"DKIF" {
+        return Err("not an IVF file".into());
+    }
+    let header_len = u16::from_le_bytes([file[6], file[7]]) as usize;
+    let mut packets = Vec::new();
+    let mut pos = header_len;
+    while pos + 12 <= file.len() {
+        let size = u32::from_le_bytes(file[pos..pos + 4].try_into()?) as usize;
+        pos += 12;
+        if pos + size > file.len() {
+            break;
+        }
+        packets.push(&file[pos..pos + size]);
+        pos += size;
+    }
+    Ok(packets)
+}
+
+/// Drive `decoder` over `packets`, each one whole coded frames, calling
+/// `on_frame` for every frame it emits. For a decoder in the default
+/// [`Framing::FrameAligned`](pixelforge::decoder::Framing) mode.
+pub fn decode_packets<F>(
+    decoder: &mut Decoder,
+    packets: &[&[u8]],
+    mut on_frame: F,
+) -> Result<(), Box<dyn std::error::Error>>
+where
+    F: FnMut(DecodedFrame) -> Result<(), Box<dyn std::error::Error>>,
+{
+    for (i, packet) in packets.iter().enumerate() {
+        decoder.decode(packet, i as u64)?;
+        while let FramePoll::Frame(frame) = decoder.try_next_frame()? {
+            on_frame(frame)?;
+        }
+    }
+    decoder.finish()?;
+    while let Some(frame) = pollster::block_on(decoder.next_frame())? {
+        on_frame(frame)?;
+    }
+    Ok(())
+}
+
 /// Write one decoded frame as NV12 to `output`, when an output is set.
 pub fn write_nv12(
     frame: &DecodedFrame,

@@ -27,11 +27,10 @@
 
 #[allow(dead_code)]
 mod common;
-use common::decode_stream;
+use common::Input;
 
 use ash::vk::{self, TaggedStructure as _};
-use pixelforge::decoder::{DecodeConfig, DecodedFrame, Decoder};
-use pixelforge::encoder::Codec;
+use pixelforge::decoder::{DecodedFrame, Decoder};
 use pixelforge::vulkan::{VideoContext, VideoContextBuilder};
 use std::fs::File;
 use std::io::Write;
@@ -43,15 +42,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut args = std::env::args().skip(1);
     let input_path = args.next().unwrap_or_else(|| {
-        eprintln!("usage: sample_planes <input.264> [output.yuv]");
+        eprintln!("usage: sample_planes <input.264|.265|.obu|.ivf> [output.yuv]");
         std::process::exit(1);
     });
     let output_path = args.next();
+    let input = Input::from_path(&input_path);
 
     let validation = std::env::var("PIXELFORGE_VALIDATION").is_ok();
     let context = VideoContextBuilder::new()
         .app_name("pixelforge-planes")
-        .require_decode(Codec::H264)
+        .require_decode(input.codec)
         .enable_validation(validation)
         .build()?;
     println!(
@@ -61,8 +61,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let consumer_family = context.compute_queue_family();
-    let config = DecodeConfig::h264()
-        .with_byte_stream()
+    let config = input
+        .config()
         .with_output_depth(8)
         .with_consumer_queue_family(consumer_family);
 
@@ -73,7 +73,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut count = 0usize;
     let start = std::time::Instant::now();
 
-    decode_stream(&mut decoder, &stream, |frame| {
+    input.decode(&mut decoder, &stream, |frame| {
         if !frame.plane_views {
             return Err(
                 "this device does not allow per-plane views of decoded pictures; \

@@ -290,7 +290,7 @@ fn query_detailed_capabilities(
     Ok(())
 }
 
-/// Report the image creation flags H.264 decode pictures allow.
+/// Report the image creation flags decode pictures allow, for each codec.
 ///
 /// Worth its own section because `imageCreateFlags` varies by *usage*, not just
 /// by format, and the answer a consumer cares about is the one for the usage
@@ -303,21 +303,48 @@ fn query_detailed_capabilities(
 fn print_decode_image_flags(
     context: &pixelforge::VideoContext,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if !context.supports_decode(Codec::H264) {
-        return Ok(());
+    for (codec, name) in [
+        (Codec::H264, "H.264"),
+        (Codec::H265, "H.265"),
+        (Codec::AV1, "AV1"),
+    ] {
+        if context.supports_decode(codec) {
+            print_decode_image_flags_for(context, codec, name)?;
+        }
     }
-    println!("\nH.264 Decode Picture Image Flags");
+    Ok(())
+}
+
+fn print_decode_image_flags_for(
+    context: &pixelforge::VideoContext,
+    codec: Codec,
+    name: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    println!("\n{name} Decode Picture Image Flags");
     println!("---------------------------------");
 
     let mut h264 = vk::VideoDecodeH264ProfileInfoKHR::default()
         .std_profile_idc(ash::vk::native::StdVideoH264ProfileIdc_STD_VIDEO_H264_PROFILE_IDC_HIGH)
         .picture_layout(vk::VideoDecodeH264PictureLayoutFlagsKHR::PROGRESSIVE);
+    let mut h265 = vk::VideoDecodeH265ProfileInfoKHR::default()
+        .std_profile_idc(ash::vk::native::StdVideoH265ProfileIdc_STD_VIDEO_H265_PROFILE_IDC_MAIN);
+    let mut av1 = vk::VideoDecodeAV1ProfileInfoKHR::default()
+        .std_profile(ash::vk::native::StdVideoAV1Profile_STD_VIDEO_AV1_PROFILE_MAIN);
+    let operation = match codec {
+        Codec::H264 => vk::VideoCodecOperationFlagsKHR::DECODE_H264,
+        Codec::H265 => vk::VideoCodecOperationFlagsKHR::DECODE_H265,
+        Codec::AV1 => vk::VideoCodecOperationFlagsKHR::DECODE_AV1,
+    };
     let profile = vk::VideoProfileInfoKHR::default()
-        .video_codec_operation(vk::VideoCodecOperationFlagsKHR::DECODE_H264)
+        .video_codec_operation(operation)
         .chroma_subsampling(vk::VideoChromaSubsamplingFlagsKHR::TYPE_420)
         .luma_bit_depth(vk::VideoComponentBitDepthFlagsKHR::TYPE_8)
-        .chroma_bit_depth(vk::VideoComponentBitDepthFlagsKHR::TYPE_8)
-        .push(&mut h264);
+        .chroma_bit_depth(vk::VideoComponentBitDepthFlagsKHR::TYPE_8);
+    let profile = match codec {
+        Codec::H264 => profile.push(&mut h264),
+        Codec::H265 => profile.push(&mut h265),
+        Codec::AV1 => profile.push(&mut av1),
+    };
 
     let dpb = vk::ImageUsageFlags::VIDEO_DECODE_DPB_KHR;
     let coincide = dpb

@@ -5,7 +5,7 @@
 //! `build_from_existing_decode` so decoded images live on the app's device.
 //!
 //! Usage:
-//!   decode_adopted <input.264> [output.yuv]
+//!   decode_adopted <input.264|.265|.obu|.ivf> [output.yuv]
 //!
 //! Output is NV12 in display order, comparable to:
 //!   ffmpeg -i input.264 -pix_fmt nv12 reference.yuv
@@ -16,17 +16,17 @@ use ash::vk;
 use ash::vk::TaggedStructure;
 #[allow(dead_code)]
 mod common;
-use common::{Readback, decode_stream, write_nv12};
+use common::{Input, Readback, write_nv12};
 
-use pixelforge::decoder::{DecodeConfig, Decoder};
-use pixelforge::encoder::Codec;
+use pixelforge::decoder::Decoder;
 use pixelforge::vulkan::{DeviceQueue, VideoContextBuilder};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
     let input_path = args
         .next()
-        .expect("usage: decode_adopted <input.264> [output.yuv]");
+        .expect("usage: decode_adopted <input.264|.265|.obu|.ivf> [output.yuv]");
+    let input = Input::from_path(&input_path);
     let output_path = args.next();
 
     // --- The application creates its own instance and device ---
@@ -40,7 +40,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Ask pixelforge what a decode device needs, and pick a physical device that
     // satisfies it — exactly the negotiation an app would do.
-    let builder = VideoContextBuilder::new().require_decode(Codec::H264);
+    let builder = VideoContextBuilder::new().require_decode(input.codec);
     let physical_devices = unsafe { instance.enumerate_physical_devices()? };
     let (physical_device, reqs) = physical_devices
         .iter()
@@ -50,7 +50,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .ok()
                 .map(|r| (pd, r))
         })
-        .expect("no physical device can decode H.264");
+        .unwrap_or_else(|| panic!("no physical device can decode {:?}", input.codec));
 
     let name = unsafe {
         std::ffi::CStr::from_ptr(
@@ -140,10 +140,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .is_some()
         .then(|| Readback::new(&context))
         .transpose()?;
-    let mut decoder = Decoder::new(context, DecodeConfig::h264().with_byte_stream())?;
+    let mut decoder = Decoder::new(context, input.config())?;
     let mut count = 0usize;
 
-    decode_stream(&mut decoder, &stream, |frame| {
+    input.decode(&mut decoder, &stream, |frame| {
         write_nv12(&frame, &mut readback, &mut output)?;
         count += 1;
         Ok(())

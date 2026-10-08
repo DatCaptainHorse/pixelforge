@@ -5,12 +5,12 @@
 [![Documentation](https://docs.rs/pixelforge/badge.svg)](https://docs.rs/pixelforge)
 
 A Vulkan-based video encoding and decoding library for Rust, supporting H.264,
-H.265 and AV1 encode, and H.264 decode.
+H.265 and AV1, both encode and decode.
 
 ## Features
 
 - **Hardware-accelerated** video encoding and decoding using Vulkan Video extensions.
-- **Multiple codec support**: H.264/AVC, H.265/HEVC, AV1 encode; H.264 decode.
+- **Multiple codec support**: H.264/AVC, H.265/HEVC and AV1, encode and decode.
 - **Asynchronous pipelines**: both directions submit without waiting.
   Encoding hands back an [`EncodeFuture`]; decoding delivers frames through a
   [`DecodeSource`] as the GPU finishes with them.
@@ -33,11 +33,14 @@ H.265 and AV1 encode, and H.264 decode.
 | Codec | Encode | Decode |
 |-------|--------|--------|
 | H.264/AVC | ✓ | ✓ |
-| H.265/HEVC | ✓ | |
-| AV1 | ✓ | |
+| H.265/HEVC | ✓ | ✓ |
+| AV1 | ✓ | ✓ |
 
 H.264 decoding is verified byte-identical to `ffmpeg -pix_fmt nv12` on AMD
-(RADV), NVIDIA and Intel (ANV).
+(RADV), NVIDIA and Intel (ANV). H.265 and AV1 decoding are verified the same
+way on AMD (RADV) and Intel (ANV), against streams from x265, libaom,
+SVT-AV1 and rav1e. Each codec's limits are listed under
+[`decoder`](crate::decoder#codecs-and-their-limits).
 
 ## Requirements
 
@@ -156,6 +159,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // A file can cut anywhere, so let the decoder frame it. Input that
     // arrives already framed (RTP, a container) skips `with_byte_stream`.
+    // `DecodeConfig::h265()` and `DecodeConfig::av1()` pick the other codecs;
+    // AV1 takes a raw OBU stream (or an IVF file's packets, already framed).
     let config = DecodeConfig::h264().with_byte_stream();
     let mut decoder = Decoder::new(context, config)?;
     let stream: Vec<u8> = std::fs::read("input.264")?;
@@ -304,7 +309,8 @@ Run the examples with:
 # Query codec capabilities
 cargo run --example query_capabilities
 
-# Decode H.264 to raw YUV
+# Decode H.264, H.265 or AV1 to raw YUV, by the input's extension
+# (.264, .265, .obu for a raw OBU stream, .ivf)
 cargo run --example decode -- input.264 output.yuv
 
 # Decode on a caller-created Vulkan device

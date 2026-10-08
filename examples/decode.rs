@@ -1,7 +1,11 @@
-//! Decode an H.264 Annex B stream to raw YUV.
+//! Decode an H.264, H.265 or AV1 stream to raw YUV.
 //!
 //! Usage:
-//!   cargo run --example decode -- input.264 [output.yuv]
+//!   cargo run --example decode -- input.264|input.265|input.obu|input.ivf [output.yuv]
+//!
+//! The codec comes from the extension: `.264`/`.h264` is H.264,
+//! `.265`/`.h265`/`.hevc` is H.265, `.obu`/`.av1` is a raw AV1 OBU stream and
+//! `.ivf` is AV1 in an IVF container.
 //!
 //! Produces the same layout as `ffmpeg -i input.264 -pix_fmt nv12 out.yuv`,
 //! so the output can be compared directly:
@@ -13,10 +17,9 @@ use std::fs::File;
 
 #[allow(dead_code)]
 mod common;
-use common::{Readback, decode_stream, write_nv12};
+use common::{Input, Readback, write_nv12};
 
-use pixelforge::decoder::{DecodeConfig, Decoder};
-use pixelforge::encoder::Codec;
+use pixelforge::decoder::Decoder;
 use pixelforge::vulkan::VideoContextBuilder;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -29,6 +32,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
     let output_path = args.next();
 
+    let input = Input::from_path(&input_path);
+    let codec = input.codec;
+
     // PIXELFORGE_VALIDATION=1 enables the Vulkan validation layers, which
     // report the exact offending call for any API misuse.
     let validation = std::env::var("PIXELFORGE_VALIDATION").is_ok();
@@ -36,7 +42,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // hardware that would otherwise take the zero-copy path.
     let mut builder = VideoContextBuilder::new()
         .app_name("pixelforge-decode")
-        .require_decode(Codec::H264)
+        .require_decode(codec)
         .enable_validation(validation);
     if std::env::var("PIXELFORGE_NO_UNIFIED_LAYOUTS").is_ok() {
         builder = builder.without_unified_image_layouts();
@@ -59,7 +65,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // sized for one frame per call, so raise it: past the budget the decoder
     // copies pictures out instead of handing over its own images, which is
     // still correct but gives up the zero-copy path.
-    let config = DecodeConfig::h264().with_byte_stream().with_output_depth(8);
+    let config = input.config().with_output_depth(8);
     let mut output = output_path.as_ref().map(File::create).transpose()?;
     // Readback lives in the consumer, not in pixelforge: the decoder hands over
     // a GPU image and a renderer would sample it in place. See examples/common.
@@ -82,31 +88,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // A renderer would instead `split()` the decoder and await `next_frame` on
     // its own thread, which is what the `Decoder::split` docs show.
     // `common::decode_stream` owns that loop.
-    decode_stream(&mut decoder, &stream, |frame| {
-        write_nv12(&frame, &mut readback, &mut output)?;
-        // A rebuilt session means a new set of images, so anything caching
-        // per-image state has to notice. Reporting it here is what makes the
-        // field visible in an example rather than only in the docs.
-        if last_generation.is_some_and(|g| g != frame.generation) {
-            println!(
-                "  generation {} -> {} at frame {}: the decoder rebuilt its images",
-                last_generation.unwrap(),
-                frame.generation,
-                frame_count
-            );
-        }
-        last_generation = Some(frame.generation);
-        last_info = Some((
-            frame.width,
-            frame.height,
-            frame.display_order,
-            frame.is_keyframe,
-        ));
-        frame_count += 1;
-        // Dropping the frame here is what hands its DPB slot back. Holding on
-        // to frames is what pushes the decoder onto the copying path.
-        Ok(())
-    })?;
+    let mut on_frame =
+        |frame: pixelforge::decoder::DecodedFrame| -> Result<(), Box<dyn std::error::Error>> {
+            write_nv12(&frame, &mut readback, &mut output)?;
+            // A rebuilt session means a new set of images, so anything caching
+            // per-image state has to notice. Reporting it here is what makes the
+            // field visible in an example rather than only in the docs.
+            if last_generation.is_some_and(|g| g != frame.generation) {
+                println!(
+                    "  generation {} -> {} at frame {}: the decoder rebuilt its images",
+                    last_generation.unwrap(),
+                    frame.generation,
+                    frame_count
+                );
+            }
+            last_generation = Some(frame.generation);
+            last_info = Some((
+                frame.width,
+                frame.height,
+                frame.display_order,
+                frame.is_keyframe,
+            ));
+            frame_count += 1;
+            // Dropping the frame here is what hands its DPB slot back. Holding on
+            // to frames is what pushes the decoder onto the copying path.
+            Ok(())
+        };
+    input.decode(&mut decoder, &stream, &mut on_frame)?;
     let decode_time = start.elapsed();
 
     println!(

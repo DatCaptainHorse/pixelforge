@@ -29,15 +29,42 @@
 //!   image is valid for exactly as long as the frame is; see [`DecodedFrame`]
 //!   for what holding one costs.
 //!
-//! # Limitations (H.264)
+//! # Codecs and their limits
+//!
+//! **H.264**
 //!
 //! - Progressive streams only (no interlaced/field coding).
 //! - Streams using explicit scaling matrices are rejected.
 //!
 //! Reference management is complete (IDR, sliding-window, and MMCO), so any
-//! stream this crate's encoder produces — and typical output from x264, NVENC
-//! and friends, including B-pyramid — decodes correctly.
-
+//! stream this crate's encoder produces, and typical output from x264, NVENC
+//! and friends, including B-pyramid, decodes correctly.
+//!
+//! **H.265**
+//!
+//! - Main, Main 10 and the range extension formats the device supports (4:2:2
+//!   and 4:4:4, at 8 and 10 bits). Screen content coding is rejected.
+//! - Only the base layer is decoded. Scalable and multiview streams decode as
+//!   their base layer.
+//! - Pictures a CRA or BLA leaves undecodable (RASL) are skipped, as the
+//!   standard says, but pictures still waiting for output when a new coded
+//!   video sequence begins are emitted rather than discarded, whatever
+//!   `no_output_of_prior_pics_flag` says: a live decoder dropping frames is
+//!   worse than showing them.
+//!
+//! **AV1**
+//!
+//! - Low-overhead OBU streams (Section 5): raw `.obu` files, IVF payloads,
+//!   MP4 samples with the `av1C` header removed. Annex B is not supported.
+//! - Film grain is not applied; the picture comes out as decoded, without it.
+//! - Spatial scalability and monochrome are rejected, as is 12-bit.
+//! - The device must decode into the DPB image directly
+//!   (`DPB_AND_OUTPUT_COINCIDE`), which every device tested does.
+//! - Frames predicted from a reference of a different size (superres, or the
+//!   encoder's resize mode) decode wrongly on Intel's ANV driver, and correctly
+//!   on AMD's RADV with the same data and clean validation, so it is a gap in
+//!   ANV.
+//!
 pub(crate) mod annexb;
 pub(crate) mod av1;
 pub(crate) mod bitreader;

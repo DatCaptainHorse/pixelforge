@@ -110,6 +110,40 @@ rebuilt, and getting that wrong is silent rather than loud. Build the reference 
 resolution-changing stream to its first size and a whole-stream reference will
 not compare.
 
+H.265 and AV1 decode are checked the same way: byte-identical against ffmpeg's
+software decoder, with validation, on both storage paths. `tests/decode.rs` does
+that for every fixture in `tests/data` (`cargo test --test decode -- --ignored`),
+and `tests/adopted.rs` runs the three codecs on a Vulkan 1.1 device. The
+examples take the codec from the input's extension (`.264`, `.265`, `.obu` for a
+raw AV1 OBU stream, `.ivf`). Make more streams with x265 and libaom, SVT-AV1 or
+`aomenc` (ffmpeg's libaom wrapper hides superres and resize); `aomdec` and
+`dav1d` write AV1 at each frame's own size, which ffmpeg will not.
+
+Three things that look like decoder bugs and are not, or not ours:
+
+- **AV1 CDEF strengths.** The `StdVideo` struct takes the secondary strengths as
+  coded (0 to 3) and the driver widens a 3 to 4 itself. Passing the
+  specification's widened value decodes wrongly, and only for streams whose
+  encoder picks that strength: libaom rarely does, SVT-AV1 often does.
+- **16x16 CTBs** (`x265 --ctu 16`) differ from ffmpeg's software decoder by one
+  or two LSBs in a few chroma samples. ANV, RADV and ffmpeg's own Vulkan
+  decoder all produce the identical difference, so suspect the software
+  reference, not the drivers.
+- **AV1 frames predicted from a reference of another size** (superres, or the
+  encoder's resize mode) decode to garbage on ANV from the first such frame on,
+  with validation clean. RADV decodes the same streams correctly, so it is a gap
+  in ANV.
+
+RADV needs more of H.265 than ANV does. A decode must list every held reference,
+not only those the picture predicts from, or the RASL pictures after a
+mid-stream CRA decode wrongly (ANV forgave it). Verify on both: the zero-copy
+path, and the plane-view example under validation, only run where unified image
+layouts exist.
+
+ffmpeg's `-hwaccel vulkan` is a useful second opinion for H.265 (it decodes
+here) but produces nothing for AV1 on ANV, so there is no hardware reference
+for AV1 on this machine.
+
 Pixelforge can also run on a device the caller created, for decode and for
 encode. `tests/adopted.rs` builds one from a Vulkan 1.1 instance, as an
 application that never asked for 1.3 would, hands pixelforge spare queues, and

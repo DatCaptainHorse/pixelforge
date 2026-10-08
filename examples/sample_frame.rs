@@ -26,13 +26,12 @@ use std::fs::File;
 use std::io::Write;
 
 use ash::vk::{self, TaggedStructure as _};
-use pixelforge::decoder::{DecodeConfig, DecodedFrame, Decoder};
-use pixelforge::encoder::Codec;
+use pixelforge::decoder::{DecodedFrame, Decoder};
 use pixelforge::vulkan::{VideoContext, VideoContextBuilder};
 
 #[allow(dead_code)]
 mod common;
-use common::decode_stream;
+use common::Input;
 
 const SHADER: &[u8] = include_bytes!("shader/sample_frame.spv");
 
@@ -41,15 +40,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut args = std::env::args().skip(1);
     let input_path = args.next().unwrap_or_else(|| {
-        eprintln!("usage: sample_frame <input.264> [output.rgba]");
+        eprintln!("usage: sample_frame <input.264|.265|.obu|.ivf> [output.rgba]");
         std::process::exit(1);
     });
     let output_path = args.next();
+    let input = Input::from_path(&input_path);
 
     let validation = std::env::var("PIXELFORGE_VALIDATION").is_ok();
     let context = VideoContextBuilder::new()
         .app_name("pixelforge-sample")
-        .require_decode(Codec::H264)
+        .require_decode(input.codec)
         .enable_validation(validation)
         .build()?;
 
@@ -63,8 +63,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // picture's sharing set. Without this, sampling a decoded image from a
     // family the decoder did not share with is undefined.
     let consumer_family = context.compute_queue_family();
-    let config = DecodeConfig::h264()
-        .with_byte_stream()
+    let config = input
+        .config()
         .with_output_depth(8)
         .with_consumer_queue_family(consumer_family);
 
@@ -78,7 +78,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut count = 0usize;
     let start = std::time::Instant::now();
 
-    decode_stream(&mut decoder, &stream, |frame| {
+    input.decode(&mut decoder, &stream, |frame| {
         let sampler = match &mut sampler {
             Some(s) => s,
             none => none.insert(Sampler::new(&context, consumer_family, &frame)?),

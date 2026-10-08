@@ -143,13 +143,24 @@ fn spare(app: &AppDevice, family: u32) -> DeviceQueue {
     DeviceQueue::new(family, props[family as usize].queue_count.min(2) - 1)
 }
 
+/// The decode configuration for `codec`'s raw streams.
+fn decode_config(codec: Codec) -> DecodeConfig {
+    match codec {
+        Codec::H264 => DecodeConfig::h264(),
+        Codec::H265 => DecodeConfig::h265(),
+        Codec::AV1 => DecodeConfig::av1(),
+    }
+    .with_byte_stream()
+}
+
 /// Decode `stream` on `context` and read every frame back.
 fn decode_all(
     context: &VideoContext,
+    codec: Codec,
     stream: &[u8],
 ) -> Result<Vec<Vec<u8>>, Box<dyn std::error::Error>> {
     let mut readback = Readback::new(context)?;
-    let mut decoder = Decoder::new(context.clone(), DecodeConfig::h264().with_byte_stream())?;
+    let mut decoder = Decoder::new(context.clone(), decode_config(codec))?;
     let mut frames = Vec::new();
     decode_stream(&mut decoder, stream, |frame| {
         let data = readback.read(&frame)?;
@@ -176,40 +187,56 @@ fn same_gpu(instance: &ash::Instance, own: &VideoContext) -> vk::PhysicalDevice 
 #[ignore = "requires a Vulkan Video device"]
 fn decode_on_a_vulkan_1_1_device() -> Result<(), Box<dyn std::error::Error>> {
     common::init_logging();
-    let stream = std::fs::read("tests/data/bframes.264")?;
+    for (codec, path) in [
+        (Codec::H264, "tests/data/bframes.264"),
+        (Codec::H265, "tests/data/h265_bframes.265"),
+        (Codec::AV1, "tests/data/av1_pyramid.obu"),
+    ] {
+        let stream = std::fs::read(path)?;
 
-    let own = VideoContextBuilder::new()
-        .enable_validation(validation_requested())
-        .require_decode(Codec::H264)
-        .build()?;
-    let expected = decode_all(&own, &stream)?;
+        let own = match VideoContextBuilder::new()
+            .enable_validation(validation_requested())
+            .require_decode(codec)
+            .build()
+        {
+            Ok(own) => own,
+            Err(e) => {
+                eprintln!("skipping {codec:?}: {e}");
+                continue;
+            }
+        };
+        let expected = decode_all(&own, codec, &stream)?;
 
-    let (entry, instance) = instance_1_1()?;
-    let builder = VideoContextBuilder::new().require_decode(Codec::H264);
-    let physical_device = same_gpu(&instance, &own);
-    drop(own);
-    let reqs = builder.decode_device_requirements(&entry, &instance, physical_device)?;
-    let app = create_app_device(entry, instance, physical_device, &reqs)?;
+        let (entry, instance) = instance_1_1()?;
+        let builder = VideoContextBuilder::new().require_decode(codec);
+        let physical_device = same_gpu(&instance, &own);
+        drop(own);
+        let reqs = builder.decode_device_requirements(&entry, &instance, physical_device)?;
+        let app = create_app_device(entry, instance, physical_device, &reqs)?;
 
-    let mut builder = builder
-        .with_decode_queue(spare(&app, reqs.queues.decode.unwrap()))
-        .with_transfer_queue(spare(&app, reqs.queues.transfer))
-        .with_compute_queue(spare(&app, reqs.queues.compute));
-    if reqs.unified_image_layouts {
-        builder = builder.declare_unified_image_layouts();
-    }
-    let context = builder.build_from_existing_decode(
-        app.entry.clone(),
-        app.instance.clone(),
-        app.physical_device,
-        app.device.clone(),
-    )?;
-    let actual = decode_all(&context, &stream)?;
-    drop(context);
+        let mut builder = builder
+            .with_decode_queue(spare(&app, reqs.queues.decode.unwrap()))
+            .with_transfer_queue(spare(&app, reqs.queues.transfer))
+            .with_compute_queue(spare(&app, reqs.queues.compute));
+        if reqs.unified_image_layouts {
+            builder = builder.declare_unified_image_layouts();
+        }
+        let context = builder.build_from_existing_decode(
+            app.entry.clone(),
+            app.instance.clone(),
+            app.physical_device,
+            app.device.clone(),
+        )?;
+        let actual = decode_all(&context, codec, &stream)?;
+        drop(context);
 
-    assert_eq!(actual.len(), expected.len(), "frame count");
-    for (i, (a, e)) in actual.iter().zip(&expected).enumerate() {
-        assert!(a == e, "frame {i} differs from the own-context decode");
+        assert_eq!(actual.len(), expected.len(), "{codec:?}: frame count");
+        for (i, (a, e)) in actual.iter().zip(&expected).enumerate() {
+            assert!(
+                a == e,
+                "{codec:?}: frame {i} differs from the own-context decode"
+            );
+        }
     }
     Ok(())
 }
@@ -389,8 +416,8 @@ fn encode_on_a_vulkan_1_1_device() -> Result<(), Box<dyn std::error::Error>> {
     // below the floor here. The floor is not equality because not every
     // encoder is reproducible: RADV gives bit-identical streams, while ANV has
     // been seen as low as 47 dB between two runs of the same synchronous path.
-    let expected_frames = decode_all(&own, &expected)?;
-    let actual_frames = decode_all(&own, &actual)?;
+    let expected_frames = decode_all(&own, Codec::H264, &expected)?;
+    let actual_frames = decode_all(&own, Codec::H264, &actual)?;
     assert_eq!(actual_frames.len(), ENCODE_FRAMES as usize, "frame count");
     assert_eq!(expected_frames.len(), actual_frames.len(), "frame count");
     let psnrs: Vec<f64> = actual_frames
