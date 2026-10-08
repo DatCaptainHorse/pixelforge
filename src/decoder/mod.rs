@@ -39,6 +39,7 @@
 //! and friends, including B-pyramid — decodes correctly.
 
 pub(crate) mod annexb;
+pub(crate) mod av1;
 pub(crate) mod bitreader;
 /// The Vulkan video session and the per-decoder state every codec shares.
 pub(crate) mod common;
@@ -124,6 +125,11 @@ impl DecodeConfig {
     /// Create an H.265 decode configuration.
     pub fn h265() -> Self {
         Self::new(Codec::H265)
+    }
+
+    /// Create an AV1 decode configuration.
+    pub fn av1() -> Self {
+        Self::new(Codec::AV1)
     }
 
     fn new(codec: Codec) -> Self {
@@ -413,12 +419,7 @@ impl Decoder {
         let mut inner: Box<dyn DecoderApi> = match config.codec {
             Codec::H264 => Box::new(h264::H264Decoder::create(context, &config)?),
             Codec::H265 => Box::new(h265::H265Decoder::create(context, &config)?),
-            other => {
-                return Err(PixelForgeError::CodecNotSupported(format!(
-                    "{:?} decoding is not implemented yet",
-                    other
-                )));
-            }
+            Codec::AV1 => Box::new(av1::Av1Decoder::create(context, &config)?),
         };
         let rx = inner
             .take_frame_receiver()

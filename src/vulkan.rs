@@ -586,7 +586,7 @@ fn query_decode_codecs(
     instance: &ash::Instance,
     physical_device: vk::PhysicalDevice,
 ) -> Vec<Codec> {
-    [Codec::H264, Codec::H265]
+    [Codec::H264, Codec::H265, Codec::AV1]
         .into_iter()
         .filter(|&codec| {
             VideoContext::check_decode_support(entry, instance, physical_device, codec)
@@ -1020,7 +1020,7 @@ impl VideoContext {
                     })
                 };
 
-                for codec in [Codec::H264, Codec::H265] {
+                for codec in [Codec::H264, Codec::H265, Codec::AV1] {
                     if has_extension(decode_extension_name(codec))
                         && Self::check_decode_support(&entry, &instance, physical_device, codec)
                     {

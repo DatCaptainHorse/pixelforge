@@ -841,6 +841,42 @@ impl DecoderCommon {
         Ok((aligned_total as u64, offsets))
     }
 
+    /// Copy `chunks` into the staging buffer back to back, each starting at an
+    /// offset the device accepts, and report the buffer range plus each
+    /// chunk's offset. For codecs whose data goes to the driver as it is, with
+    /// no start codes: AV1's tiles.
+    pub fn stage_chunks(
+        &mut self,
+        chunks: &[&[u8]],
+        profile_info: &vk::VideoProfileInfoKHR,
+    ) -> Result<(u64, Vec<u32>)> {
+        let offset_alignment = self.bitstream_offset_alignment as usize;
+        let mut offsets = Vec::with_capacity(chunks.len());
+        let mut cursor = 0usize;
+        for chunk in chunks {
+            cursor = cursor.next_multiple_of(offset_alignment);
+            offsets.push(cursor as u32);
+            cursor += chunk.len();
+        }
+        let aligned_total = cursor.next_multiple_of(self.bitstream_size_alignment as usize);
+        self.pipeline
+            .ensure_bitstream_capacity(&self.context, aligned_total, profile_info)?;
+        let dst = self.pipeline.current().bitstream_ptr;
+        unsafe {
+            // Zero it all first, so the padding between and after chunks is
+            // never stale bytes from an earlier picture.
+            std::ptr::write_bytes(dst, 0, aligned_total);
+            for (chunk, &offset) in chunks.iter().zip(&offsets) {
+                std::ptr::copy_nonoverlapping(
+                    chunk.as_ptr(),
+                    dst.add(offset as usize),
+                    chunk.len(),
+                );
+            }
+        }
+        Ok((aligned_total as u64, offsets))
+    }
+
     /// Transition the DPB slot this decode writes into, and the output image
     /// (if distinct), into the layouts `vkCmdDecodeVideo` requires.
     pub fn record_barriers(&self, slot: u8) {
