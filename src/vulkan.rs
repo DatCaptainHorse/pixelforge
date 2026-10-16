@@ -256,9 +256,6 @@ impl DecodeQueueFamilies {
     }
 }
 
-/// Select the decode / transfer / compute queue families on `physical_device`,
-/// failing if it cannot decode the required codecs.
-///
 /// The queue family for the colour conversion's compute work, if there is one.
 ///
 /// A family that does not also do graphics is preferred. A driver may back
@@ -275,6 +272,9 @@ fn find_compute_queue_family(queue_families: &[vk::QueueFamilyProperties]) -> Op
         .map(|(idx, _)| idx as u32)
 }
 
+/// Select the decode / transfer / compute queue families on `physical_device`,
+/// failing if it cannot decode the required codecs.
+///
 /// Mirrors the selection [`VideoContext::new`] does inline, but scoped to the
 /// decode path: a video-decode family, a transfer family (preferring a
 /// dedicated engine over one that also does video — see the scoring), and a
