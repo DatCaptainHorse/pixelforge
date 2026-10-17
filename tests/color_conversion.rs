@@ -414,3 +414,58 @@ fn unsupported_conversions_are_refused() -> Result<(), Box<dyn std::error::Error
     }
     Ok(())
 }
+
+/// A source image destroyed and replaced by a new one must be read as the new
+/// one, even when the driver hands the new image the old one's handle.
+///
+/// Drivers do reuse handles, so a converter that remembered anything by image
+/// handle would read the second frame through a view of the first, destroyed
+/// image. The validation layer gives every object a unique handle, which hides
+/// exactly this, so the test means most with validation off.
+#[test]
+#[ignore = "requires a Vulkan Video device"]
+fn a_replaced_source_image_is_read_afresh() -> Result<(), Box<dyn std::error::Error>> {
+    let context = context()?;
+    let (encoder, _) = encoders(&context)?;
+    let first = make_frame_bgra();
+    let second: Vec<u8> = first
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .flat_map(|&[b, g, r, a]| [255 - b, 255 - g, 255 - r, a])
+        .collect();
+
+    let config = ColorConverterConfig::new(
+        WIDTH,
+        HEIGHT,
+        InputFormat::BGRA,
+        OutputFormat::NV12,
+        ColorSpec::Srgb,
+        ColorSpec::Srgb,
+        ColorRange::Limited,
+    );
+    let convert_with = |converter: &mut ColorConverter, pixels: &[u8]| {
+        let src = unsafe { create_src_image(&context, WIDTH, HEIGHT, pixels)? };
+        converter.convert(
+            src.image,
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            encoder.input_image(),
+        )?;
+        let luma = read_luma(&context, converter, OutputFormat::NV12)?;
+        drop(src);
+        Ok::<_, Box<dyn std::error::Error>>(luma)
+    };
+
+    let expected = convert_with(
+        &mut ColorConverter::new(context.clone(), config.clone())?,
+        &second,
+    )?;
+    let mut converter = ColorConverter::new(context.clone(), config)?;
+    convert_with(&mut converter, &first)?;
+    let actual = convert_with(&mut converter, &second)?;
+    assert!(
+        actual == expected,
+        "the second frame came out as something other than the second frame"
+    );
+    Ok(())
+}
