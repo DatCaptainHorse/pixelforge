@@ -11,6 +11,7 @@ pub(crate) mod parser;
 mod parser_tests;
 
 mod dpb;
+mod record;
 mod session;
 
 use crate::decoder::{DecodeStatus, FrameReceiver};

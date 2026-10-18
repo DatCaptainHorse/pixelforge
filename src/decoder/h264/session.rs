@@ -13,6 +13,8 @@ use crate::decoder::h264::dpb::{DecodeDpb, PictureState};
 use crate::decoder::h264::parser::{
     self, NalType, NalUnit, Pps, SliceHeader, SliceType, Sps, iter_nal_units,
 };
+use crate::decoder::h264::record::{DecodeRecord, LinkParams};
+use crate::decoder::pipeline::DECODE_PIPELINE_DEPTH;
 use crate::decoder::{DecodeConfig, DecodeStatus, Framing};
 use crate::encoder::{BitDepth, PixelFormat};
 use crate::error::{PixelForgeError, Result};
@@ -43,6 +45,11 @@ pub(crate) struct H264Decoder {
 
     /// POC and reference state, recreated alongside the session.
     dpb: Option<DecodeDpb>,
+
+    /// What each pipeline slot's decode command was recorded from, indexed like
+    /// the pipeline's slots. Never resized or moved out of: the records point
+    /// into themselves.
+    records: Box<[DecodeRecord]>,
 
     /// Display-order reordering, which holds pictures by pinning their DPB
     /// slots rather than by copying them out.
@@ -109,6 +116,9 @@ impl H264Decoder {
             active_sps: None,
             active_pps: None,
             dpb: None,
+            records: (0..DECODE_PIPELINE_DEPTH)
+                .map(|_| DecodeRecord::new())
+                .collect(),
             reorder: ReorderBuffer::new(),
             reorder_depth: 0,
             framing: config.framing,
@@ -869,11 +879,9 @@ impl H264Decoder {
         self.common.stage_slices(&picture.slices, &profile_info)
     }
 
-    /// Transition the DPB slots this decode touches into DPB layout, and the
-    /// output image (if distinct) into decode-DST layout.
     /// Record `vkCmdBeginVideoCoding` / `vkCmdDecodeVideo` / `vkCmdEndVideoCoding`.
     fn record_decode(
-        &self,
+        &mut self,
         picture: &Picture,
         state: &PictureState,
         slot: u8,
@@ -881,18 +889,15 @@ impl H264Decoder {
         slice_offsets: &[u32],
     ) -> Result<()> {
         let active = self.common.session.as_ref().expect("active");
+        let command_buffer = self.common.decode_command_buffer();
 
-        let extent = vk::Extent2D {
-            width: active.coded_width,
-            height: active.coded_height,
-        };
+        // The slot's previous decode has finished (`begin_decode_commands`
+        // waited for it), so its record can be rewritten.
+        let record = &mut self.records[self.common.pipeline.current_index()];
+        record.reset(slice_offsets);
 
-        // --- Reference slots ---
         // Every reference the driver may use, plus the slot we reconstruct into.
-        let refs = self.dpb.as_ref().expect("active").references().to_vec();
-
-        let mut ref_std_infos: Vec<ash::vk::native::StdVideoDecodeH264ReferenceInfo> = Vec::new();
-        for r in &refs {
+        for r in self.dpb.as_ref().expect("active").references() {
             let mut flags: ash::vk::native::StdVideoDecodeH264ReferenceInfoFlags =
                 unsafe { std::mem::zeroed() };
             flags.set_top_field_flag(0);
@@ -907,12 +912,16 @@ impl H264Decoder {
             } else {
                 r.frame_num
             };
-            ref_std_infos.push(ash::vk::native::StdVideoDecodeH264ReferenceInfo {
-                flags,
-                FrameNum: frame_num,
-                reserved: 0,
-                PicOrderCnt: r.poc,
-            });
+            record.push_reference(
+                r.slot,
+                active.dpb_entry(r.slot).2,
+                ash::vk::native::StdVideoDecodeH264ReferenceInfo {
+                    flags,
+                    FrameNum: frame_num,
+                    reserved: 0,
+                    PicOrderCnt: r.poc,
+                },
+            );
         }
 
         // Setup (reconstruction) slot info for the current picture.
@@ -922,82 +931,13 @@ impl H264Decoder {
         setup_flags.set_bottom_field_flag(0);
         setup_flags.set_used_for_long_term_reference(0);
         setup_flags.set_is_non_existing(0);
-        let setup_std_info = ash::vk::native::StdVideoDecodeH264ReferenceInfo {
+        let setup_std = ash::vk::native::StdVideoDecodeH264ReferenceInfo {
             flags: setup_flags,
             FrameNum: state.frame_num,
             reserved: 0,
             PicOrderCnt: [state.poc, state.poc],
         };
 
-        // Picture resources. These must outlive the command recording.
-        let dpb_resource = |slot: u8| -> vk::VideoPictureResourceInfoKHR<'_> {
-            vk::VideoPictureResourceInfoKHR::default()
-                .coded_offset(vk::Offset2D { x: 0, y: 0 })
-                .coded_extent(extent)
-                .base_array_layer(0)
-                .image_view_binding(active.dpb_entry(slot).2)
-        };
-
-        let ref_resources: Vec<vk::VideoPictureResourceInfoKHR> =
-            refs.iter().map(|r| dpb_resource(r.slot)).collect();
-        let setup_resource = dpb_resource(slot);
-
-        let mut ref_h264_infos: Vec<vk::VideoDecodeH264DpbSlotInfoKHR> = ref_std_infos
-            .iter()
-            .map(|info| vk::VideoDecodeH264DpbSlotInfoKHR::default().std_reference_info(info))
-            .collect();
-        let mut setup_h264_info =
-            vk::VideoDecodeH264DpbSlotInfoKHR::default().std_reference_info(&setup_std_info);
-
-        // Slots passed to begin_video_coding: all active references, plus the
-        // slot we reconstruct into. The latter is not active yet -- it only
-        // becomes active via `setup_reference_slot` in the decode info -- and
-        // a non-negative slot_index here must name an already-active slot
-        // (VUID-vkCmdBeginVideoCodingKHR-slotIndex-07239). So it is listed
-        // with slot_index = -1, which still binds its picture resource.
-        let mut begin_slots: Vec<vk::VideoReferenceSlotInfoKHR> = Vec::new();
-        for ((r, resource), h264_info) in refs
-            .iter()
-            .zip(ref_resources.iter())
-            .zip(ref_h264_infos.iter_mut())
-        {
-            begin_slots.push(
-                vk::VideoReferenceSlotInfoKHR::default()
-                    .slot_index(r.slot as i32)
-                    .picture_resource(resource)
-                    .push(h264_info),
-            );
-        }
-        begin_slots.push(
-            vk::VideoReferenceSlotInfoKHR::default()
-                .slot_index(-1)
-                .picture_resource(&setup_resource),
-        );
-
-        let begin_info = vk::VideoBeginCodingInfoKHR::default()
-            .video_session(active.session)
-            .video_session_parameters(active.session_params)
-            .reference_slots(&begin_slots);
-
-        let device = self.common.context.device();
-        unsafe {
-            self.common
-                .video_queue_fn
-                .cmd_begin_video_coding(self.common.decode_command_buffer(), &begin_info);
-        }
-
-        // On the first use of the session, all DPB slots must be reset.
-        if !active.dpb_slot_active.iter().any(|&a| a) {
-            let control = vk::VideoCodingControlInfoKHR::default()
-                .flags(vk::VideoCodingControlFlagsKHR::RESET);
-            unsafe {
-                self.common
-                    .video_queue_fn
-                    .cmd_control_video_coding(self.common.decode_command_buffer(), &control);
-            }
-        }
-
-        // --- Picture info ---
         let mut pic_flags: ash::vk::native::StdVideoDecodeH264PictureInfoFlags =
             unsafe { std::mem::zeroed() };
         pic_flags.set_field_pic_flag(0);
@@ -1006,8 +946,7 @@ impl H264Decoder {
         pic_flags.set_bottom_field_flag(0);
         pic_flags.set_is_reference(state.is_reference as u32);
         pic_flags.set_complementary_field_pair(0);
-
-        let std_pic_info = ash::vk::native::StdVideoDecodeH264PictureInfo {
+        let pic_std = ash::vk::native::StdVideoDecodeH264PictureInfo {
             flags: pic_flags,
             seq_parameter_set_id: picture.sps.sps_id,
             pic_parameter_set_id: picture.header.pps_id,
@@ -1018,66 +957,49 @@ impl H264Decoder {
             PicOrderCnt: [state.poc, state.poc],
         };
 
-        let mut h264_picture_info = vk::VideoDecodeH264PictureInfoKHR::default()
-            .std_picture_info(&std_pic_info)
-            .slice_offsets(slice_offsets);
-
-        // The decode destination: the DPB slot itself when the implementation
+        // The decode destination is the DPB slot itself when the implementation
         // supports coincide, otherwise the separate output image.
-        let output_resource = match active.output_image {
-            None => setup_resource,
-            Some((_, _, view)) => vk::VideoPictureResourceInfoKHR::default()
-                .coded_offset(vk::Offset2D { x: 0, y: 0 })
-                .coded_extent(extent)
-                .base_array_layer(0)
-                .image_view_binding(view),
-        };
+        record.link(&LinkParams {
+            extent: vk::Extent2D {
+                width: active.coded_width,
+                height: active.coded_height,
+            },
+            session: active.session,
+            session_params: active.session_params,
+            bitstream: self.common.bitstream_buffer(),
+            bitstream_range: buffer_range,
+            setup_slot: slot,
+            setup_view: active.dpb_entry(slot).2,
+            output_view: active.output_image.map(|(_, _, view)| view),
+            setup_std,
+            pic_std,
+        });
 
-        // Only reference pictures need a setup slot; disposable pictures still
-        // decode into a DPB resource but are not retained.
-        let setup_slot = vk::VideoReferenceSlotInfoKHR::default()
-            .slot_index(slot as i32)
-            .picture_resource(&setup_resource)
-            .push(&mut setup_h264_info);
-
-        // Reference slots for the decode itself (the current slot is excluded).
-        let mut decode_ref_h264_infos: Vec<vk::VideoDecodeH264DpbSlotInfoKHR> = ref_std_infos
-            .iter()
-            .map(|info| vk::VideoDecodeH264DpbSlotInfoKHR::default().std_reference_info(info))
-            .collect();
-        let mut decode_slots: Vec<vk::VideoReferenceSlotInfoKHR> = Vec::new();
-        for ((r, resource), h264_info) in refs
-            .iter()
-            .zip(ref_resources.iter())
-            .zip(decode_ref_h264_infos.iter_mut())
-        {
-            decode_slots.push(
-                vk::VideoReferenceSlotInfoKHR::default()
-                    .slot_index(r.slot as i32)
-                    .picture_resource(resource)
-                    .push(h264_info),
-            );
+        unsafe {
+            self.common
+                .video_queue_fn
+                .cmd_begin_video_coding(command_buffer, record.begin_info());
         }
 
-        let decode_info = vk::VideoDecodeInfoKHR::default()
-            .src_buffer(self.common.bitstream_buffer())
-            .src_buffer_offset(0)
-            .src_buffer_range(buffer_range)
-            .dst_picture_resource(output_resource)
-            .setup_reference_slot(&setup_slot)
-            .reference_slots(&decode_slots)
-            .push(&mut h264_picture_info);
+        // On the first use of the session, all DPB slots must be reset.
+        if !active.dpb_slot_active.iter().any(|&a| a) {
+            let control = vk::VideoCodingControlInfoKHR::default()
+                .flags(vk::VideoCodingControlFlagsKHR::RESET);
+            unsafe {
+                self.common
+                    .video_queue_fn
+                    .cmd_control_video_coding(command_buffer, &control);
+            }
+        }
 
         unsafe {
             self.common
                 .video_decode_fn
-                .cmd_decode_video(self.common.decode_command_buffer(), &decode_info);
-            self.common.video_queue_fn.cmd_end_video_coding(
-                self.common.decode_command_buffer(),
-                &vk::VideoEndCodingInfoKHR::default(),
-            );
+                .cmd_decode_video(command_buffer, record.decode_info());
+            self.common
+                .video_queue_fn
+                .cmd_end_video_coding(command_buffer, &vk::VideoEndCodingInfoKHR::default());
         }
-        let _ = device;
         Ok(())
     }
 }
