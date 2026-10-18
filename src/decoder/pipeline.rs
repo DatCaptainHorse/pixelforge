@@ -181,6 +181,11 @@ impl DecodePipeline {
         &self.slots[self.current_slot]
     }
 
+    /// Index of the slot being recorded, for storage kept per slot elsewhere.
+    pub(crate) fn current_index(&self) -> usize {
+        self.current_slot
+    }
+
     /// Wait until the current slot's previous submission is finished, so its
     /// command buffers and staging buffer can be recorded over.
     pub(crate) fn wait_current_free(&self) {
