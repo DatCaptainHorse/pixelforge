@@ -9,6 +9,9 @@
 //!   Encoding hands back an [`EncodeFuture`]; decoding delivers frames through a
 //!   [`DecodeSource`] as the GPU finishes with them.
 //! - **GPU color conversion**: RGB/BGR → YUV via Vulkan compute shaders (BT.709, BT.2020, sRGB→BT.2020+PQ, scRGB-linear→BT.2020+PQ).
+//! - **Shared devices**: encode and decode on a Vulkan device your application
+//!   created, from Vulkan 1.1 up, on queues you choose, ordered against your own
+//!   work with timeline semaphores.
 //! - **HDR support**: 10-bit encoding (P010, YUV444P10), PQ transfer function, BT.2020 color space.
 //! - **GPU-native API**: Encode directly from Vulkan images (`vk::Image`).
 //! - **Flexible configuration**: Rate control (CBR, VBR, CQP), quality levels, GOP settings.
@@ -244,6 +247,49 @@
 //! # }
 //! ```
 //!
+//! ## Encoding on your own device
+//!
+//! An application that already renders with Vulkan can give pixelforge its own
+//! device instead of letting it create a second one. Frames then never leave
+//! the device: no external memory, no import, and no CPU wait between the
+//! application's work and pixelforge's.
+//!
+//! [`VideoContextBuilder::encode_device_requirements`] lists the queue
+//! families, extensions and features to create the device with, and
+//! [`VideoContextBuilder::build_from_existing_encode`] adopts it. A `VkQueue`
+//! may not be submitted to from two threads at once, so give pixelforge queues
+//! the application does not use, with
+//! [`VideoContextBuilder::with_encode_queue`] and friends.
+//!
+//! [`ColorConverter::convert_async`] and [`Encoder::encode_after`] then order
+//! each frame on the GPU: the application's submission signals a
+//! [`TimelinePoint`], the conversion waits for it and signals its own, and the
+//! encode waits for that. This stays off the CPU as long as the encoder's own
+//! [`Encoder::input_image`] is what gets encoded, as below: any other image is
+//! copied into it first, and that copy is waited for on the CPU.
+//!
+//! ```rust,no_run
+//! # use ash::vk;
+//! # use pixelforge::{ColorConverter, Encoder, TimelinePoint};
+//! # fn frame(
+//! #     converter: &mut ColorConverter,
+//! #     encoder: &mut Encoder,
+//! #     rendered: vk::Semaphore,
+//! #     frame_number: u64,
+//! #     image: vk::Image,
+//! # ) -> Result<(), Box<dyn std::error::Error>> {
+//! // `rendered` reaches `frame_number` once the application has drawn `image`.
+//! let converted = converter.convert_async(
+//!     image,
+//!     vk::ImageLayout::GENERAL,
+//!     encoder.input_image(),
+//!     &[TimelinePoint::new(rendered, frame_number)],
+//! )?;
+//! let packet = encoder.encode_after(encoder.input_image(), &[converted])?;
+//! # Ok(())
+//! # }
+//! ```
+//!
 //! # Benchmarking
 //!
 //! Run the encode latency benchmark with:
@@ -262,9 +308,6 @@
 //!
 //! # Decode H.264 to raw YUV
 //! cargo run --example decode -- input.264 output.yuv
-//!
-//! # Decode on a caller-created Vulkan device
-//! cargo run --example decode_adopted -- input.264 output.yuv
 //!
 //! # Encode, choosing the codec (h264, h265 or av1)
 //! cargo run --example encode -- h265
@@ -307,6 +350,7 @@ pub mod decoder;
 pub mod encoder;
 pub mod error;
 pub mod image;
+pub mod sync;
 pub(crate) mod video;
 pub mod vulkan;
 
@@ -332,6 +376,7 @@ pub use encoder::{
 };
 pub use error::PixelForgeError;
 pub use image::InputImage;
+pub use sync::TimelinePoint;
 pub use vulkan::VideoContextBuilder;
 
 /// Re-export VideoContext for convenience.

@@ -7,6 +7,11 @@ use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
 use tracing::{debug, info, warn};
 
+mod encode_device;
+mod queues;
+use queues::QueueOverrides;
+pub use queues::{DeviceQueue, QueueRoles};
+
 /// Route validation-layer messages into `tracing`.
 ///
 /// Without a messenger the validation layer has nowhere to report to and its
@@ -60,6 +65,7 @@ pub struct VideoContextBuilder {
     /// enables unified image layouts when the device supports them, and one
     /// that adopts a caller's device assumes they were not enabled.
     unified_image_layouts: Option<bool>,
+    queues: QueueOverrides,
 }
 
 impl Default for VideoContextBuilder {
@@ -78,6 +84,7 @@ impl VideoContextBuilder {
             required_encode_codecs: Vec::new(),
             required_decode_codecs: Vec::new(),
             unified_image_layouts: None,
+            queues: QueueOverrides::default(),
         }
     }
 
@@ -111,6 +118,52 @@ impl VideoContextBuilder {
         self
     }
 
+    /// Submit video encode work to `queue` on an adopted device.
+    ///
+    /// See [`Self::with_transfer_queue`] for why this matters. Ignored by
+    /// [`Self::build`], which creates its own device and owns every queue on
+    /// it.
+    pub fn with_encode_queue(mut self, queue: DeviceQueue) -> Self {
+        self.queues.encode = Some(queue);
+        self
+    }
+
+    /// Submit video decode work to `queue` on an adopted device.
+    ///
+    /// See [`Self::with_transfer_queue`] for why this matters. Ignored by
+    /// [`Self::build`], which creates its own device and owns every queue on
+    /// it.
+    pub fn with_decode_queue(mut self, queue: DeviceQueue) -> Self {
+        self.queues.decode = Some(queue);
+        self
+    }
+
+    /// Submit uploads and readback copies to `queue` on an adopted device.
+    ///
+    /// Without this, an adopted context takes queue 0 of each family it needs,
+    /// and on most hardware queue 0 of the transfer and compute families is the
+    /// caller's own graphics queue. A `VkQueue` must not be submitted to from
+    /// two threads at once, so a caller that keeps submitting to its queue
+    /// while pixelforge works on another thread has to either create a spare
+    /// queue and give it here, or create its queue with
+    /// `VK_DEVICE_QUEUE_CREATE_INTERNALLY_SYNCHRONIZED_BIT_KHR` (see
+    /// [`DeviceRequirements::internally_synchronized_queues`]).
+    ///
+    /// The queue's family must support transfer, and `queue.index` must be
+    /// below the number of queues the caller created in that family. The
+    /// second part cannot be checked. Ignored by [`Self::build`].
+    pub fn with_transfer_queue(mut self, queue: DeviceQueue) -> Self {
+        self.queues.transfer = Some(queue);
+        self
+    }
+
+    /// Submit the colour converter's dispatches to `queue` on an adopted
+    /// device. See [`Self::with_transfer_queue`]. Ignored by [`Self::build`].
+    pub fn with_compute_queue(mut self, queue: DeviceQueue) -> Self {
+        self.queues.compute = Some(queue);
+        self
+    }
+
     /// Build the VideoContext.
     pub fn build(self) -> Result<VideoContext> {
         VideoContext::new(self)
@@ -138,10 +191,27 @@ impl VideoContextBuilder {
         if unified_image_layouts {
             extensions.push(ash::khr::unified_image_layouts::NAME);
         }
+        let queues = QueueRoles {
+            encode: None,
+            decode: Some(families.decode),
+            transfer: families.transfer,
+            compute: families.compute,
+        };
         Ok(DeviceRequirements {
-            queue_families: families.unique(),
+            queue_families: queues.unique_families(),
+            queues,
             extensions,
+            features: DeviceFeatures {
+                synchronization2: true,
+                timeline_semaphore: true,
+                ..DeviceFeatures::default()
+            },
             unified_image_layouts,
+            internally_synchronized_queues: supports_internally_synchronized_queues(
+                instance,
+                physical_device,
+                &DeviceExtensions::of(instance, physical_device),
+            ),
         })
     }
 
@@ -200,6 +270,7 @@ impl VideoContextBuilder {
         VideoContext::from_existing_decode(
             self.required_decode_codecs,
             self.unified_image_layouts.unwrap_or(false),
+            self.queues,
             entry,
             instance,
             physical_device,
@@ -208,19 +279,34 @@ impl VideoContextBuilder {
     }
 }
 
-/// Queue families and extensions a caller's device must provide to decode.
+/// Queue families, extensions and features a caller's device must provide for
+/// pixelforge to work on it.
 ///
-/// Returned by [`VideoContextBuilder::decode_device_requirements`]. Two device
-/// features must be enabled as well, and are not listed here because they are
-/// feature-struct fields rather than extensions: `synchronization2` and
-/// `timelineSemaphore`.
+/// Returned by [`VideoContextBuilder::decode_device_requirements`] and
+/// [`VideoContextBuilder::encode_device_requirements`]. Enable every extension
+/// in [`Self::extensions`] and every feature set in [`Self::features`]:
+/// pixelforge assumes all of them are on, since Vulkan cannot be asked
+/// afterwards which were.
+///
+/// The instance may ask for any Vulkan version from 1.1 up. Pixelforge reaches
+/// everything newer through the extensions listed here, so an application that
+/// created its instance for 1.1 or 1.2 does not have to raise it.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct DeviceRequirements {
     /// Queue families pixelforge needs a queue created for. Merge these with
     /// your own (deduplicated) when building the device.
     pub queue_families: Vec<u32>,
+    /// The family behind each role in [`Self::queue_families`]. An adopted
+    /// context takes queue 0 of each unless told otherwise with
+    /// [`VideoContextBuilder::with_transfer_queue`] and friends, which is
+    /// where a caller that needs its own queue to itself points pixelforge at
+    /// a spare one.
+    pub queues: QueueRoles,
     /// Device extensions pixelforge needs enabled. Merge with your own.
     pub extensions: Vec<&'static std::ffi::CStr>,
+    /// Device features pixelforge needs enabled. Merge with your own.
+    pub features: DeviceFeatures,
     /// Whether this device can support unified image layouts for video, which
     /// is what lets decoded frames be sampled with no copy and no layout
     /// transition. When true, `VK_KHR_unified_image_layouts` is included in
@@ -234,6 +320,42 @@ pub struct DeviceRequirements {
     /// into a private image, which is correct but costs a full-frame GPU copy
     /// per frame.
     pub unified_image_layouts: bool,
+    /// Whether this device supports `VK_KHR_internally_synchronized_queues`.
+    ///
+    /// A queue created with `VK_DEVICE_QUEUE_CREATE_INTERNALLY_SYNCHRONIZED_BIT_KHR`
+    /// (and the `internallySynchronizedQueues` feature enabled) may be
+    /// submitted to from several threads at once, the driver doing the
+    /// locking. That makes it safe to give pixelforge the same queue the
+    /// caller uses, which is the way out on hardware with too few queues to
+    /// spare one. Pixelforge needs to be told nothing: it is the caller's
+    /// queue that has to be created this way. The extension is not in
+    /// [`Self::extensions`], since only a caller sharing its queue needs it.
+    pub internally_synchronized_queues: bool,
+}
+
+/// Device features, as booleans rather than a `pNext` chain.
+///
+/// A caller merging these into its own device creation may already chain
+/// `VkPhysicalDeviceVulkan12Features` or `VkPhysicalDeviceVulkan13Features`,
+/// and Vulkan forbids chaining those alongside the per-feature structs they
+/// contain. So pixelforge says which bits it needs and leaves it to the caller
+/// to set them in whichever structs it uses. The field names match the Vulkan
+/// feature names.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct DeviceFeatures {
+    /// `synchronization2`, from `VkPhysicalDeviceSynchronization2Features`.
+    pub synchronization2: bool,
+    /// `timelineSemaphore`, from `VkPhysicalDeviceTimelineSemaphoreFeatures`.
+    pub timeline_semaphore: bool,
+    /// `samplerYcbcrConversion`, from
+    /// `VkPhysicalDeviceSamplerYcbcrConversionFeatures`.
+    pub sampler_ycbcr_conversion: bool,
+    /// `ycbcr2plane444Formats`, from
+    /// `VkPhysicalDeviceYcbcr2Plane444FormatsFeaturesEXT`.
+    pub ycbcr_2plane_444_formats: bool,
+    /// `videoEncodeAV1`, from `VkPhysicalDeviceVideoEncodeAV1FeaturesKHR`.
+    pub video_encode_av1: bool,
 }
 
 /// The queue families pixelforge selects for decoding on a given device.
@@ -241,19 +363,6 @@ struct DecodeQueueFamilies {
     decode: u32,
     transfer: u32,
     compute: u32,
-}
-
-impl DecodeQueueFamilies {
-    /// The distinct families, in a stable order.
-    fn unique(&self) -> Vec<u32> {
-        let mut out = vec![self.decode];
-        for f in [self.transfer, self.compute] {
-            if !out.contains(&f) {
-                out.push(f);
-            }
-        }
-        out
-    }
 }
 
 /// The queue family for the colour conversion's compute work, if there is one.
@@ -272,23 +381,34 @@ fn find_compute_queue_family(queue_families: &[vk::QueueFamilyProperties]) -> Op
         .map(|(idx, _)| idx as u32)
 }
 
-/// Select the decode / transfer / compute queue families on `physical_device`,
-/// failing if it cannot decode the required codecs.
+/// The families [`scan_queue_families`] found.
+struct ScannedFamilies {
+    /// The last family with the requested video flag, if any.
+    video: Option<u32>,
+    /// `timestampValidBits` of [`Self::video`]'s family.
+    video_timestamp_valid_bits: u32,
+    transfer: u32,
+    compute: u32,
+}
+
+/// Find a family with the `video` flag, a transfer family and a compute family
+/// on `physical_device`, the same way [`VideoContext::new`] does.
 ///
-/// Mirrors the selection [`VideoContext::new`] does inline, but scoped to the
-/// decode path: a video-decode family, a transfer family (preferring a
-/// dedicated engine over one that also does video — see the scoring), and a
-/// compute family (see [`find_compute_queue_family`]).
-fn find_decode_queue_families(
-    entry: &ash::Entry,
+/// The transfer family is picked by preference rather than last-wins: a family
+/// that also does video is the worst choice, since it contends with the
+/// encode or decode work itself, then the graphics family, which the caller
+/// most likely renders on, then compute, and best of all a dedicated transfer
+/// engine. The compute family is [`find_compute_queue_family`]'s.
+fn scan_queue_families(
     instance: &ash::Instance,
     physical_device: vk::PhysicalDevice,
-    decode_codecs: &[Codec],
-) -> Result<DecodeQueueFamilies> {
+    video_flag: vk::QueueFlags,
+) -> Result<ScannedFamilies> {
     let queue_families =
         unsafe { instance.get_physical_device_queue_family_properties(physical_device) };
 
-    let mut decode = None;
+    let mut video = None;
+    let mut video_timestamp_valid_bits = 0;
     let mut transfer = u32::MAX;
     let mut transfer_score = -1i32;
 
@@ -296,8 +416,9 @@ fn find_decode_queue_families(
         let idx = idx as u32;
         let flags = props.queue_flags;
 
-        if flags.contains(vk::QueueFlags::VIDEO_DECODE_KHR) {
-            decode = Some(idx);
+        if flags.contains(video_flag) {
+            video = Some(idx);
+            video_timestamp_valid_bits = props.timestamp_valid_bits;
         }
         if flags.contains(vk::QueueFlags::TRANSFER) {
             let is_video = flags
@@ -318,11 +439,6 @@ fn find_decode_queue_families(
         }
     }
 
-    let decode = decode.ok_or_else(|| {
-        PixelForgeError::NoSuitableDevice(
-            "Physical device has no video decode queue family".to_string(),
-        )
-    })?;
     if transfer == u32::MAX {
         return Err(PixelForgeError::NoSuitableDevice(
             "Physical device has no transfer queue family".to_string(),
@@ -330,6 +446,39 @@ fn find_decode_queue_families(
     }
     let compute = find_compute_queue_family(&queue_families).ok_or_else(|| {
         PixelForgeError::NoSuitableDevice("Physical device has no compute queue family".to_string())
+    })?;
+    Ok(ScannedFamilies {
+        video,
+        video_timestamp_valid_bits,
+        transfer,
+        compute,
+    })
+}
+
+/// Select the decode / transfer / compute queue families on `physical_device`,
+/// failing if it cannot decode the required codecs.
+///
+/// Mirrors the selection [`VideoContext::new`] does inline, but scoped to the
+/// decode path: a video-decode family, a transfer family (preferring a
+/// dedicated engine over one that also does video — see the scoring), and a
+/// compute family (see [`find_compute_queue_family`]).
+fn find_decode_queue_families(
+    entry: &ash::Entry,
+    instance: &ash::Instance,
+    physical_device: vk::PhysicalDevice,
+    decode_codecs: &[Codec],
+) -> Result<DecodeQueueFamilies> {
+    let ScannedFamilies {
+        video: decode,
+        transfer,
+        compute,
+        ..
+    } = scan_queue_families(instance, physical_device, vk::QueueFlags::VIDEO_DECODE_KHR)?;
+
+    let decode = decode.ok_or_else(|| {
+        PixelForgeError::NoSuitableDevice(
+            "Physical device has no video decode queue family".to_string(),
+        )
     })?;
 
     // Confirm the device actually decodes the codecs asked for.
@@ -350,7 +499,28 @@ fn find_decode_queue_families(
     })
 }
 
-/// Device extensions required to decode the given codecs.
+/// The extensions a physical device offers, for asking which it has.
+///
+/// Enumerated once, so a caller checking several extensions does not ask the
+/// driver for the list again each time. A device whose list cannot be read is
+/// treated as offering nothing.
+pub(super) struct DeviceExtensions(Vec<vk::ExtensionProperties>);
+
+impl DeviceExtensions {
+    pub(super) fn of(instance: &ash::Instance, physical_device: vk::PhysicalDevice) -> Self {
+        Self(
+            unsafe { instance.enumerate_device_extension_properties(physical_device) }
+                .unwrap_or_default(),
+        )
+    }
+
+    pub(super) fn has(&self, name: &CStr) -> bool {
+        self.0
+            .iter()
+            .any(|ext| unsafe { CStr::from_ptr(ext.extension_name.as_ptr()) } == name)
+    }
+}
+
 /// Whether `physical_device` can support unified image layouts *for video*.
 ///
 /// Both the extension and both of its feature bits are needed:
@@ -360,15 +530,7 @@ fn supports_unified_image_layouts(
     instance: &ash::Instance,
     physical_device: vk::PhysicalDevice,
 ) -> bool {
-    let exts = match unsafe { instance.enumerate_device_extension_properties(physical_device) } {
-        Ok(exts) => exts,
-        Err(_) => return false,
-    };
-    let present = exts.iter().any(|ext| {
-        let name = unsafe { std::ffi::CStr::from_ptr(ext.extension_name.as_ptr()) };
-        name == ash::khr::unified_image_layouts::NAME
-    });
-    if !present {
+    if !DeviceExtensions::of(instance, physical_device).has(ash::khr::unified_image_layouts::NAME) {
         return false;
     }
     let mut features = vk::PhysicalDeviceUnifiedImageLayoutsFeaturesKHR::default();
@@ -377,11 +539,33 @@ fn supports_unified_image_layouts(
     features.unified_image_layouts != 0 && features.unified_image_layouts_video != 0
 }
 
+/// Whether `physical_device` supports `VK_KHR_internally_synchronized_queues`,
+/// extension and feature both.
+fn supports_internally_synchronized_queues(
+    instance: &ash::Instance,
+    physical_device: vk::PhysicalDevice,
+    extensions: &DeviceExtensions,
+) -> bool {
+    if !extensions.has(ash::khr::internally_synchronized_queues::NAME) {
+        return false;
+    }
+    let mut features = vk::PhysicalDeviceInternallySynchronizedQueuesFeaturesKHR::default();
+    let mut query = vk::PhysicalDeviceFeatures2::default().push(&mut features);
+    unsafe { instance.get_physical_device_features2(physical_device, &mut query) };
+    features.internally_synchronized_queues != 0
+}
+
+/// Device extensions required to decode the given codecs.
 fn decode_extension_names(decode_codecs: &[Codec]) -> Vec<&'static std::ffi::CStr> {
+    // Synchronization2 and timeline semaphores are core in 1.3 and 1.2, but
+    // are listed anyway: enabling a promoted extension is harmless, and on a
+    // device created from an instance asking for less it is what makes them
+    // available at all.
     let mut names = vec![
         ash::khr::video_queue::NAME,
         ash::khr::video_decode_queue::NAME,
         ash::khr::synchronization2::NAME,
+        ash::khr::timeline_semaphore::NAME,
     ];
     if decode_codecs.contains(&Codec::H264) {
         names.push(ash::khr::video_decode_h264::NAME);
@@ -408,6 +592,14 @@ struct VideoContextInner {
     instance: ash::Instance,
     physical_device: vk::PhysicalDevice,
     device: ash::Device,
+    /// `vkQueueSubmit2` and `vkCmdPipelineBarrier2` through their KHR names.
+    ///
+    /// The core entry points exist only when the device was created from an
+    /// instance asking for Vulkan 1.3. An adopted device may come from an
+    /// application that asked for less, where the core pointers are null and
+    /// calling them crashes. The KHR names are valid on any device with
+    /// `VK_KHR_synchronization2` enabled, which pixelforge requires either way.
+    sync2: ash::khr::synchronization2::Device,
     video_encode_queue_family: Option<u32>,
     video_encode_timestamp_valid_bits: u32,
     video_encode_queue: Option<vk::Queue>,
@@ -424,9 +616,13 @@ struct VideoContextInner {
     has_push_descriptor: bool,
     has_unified_image_layouts: bool,
     /// Whether this context created (and therefore must destroy) the device and
-    /// instance. A context adopted from a caller's device via
-    /// [`VideoContext::from_existing_decode`] borrows them and destroys neither.
+    /// instance. A context adopted from a caller's device borrows them and
+    /// destroys neither.
     owns_device: bool,
+    /// Semaphores whose owners are gone but which a submission may still be
+    /// waiting on, destroyed with the context. See
+    /// [`VideoContext::retire_semaphore`].
+    retired_semaphores: std::sync::Mutex<Vec<vk::Semaphore>>,
     /// Validation message sink, present only when validation is enabled and the
     /// instance is ours. Destroyed before the instance it belongs to.
     debug_messenger: Option<(ash::ext::debug_utils::Instance, vk::DebugUtilsMessengerEXT)>,
@@ -434,6 +630,15 @@ struct VideoContextInner {
 
 impl Drop for VideoContextInner {
     fn drop(&mut self) {
+        // Ours whoever owns the device, and gone before the device can be.
+        let retired = std::mem::take(
+            self.retired_semaphores
+                .get_mut()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        );
+        for semaphore in retired {
+            unsafe { self.device.destroy_semaphore(semaphore, None) };
+        }
         // Only tear down the device/instance we created ourselves. An adopted
         // device is owned by the caller and outlives this context.
         if self.owns_device {
@@ -466,6 +671,26 @@ impl VideoContext {
     /// Get the Vulkan device.
     pub fn device(&self) -> &ash::Device {
         &self.inner.device
+    }
+
+    pub(crate) fn sync2(&self) -> &ash::khr::synchronization2::Device {
+        &self.inner.sync2
+    }
+
+    /// Hand over a semaphore to be destroyed with the context rather than now.
+    ///
+    /// For a semaphore whose owner is being dropped while a submission from
+    /// elsewhere may still wait on it: the colour converter's timeline, which
+    /// an encode submitted with [`crate::Encoder::encode_after`] can still be
+    /// waiting on when the converter goes. Every encoder holds the context and
+    /// waits for its queues when dropped, so by the time the context goes,
+    /// nothing of pixelforge's waits on these any more.
+    pub(crate) fn retire_semaphore(&self, semaphore: vk::Semaphore) {
+        self.inner
+            .retired_semaphores
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(semaphore);
     }
 
     pub(crate) fn video_encode_queue_family(&self) -> Option<u32> {
@@ -1110,6 +1335,7 @@ impl VideoContext {
         Ok(Self {
             inner: std::sync::Arc::new(VideoContextInner {
                 entry,
+                sync2: ash::khr::synchronization2::Device::load(&instance, &device),
                 instance,
                 physical_device,
                 device,
@@ -1129,6 +1355,7 @@ impl VideoContext {
                 has_push_descriptor,
                 has_unified_image_layouts: has_unified_layouts,
                 owns_device: true,
+                retired_semaphores: Default::default(),
                 debug_messenger,
             }),
         })
@@ -1142,6 +1369,7 @@ impl VideoContext {
     fn from_existing_decode(
         required_decode_codecs: Vec<Codec>,
         declared_unified_image_layouts: bool,
+        queue_overrides: QueueOverrides,
         entry: ash::Entry,
         instance: ash::Instance,
         physical_device: vk::PhysicalDevice,
@@ -1158,10 +1386,34 @@ impl VideoContext {
         let memory_properties =
             unsafe { instance.get_physical_device_memory_properties(physical_device) };
 
-        // The caller created a queue for each family (from device_requirements).
-        let video_decode_queue = unsafe { device.get_device_queue(families.decode, 0) };
-        let transfer_queue = unsafe { device.get_device_queue(families.transfer, 0) };
-        let compute_queue = unsafe { device.get_device_queue(families.compute, 0) };
+        let decode = queues::resolve(
+            &instance,
+            physical_device,
+            "decode",
+            queue_overrides.decode,
+            families.decode,
+            vk::QueueFlags::VIDEO_DECODE_KHR,
+        )?;
+        let transfer = queues::resolve(
+            &instance,
+            physical_device,
+            "transfer",
+            queue_overrides.transfer,
+            families.transfer,
+            vk::QueueFlags::TRANSFER,
+        )?;
+        let compute = queues::resolve(
+            &instance,
+            physical_device,
+            "compute",
+            queue_overrides.compute,
+            families.compute,
+            vk::QueueFlags::COMPUTE,
+        )?;
+
+        let video_decode_queue = unsafe { device.get_device_queue(decode.family, decode.index) };
+        let transfer_queue = unsafe { device.get_device_queue(transfer.family, transfer.index) };
+        let compute_queue = unsafe { device.get_device_queue(compute.family, compute.index) };
 
         let supported_decode_codecs = query_decode_codecs(&entry, &instance, physical_device);
 
@@ -1180,24 +1432,25 @@ impl VideoContext {
         }
 
         info!(
-            "Adopted caller device for decode: decode family {}, transfer family {}, compute family {}",
-            families.decode, families.transfer, families.compute
+            "Adopted caller device for decode: decode queue {:?}, transfer queue {:?}, compute queue {:?}",
+            decode, transfer, compute
         );
 
         Ok(VideoContext {
             inner: std::sync::Arc::new(VideoContextInner {
                 entry,
+                sync2: ash::khr::synchronization2::Device::load(&instance, &device),
                 instance,
                 physical_device,
                 device,
                 video_encode_queue_family: None,
                 video_encode_timestamp_valid_bits: 0u32,
                 video_encode_queue: None,
-                video_decode_queue_family: Some(families.decode),
+                video_decode_queue_family: Some(decode.family),
                 video_decode_queue: Some(video_decode_queue),
-                transfer_queue_family: families.transfer,
+                transfer_queue_family: transfer.family,
                 transfer_queue,
-                compute_queue_family: families.compute,
+                compute_queue_family: compute.family,
                 compute_queue,
                 memory_properties,
                 device_properties,
@@ -1206,6 +1459,7 @@ impl VideoContext {
                 has_push_descriptor: false,
                 has_unified_image_layouts: declared_unified_image_layouts,
                 owns_device: false,
+                retired_semaphores: Default::default(),
                 // The caller owns the instance; reporting is theirs to set up.
                 debug_messenger: None,
             }),

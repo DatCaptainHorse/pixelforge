@@ -102,6 +102,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Validation layer messages are now routed into `tracing` through a
   `VK_EXT_debug_utils` messenger. Previously the layer was loaded with nowhere to
   report, so enabling validation verified nothing.
+- Encoding on a caller-created device: `encode_device_requirements` and
+  `build_from_existing_encode`, the counterparts of the decode pair. An
+  application that renders on its own device can encode its images there
+  directly, with no external memory and no second device.
+- `DeviceRequirements::features` names the device features pixelforge needs as
+  booleans, so a caller can set them in whichever feature structs it already
+  chains.
+- `VideoContextBuilder::with_encode_queue`, `with_decode_queue`,
+  `with_transfer_queue` and `with_compute_queue` choose exactly which queue an
+  adopted context submits to, so the caller can keep its own queues to itself.
+  `DeviceRequirements::queues` says which family serves which role, and
+  `DeviceRequirements::internally_synchronized_queues` whether the device can
+  share a queue safely instead.
+- `ColorConverter::convert_async` and `Encoder::encode_after` wait for, and in
+  the converter's case signal, a `TimelinePoint`, so a frame can go from the
+  caller's rendering through conversion to encode ordered on the GPU, with no
+  CPU wait in between.
 
 ### Changed
 
@@ -112,6 +129,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   replaced by `VideoContext::has_push_descriptor`.
 - Adopting a caller-created device for decode (`build_from_existing_decode`) now
   requires the `timelineSemaphore` feature in addition to `synchronization2`.
+- Adopted devices may come from an instance asking for any Vulkan version from
+  1.1 up. Pixelforge reaches synchronization2 through its extension rather than
+  core 1.3, and the requirements list `VK_KHR_timeline_semaphore`.
+- `DeviceRequirements` is `#[non_exhaustive]`, like the new `DeviceFeatures`
+  and `QueueRoles`, so later fields are not breaking changes. It can no longer
+  be built with a struct literal outside pixelforge.
 
 ### Fixed
 
