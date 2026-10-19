@@ -16,6 +16,7 @@ pub(crate) mod pipeline;
 pub(crate) mod profile;
 pub mod reorder;
 pub mod resources;
+pub(crate) mod support;
 
 use ash::vk;
 

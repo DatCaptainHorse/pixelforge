@@ -1699,6 +1699,10 @@ impl VideoContext {
         }
     }
 
+    /// Check if the selected device supports encoding the given codec.
+    ///
+    /// This only answers for 8-bit 4:2:0; see
+    /// [`supports_encode_format`](Self::supports_encode_format) for other formats.
     pub fn supports_encode(&self, codec: Codec) -> bool {
         self.inner.supported_encode_codecs.contains(&codec)
     }
