@@ -13,6 +13,7 @@ pub mod gop;
 pub mod h264;
 pub mod h265;
 pub(crate) mod pipeline;
+pub(crate) mod profile;
 pub mod reorder;
 pub mod resources;
 

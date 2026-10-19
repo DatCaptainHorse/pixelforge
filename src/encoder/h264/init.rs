@@ -4,8 +4,9 @@ use crate::encoder::codec::{
     CodecEncoder, CommonInitRequest, build_encoder_common, query_video_caps,
 };
 use crate::encoder::dpb::{DecodedPictureBuffer, DecodedPictureBufferTrait, DpbConfig};
+use crate::encoder::profile::h264_profile_idc;
 use crate::encoder::resources::MIN_BITSTREAM_BUFFER_SIZE;
-use crate::encoder::{ColorDescription, EncodeConfig, PixelFormat};
+use crate::encoder::{ColorDescription, EncodeConfig};
 use crate::error::{PixelForgeError, Result};
 use crate::vulkan::VideoContext;
 use ash::vk;
@@ -31,12 +32,7 @@ impl H264 {
         );
 
         // Select the profile based on chroma subsampling.
-        let profile_idc = match config.pixel_format {
-            PixelFormat::Yuv444 => {
-                ash::vk::native::StdVideoH264ProfileIdc_STD_VIDEO_H264_PROFILE_IDC_HIGH_444_PREDICTIVE
-            }
-            _ => ash::vk::native::StdVideoH264ProfileIdc_STD_VIDEO_H264_PROFILE_IDC_HIGH,
-        };
+        let profile_idc = h264_profile_idc(config.pixel_format);
 
         let chroma_subsampling: vk::VideoChromaSubsamplingFlagsKHR = config.pixel_format.into();
         let bit_depth: vk::VideoComponentBitDepthFlagsKHR = config.bit_depth.into();

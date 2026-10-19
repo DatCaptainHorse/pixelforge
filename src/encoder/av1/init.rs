@@ -3,7 +3,8 @@ use super::{Av1, MIN_BITSTREAM_BUFFER_SIZE, SUPERBLOCK_SIZE};
 use crate::encoder::codec::{
     CodecEncoder, CommonInitRequest, build_encoder_common, query_video_caps,
 };
-use crate::encoder::{ColorDescription, EncodeConfig, PixelFormat};
+use crate::encoder::profile::av1_profile;
+use crate::encoder::{ColorDescription, EncodeConfig};
 use crate::error::{PixelForgeError, Result};
 use crate::vulkan::VideoContext;
 use ash::vk;
@@ -27,11 +28,7 @@ impl Av1 {
             config.dimensions.width, config.dimensions.height, config.pixel_format
         );
 
-        // AV1 profile from chroma subsampling: Main is 4:2:0, High adds 4:4:4.
-        let profile = match config.pixel_format {
-            PixelFormat::Yuv420 => ash::vk::native::StdVideoAV1Profile_STD_VIDEO_AV1_PROFILE_MAIN,
-            _ => ash::vk::native::StdVideoAV1Profile_STD_VIDEO_AV1_PROFILE_HIGH,
-        };
+        let profile = av1_profile(config.pixel_format);
 
         let chroma_subsampling: vk::VideoChromaSubsamplingFlagsKHR = config.pixel_format.into();
         let bit_depth: vk::VideoComponentBitDepthFlagsKHR = config.bit_depth.into();

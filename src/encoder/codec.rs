@@ -468,6 +468,25 @@ pub(crate) struct DeviceVideoCaps {
     pub std_header_version: vk::ExtensionProperties,
 }
 
+/// Call `vkGetPhysicalDeviceVideoCapabilitiesKHR` and return its raw result.
+pub(crate) fn query_video_capabilities(
+    context: &VideoContext,
+    profile_info: &vk::VideoProfileInfoKHR,
+    capabilities: &mut vk::VideoCapabilitiesKHR,
+) -> vk::Result {
+    let video_queue_instance =
+        ash::khr::video_queue::Instance::load(context.entry(), context.instance());
+    unsafe {
+        (video_queue_instance
+            .fp()
+            .get_physical_device_video_capabilities_khr)(
+            context.physical_device(),
+            profile_info,
+            capabilities,
+        )
+    }
+}
+
 /// Run `vkGetPhysicalDeviceVideoCapabilitiesKHR` and resolve the fields the
 /// generic init needs.
 ///
@@ -479,17 +498,7 @@ pub(crate) fn query_video_caps(
     profile_info: &vk::VideoProfileInfoKHR,
     capabilities: &mut vk::VideoCapabilitiesKHR,
 ) -> Result<DeviceVideoCaps> {
-    let video_queue_instance =
-        ash::khr::video_queue::Instance::load(context.entry(), context.instance());
-    let result = unsafe {
-        (video_queue_instance
-            .fp()
-            .get_physical_device_video_capabilities_khr)(
-            context.physical_device(),
-            profile_info,
-            capabilities,
-        )
-    };
+    let result = query_video_capabilities(context, profile_info, capabilities);
     if result != vk::Result::SUCCESS {
         return Err(PixelForgeError::NoSuitableDevice(format!(
             "Failed to query Vulkan Video encode capabilities: {:?}",

@@ -4,8 +4,9 @@ use crate::encoder::codec::{
     CodecEncoder, CommonInitRequest, build_encoder_common, query_video_caps,
 };
 use crate::encoder::dpb::{DecodedPictureBuffer, DecodedPictureBufferTrait, DpbConfig};
+use crate::encoder::profile::h265_profile_idc;
 use crate::encoder::resources::MIN_BITSTREAM_BUFFER_SIZE;
-use crate::encoder::{BitDepth, ColorDescription, EncodeConfig, PixelFormat};
+use crate::encoder::{ColorDescription, EncodeConfig};
 use crate::error::{PixelForgeError, Result};
 use crate::vulkan::VideoContext;
 use ash::vk;
@@ -29,23 +30,13 @@ impl H265 {
             config.dimensions.width, config.dimensions.height, config.pixel_format
         );
 
-        let profile_idc = match (config.pixel_format, config.bit_depth) {
-            (PixelFormat::Yuv420, BitDepth::Eight) => {
-                ash::vk::native::StdVideoH265ProfileIdc_STD_VIDEO_H265_PROFILE_IDC_MAIN
-            }
-            (PixelFormat::Yuv420, BitDepth::Ten) => {
-                ash::vk::native::StdVideoH265ProfileIdc_STD_VIDEO_H265_PROFILE_IDC_MAIN_10
-            }
-            (PixelFormat::Yuv444, _) => {
-                ash::vk::native::StdVideoH265ProfileIdc_STD_VIDEO_H265_PROFILE_IDC_FORMAT_RANGE_EXTENSIONS
-            }
-            _ => {
-                return Err(PixelForgeError::InvalidInput(format!(
+        let profile_idc =
+            h265_profile_idc(config.pixel_format, config.bit_depth).ok_or_else(|| {
+                PixelForgeError::InvalidInput(format!(
                     "Unsupported pixel format / bit depth for H.265: {:?} / {:?}",
                     config.pixel_format, config.bit_depth
-                )));
-            }
-        };
+                ))
+            })?;
 
         let chroma_subsampling: vk::VideoChromaSubsamplingFlagsKHR = config.pixel_format.into();
         let bit_depth: vk::VideoComponentBitDepthFlagsKHR = config.bit_depth.into();
