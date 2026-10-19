@@ -110,6 +110,13 @@ rebuilt, and getting that wrong is silent rather than loud. Build the reference 
 resolution-changing stream to its first size and a whole-stream reference will
 not compare.
 
+Pixelforge can also run on a device the caller created, for decode and for
+encode. `tests/adopted.rs` builds one from a Vulkan 1.1 instance, as an
+application that never asked for 1.3 would, hands pixelforge spare queues, and
+checks the output against a context pixelforge created itself. It needs no
+ffmpeg. Anything that reaches a core 1.2 or 1.3 entry point panics there, so
+run it after touching submission or barrier code.
+
 Make sure there are no Vulkan validation layer errors during execution. Enable
 them with `PIXELFORGE_VALIDATION=1`; the layer's messages are routed through
 `tracing`, so pair it with `RUST_LOG=warn` (or `debug` for the layer's own
