@@ -282,6 +282,9 @@ fn encode_all(
         )?
     };
 
+    // Signalled after the converter is dropped, see the last encode below.
+    let after_drop = u64::from(ENCODE_FRAMES) + 1;
+
     // Every source stays alive until the end: with a GPU handoff nothing says
     // a conversion has finished reading one until its packet is back.
     let mut sources = Vec::new();
@@ -312,17 +315,36 @@ fn encode_all(
                             .value(ready.value),
                     )?
                 };
-                encoder.encode_after(target, &[converted])?
+                // The last encode also waits for a point signalled only once
+                // the converter is gone, so it is certainly still queued,
+                // waiting on the converter's semaphore, when that happens.
+                let mut waits = vec![converted];
+                if n + 1 == ENCODE_FRAMES {
+                    waits.push(TimelinePoint::new(rendered, after_drop));
+                }
+                encoder.encode_after(target, &waits)?
             }
         };
         sources.push(src);
         pending.push(future);
     }
+    // Dropped while an encode that waits on its points is still queued, as a
+    // caller rebuilding its converter might: its semaphore has to outlive
+    // that wait.
+    drop(converter);
+    if matches!(handoff, Handoff::Gpu) {
+        unsafe {
+            timeline_fns.signal_semaphore(
+                &vk::SemaphoreSignalInfo::default()
+                    .semaphore(rendered)
+                    .value(after_drop),
+            )?
+        };
+    }
     let mut stream = Vec::new();
     for future in pending {
         stream.extend_from_slice(&pollster::block_on(future)?.data);
     }
-    drop(converter);
     drop(encoder);
     drop(sources);
     unsafe { device.destroy_semaphore(rendered, None) };

@@ -609,6 +609,10 @@ struct VideoContextInner {
     /// instance. A context adopted from a caller's device borrows them and
     /// destroys neither.
     owns_device: bool,
+    /// Semaphores whose owners are gone but which a submission may still be
+    /// waiting on, destroyed with the context. See
+    /// [`VideoContext::retire_semaphore`].
+    retired_semaphores: std::sync::Mutex<Vec<vk::Semaphore>>,
     /// Validation message sink, present only when validation is enabled and the
     /// instance is ours. Destroyed before the instance it belongs to.
     debug_messenger: Option<(ash::ext::debug_utils::Instance, vk::DebugUtilsMessengerEXT)>,
@@ -616,6 +620,15 @@ struct VideoContextInner {
 
 impl Drop for VideoContextInner {
     fn drop(&mut self) {
+        // Ours whoever owns the device, and gone before the device can be.
+        let retired = std::mem::take(
+            self.retired_semaphores
+                .get_mut()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        );
+        for semaphore in retired {
+            unsafe { self.device.destroy_semaphore(semaphore, None) };
+        }
         // Only tear down the device/instance we created ourselves. An adopted
         // device is owned by the caller and outlives this context.
         if self.owns_device {
@@ -652,6 +665,22 @@ impl VideoContext {
 
     pub(crate) fn sync2(&self) -> &ash::khr::synchronization2::Device {
         &self.inner.sync2
+    }
+
+    /// Hand over a semaphore to be destroyed with the context rather than now.
+    ///
+    /// For a semaphore whose owner is being dropped while a submission from
+    /// elsewhere may still wait on it: the colour converter's timeline, which
+    /// an encode submitted with [`crate::Encoder::encode_after`] can still be
+    /// waiting on when the converter goes. Every encoder holds the context and
+    /// waits for its queues when dropped, so by the time the context goes,
+    /// nothing of pixelforge's waits on these any more.
+    pub(crate) fn retire_semaphore(&self, semaphore: vk::Semaphore) {
+        self.inner
+            .retired_semaphores
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(semaphore);
     }
 
     pub(crate) fn video_encode_queue_family(&self) -> Option<u32> {
@@ -1316,6 +1345,7 @@ impl VideoContext {
                 has_push_descriptor,
                 has_unified_image_layouts: has_unified_layouts,
                 owns_device: true,
+                retired_semaphores: Default::default(),
                 debug_messenger,
             }),
         })
@@ -1419,6 +1449,7 @@ impl VideoContext {
                 has_push_descriptor: false,
                 has_unified_image_layouts: declared_unified_image_layouts,
                 owns_device: false,
+                retired_semaphores: Default::default(),
                 // The caller owns the instance; reporting is theirs to set up.
                 debug_messenger: None,
             }),

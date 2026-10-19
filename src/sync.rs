@@ -14,7 +14,9 @@ use ash::vk;
 /// and nothing waits on the CPU.
 ///
 /// The semaphore must be a timeline semaphore on the same device as the
-/// context.
+/// context. A point pixelforge hands out stays valid for as long as the
+/// context does, so a submission of the caller's own that waits on one must
+/// finish before the last clone of the context is dropped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TimelinePoint {
     /// A timeline semaphore.

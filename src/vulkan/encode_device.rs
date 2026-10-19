@@ -316,6 +316,7 @@ impl VideoContext {
                 has_push_descriptor: plan.push_descriptor,
                 has_unified_image_layouts: false,
                 owns_device: false,
+                retired_semaphores: Default::default(),
                 // The caller owns the instance; reporting is theirs to set up.
                 debug_messenger: None,
             }),

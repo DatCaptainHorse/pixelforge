@@ -390,8 +390,8 @@ pub struct ColorConverter {
     command_buffer: vk::CommandBuffer,
     fence: vk::Fence,
     /// Whether a conversion was submitted and `fence` not yet waited on. The
-    /// command buffer, output buffer and cached source view are all reused
-    /// by the next conversion, so it waits for this one first.
+    /// next conversion reuses the command buffer and output buffer, and
+    /// destroys this one's source view, so it waits for this one first.
     in_flight: bool,
     /// Signalled by each conversion, for [`Self::convert_async`] to hand out.
     timeline: TimelineChain,
@@ -1146,7 +1146,10 @@ impl Drop for ColorConverter {
         let _ = self.wait_idle();
         unsafe {
             let device = self.context.device();
-            self.timeline.destroy(device);
+            // Not destroyed here: an encode may still be waiting on a point
+            // this converter handed out, and that wait outlives the
+            // conversion it is waiting for.
+            self.context.retire_semaphore(self.timeline.semaphore());
 
             // Destroy sampler.
             device.destroy_sampler(self.sampler, None);
