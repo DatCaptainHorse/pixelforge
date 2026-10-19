@@ -499,7 +499,6 @@ fn find_decode_queue_families(
     })
 }
 
-/// Device extensions required to decode the given codecs.
 /// The extensions a physical device offers, for asking which it has.
 ///
 /// Enumerated once, so a caller checking several extensions does not ask the
@@ -556,6 +555,7 @@ fn supports_internally_synchronized_queues(
     features.internally_synchronized_queues != 0
 }
 
+/// Device extensions required to decode the given codecs.
 fn decode_extension_names(decode_codecs: &[Codec]) -> Vec<&'static std::ffi::CStr> {
     // Synchronization2 and timeline semaphores are core in 1.3 and 1.2, but
     // are listed anyway: enabling a promoted extension is harmless, and on a

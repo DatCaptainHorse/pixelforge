@@ -282,8 +282,6 @@ let converted = converter.convert_async(
 let packet = encoder.encode_after(encoder.input_image(), &[converted])?;
 ```
 
-`examples/encode_adopted.rs` builds such a device from scratch.
-
 ## Benchmarking
 
 Run the encode latency benchmark with:
@@ -302,12 +300,6 @@ cargo run --example query_capabilities
 
 # Decode H.264 to raw YUV
 cargo run --example decode -- input.264 output.yuv
-
-# Decode on a caller-created Vulkan device
-cargo run --example decode_adopted -- input.264 output.yuv
-
-# Encode on a caller-created Vulkan device
-cargo run --example encode_adopted -- input.yuv output.h264
 
 # Encode, choosing the codec (h264, h265 or av1)
 cargo run --example encode -- h265
