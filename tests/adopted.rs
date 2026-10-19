@@ -170,6 +170,7 @@ fn same_gpu(instance: &ash::Instance, own: &VideoContext) -> vk::PhysicalDevice 
 #[test]
 #[ignore = "requires a Vulkan Video device"]
 fn decode_on_a_vulkan_1_1_device() -> Result<(), Box<dyn std::error::Error>> {
+    common::init_logging();
     let stream = std::fs::read("tests/data/bframes.264")?;
 
     let own = VideoContextBuilder::new()
@@ -291,14 +292,14 @@ fn encode_all(
         let target = encoder.input_image();
         let future = match handoff {
             Handoff::Cpu => {
-                converter.convert(src.image, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL, target)?;
+                converter.convert(src.image, vk::ImageLayout::GENERAL, target)?;
                 encoder.encode(target)?
             }
             Handoff::Gpu => {
                 let ready = TimelinePoint::new(rendered, u64::from(n) + 1);
                 let converted = converter.convert_async(
                     src.image,
-                    vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                    vk::ImageLayout::GENERAL,
                     target,
                     &[ready],
                 )?;
@@ -347,6 +348,7 @@ fn luma_psnr(a: &[u8], b: &[u8]) -> f64 {
 #[test]
 #[ignore = "requires a Vulkan Video device"]
 fn encode_on_a_vulkan_1_1_device() -> Result<(), Box<dyn std::error::Error>> {
+    common::init_logging();
     let own = VideoContextBuilder::new()
         .enable_validation(validation_requested())
         .require_encode(Codec::H264)
