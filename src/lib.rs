@@ -264,7 +264,9 @@
 //! [`ColorConverter::convert_async`] and [`Encoder::encode_after`] then order
 //! each frame on the GPU: the application's submission signals a
 //! [`TimelinePoint`], the conversion waits for it and signals its own, and the
-//! encode waits for that.
+//! encode waits for that. This stays off the CPU as long as the encoder's own
+//! [`Encoder::input_image`] is what gets encoded, as below: any other image is
+//! copied into it first, and that copy is waited for on the CPU.
 //!
 //! ```rust,no_run
 //! # use ash::vk;

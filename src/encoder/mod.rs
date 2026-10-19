@@ -682,6 +682,13 @@ impl Encoder {
     /// returned by [`ColorConverter::convert_async`](crate::ColorConverter::convert_async)
     /// to encode what it converted without waiting for the conversion on the
     /// CPU, or a point the caller's own rendering signals.
+    ///
+    /// Only a `src_image` that is [`Self::input_image`] avoids the CPU
+    /// entirely. Any other image is first copied into the input image, and
+    /// that copy is waited for on the CPU before the encode is recorded, so
+    /// this call then blocks until the points in `wait` are reached and the
+    /// copy is done. Render or convert into [`Self::input_image`] to keep the
+    /// whole handover on the GPU.
     pub fn encode_after(
         &mut self,
         src_image: vk::Image,
