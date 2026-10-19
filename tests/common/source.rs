@@ -22,13 +22,21 @@ impl Drop for SrcImage {
     }
 }
 
+/// Record and run one command buffer on the colour converter's queue, and
+/// wait for it.
+///
+/// The converter's queue because every image this touches is the converter's
+/// too: the source it reads and the output it writes. Those images belong to
+/// one queue family, and on a device with a separate transfer family (NVIDIA
+/// has one) work there would need an ownership handover the tests do not do,
+/// and could not make the source readable by shaders at all.
 pub unsafe fn one_shot<F: FnOnce(vk::CommandBuffer)>(
     context: &VideoContext,
     record: F,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let device = context.device();
     let pool_info = vk::CommandPoolCreateInfo::default()
-        .queue_family_index(context.transfer_queue_family())
+        .queue_family_index(context.compute_queue_family())
         .flags(vk::CommandPoolCreateFlags::TRANSIENT);
     let pool = unsafe { device.create_command_pool(&pool_info, None) }?;
     let cb_info = vk::CommandBufferAllocateInfo::default()
@@ -46,8 +54,8 @@ pub unsafe fn one_shot<F: FnOnce(vk::CommandBuffer)>(
         device.end_command_buffer(cb)?;
         let cbs = [cb];
         let submit = vk::SubmitInfo::default().command_buffers(&cbs);
-        device.queue_submit(context.transfer_queue(), &[submit], vk::Fence::null())?;
-        device.queue_wait_idle(context.transfer_queue())?;
+        device.queue_submit(context.compute_queue(), &[submit], vk::Fence::null())?;
+        device.queue_wait_idle(context.compute_queue())?;
         device.destroy_command_pool(pool, None);
     }
     Ok(())
