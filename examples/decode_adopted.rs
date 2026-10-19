@@ -116,9 +116,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let device = unsafe { instance.create_device(physical_device, &device_info, None)? };
 
     // --- Hand the app's device to pixelforge ---
+    let decode = spare(
+        reqs.queues
+            .decode
+            .expect("decode requirements name a decode family"),
+    );
     let (transfer, compute) = (spare(reqs.queues.transfer), spare(reqs.queues.compute));
-    println!("pixelforge gets transfer queue {transfer:?} and compute queue {compute:?}");
+    println!(
+        "pixelforge gets decode queue {decode:?}, transfer queue {transfer:?} and compute queue {compute:?}"
+    );
     let builder = builder
+        .with_decode_queue(decode)
         .with_transfer_queue(transfer)
         .with_compute_queue(compute);
     let builder = if reqs.unified_image_layouts {
