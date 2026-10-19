@@ -210,6 +210,7 @@ impl VideoContextBuilder {
             internally_synchronized_queues: supports_internally_synchronized_queues(
                 instance,
                 physical_device,
+                &DeviceExtensions::of(instance, physical_device),
             ),
         })
     }
@@ -497,6 +498,28 @@ fn find_decode_queue_families(
 }
 
 /// Device extensions required to decode the given codecs.
+/// The extensions a physical device offers, for asking which it has.
+///
+/// Enumerated once, so a caller checking several extensions does not ask the
+/// driver for the list again each time. A device whose list cannot be read is
+/// treated as offering nothing.
+pub(super) struct DeviceExtensions(Vec<vk::ExtensionProperties>);
+
+impl DeviceExtensions {
+    pub(super) fn of(instance: &ash::Instance, physical_device: vk::PhysicalDevice) -> Self {
+        Self(
+            unsafe { instance.enumerate_device_extension_properties(physical_device) }
+                .unwrap_or_default(),
+        )
+    }
+
+    pub(super) fn has(&self, name: &CStr) -> bool {
+        self.0
+            .iter()
+            .any(|ext| unsafe { CStr::from_ptr(ext.extension_name.as_ptr()) } == name)
+    }
+}
+
 /// Whether `physical_device` can support unified image layouts *for video*.
 ///
 /// Both the extension and both of its feature bits are needed:
@@ -506,15 +529,7 @@ fn supports_unified_image_layouts(
     instance: &ash::Instance,
     physical_device: vk::PhysicalDevice,
 ) -> bool {
-    let exts = match unsafe { instance.enumerate_device_extension_properties(physical_device) } {
-        Ok(exts) => exts,
-        Err(_) => return false,
-    };
-    let present = exts.iter().any(|ext| {
-        let name = unsafe { std::ffi::CStr::from_ptr(ext.extension_name.as_ptr()) };
-        name == ash::khr::unified_image_layouts::NAME
-    });
-    if !present {
+    if !DeviceExtensions::of(instance, physical_device).has(ash::khr::unified_image_layouts::NAME) {
         return false;
     }
     let mut features = vk::PhysicalDeviceUnifiedImageLayoutsFeaturesKHR::default();
@@ -528,16 +543,9 @@ fn supports_unified_image_layouts(
 fn supports_internally_synchronized_queues(
     instance: &ash::Instance,
     physical_device: vk::PhysicalDevice,
+    extensions: &DeviceExtensions,
 ) -> bool {
-    let exts = match unsafe { instance.enumerate_device_extension_properties(physical_device) } {
-        Ok(exts) => exts,
-        Err(_) => return false,
-    };
-    let present = exts.iter().any(|ext| {
-        let name = unsafe { std::ffi::CStr::from_ptr(ext.extension_name.as_ptr()) };
-        name == ash::khr::internally_synchronized_queues::NAME
-    });
-    if !present {
+    if !extensions.has(ash::khr::internally_synchronized_queues::NAME) {
         return false;
     }
     let mut features = vk::PhysicalDeviceInternallySynchronizedQueuesFeaturesKHR::default();

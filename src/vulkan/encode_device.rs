@@ -9,8 +9,9 @@
 
 use super::queues::{self, QueueOverrides};
 use super::{
-    DeviceFeatures, DeviceRequirements, QueueRoles, VideoContext, VideoContextBuilder,
-    VideoContextInner, scan_queue_families, supports_internally_synchronized_queues,
+    DeviceExtensions, DeviceFeatures, DeviceQueue, DeviceRequirements, QueueRoles, VideoContext,
+    VideoContextBuilder, VideoContextInner, scan_queue_families,
+    supports_internally_synchronized_queues,
 };
 use crate::encoder::Codec;
 use crate::error::{PixelForgeError, Result};
@@ -20,7 +21,10 @@ use tracing::info;
 
 /// The queue families pixelforge selects for encoding on a given device.
 struct EncodeQueueFamilies {
-    encode: u32,
+    /// The encode queue: the caller's choice, or queue 0 of the family the
+    /// scan found. Settled before anything else, since codec support and
+    /// timestamp support both belong to a family.
+    encode: DeviceQueue,
     encode_timestamp_valid_bits: u32,
     transfer: u32,
     compute: u32,
@@ -36,44 +40,78 @@ struct EncodePlan {
     push_descriptor: bool,
     ycbcr_2plane_444: bool,
     sampler_ycbcr_conversion: bool,
+    internally_synchronized_queues: bool,
 }
 
 impl EncodePlan {
+    /// `encode_queue` is the caller's choice of encode queue, if it made one.
+    /// Codecs are checked on that queue's family, since that is the one the
+    /// encoder will submit to.
     fn new(
         entry: &ash::Entry,
         instance: &ash::Instance,
         physical_device: vk::PhysicalDevice,
         required: &[Codec],
+        encode_queue: Option<DeviceQueue>,
     ) -> Result<Self> {
         let scanned =
             scan_queue_families(instance, physical_device, vk::QueueFlags::VIDEO_ENCODE_KHR)?;
-        let encode = scanned.video.ok_or_else(|| {
+        let scanned_encode = scanned.video.ok_or_else(|| {
             PixelForgeError::NoSuitableDevice(
                 "Physical device has no video encode queue family".to_string(),
             )
         })?;
-
-        let extensions = unsafe { instance.enumerate_device_extension_properties(physical_device) }
-            .map_err(|e| PixelForgeError::NoSuitableDevice(e.to_string()))?;
-        let has = |name: &std::ffi::CStr| {
-            extensions
-                .iter()
-                .any(|ext| unsafe { std::ffi::CStr::from_ptr(ext.extension_name.as_ptr()) } == name)
+        let encode = queues::resolve(
+            instance,
+            physical_device,
+            "encode",
+            encode_queue,
+            scanned_encode,
+            vk::QueueFlags::VIDEO_ENCODE_KHR,
+        )?;
+        let encode_timestamp_valid_bits = if encode.family == scanned_encode {
+            scanned.video_timestamp_valid_bits
+        } else {
+            let props =
+                unsafe { instance.get_physical_device_queue_family_properties(physical_device) };
+            props[encode.family as usize].timestamp_valid_bits
         };
 
+        let extensions = DeviceExtensions::of(instance, physical_device);
+        let has = |name: &std::ffi::CStr| extensions.has(name);
+
+        // The feature bits behind two of the extensions. A driver may offer an
+        // extension and still report its feature off, and a caller told to
+        // enable a feature the device lacks gets VK_ERROR_FEATURE_NOT_PRESENT
+        // from vkCreateDevice. A struct is chained only when its extension is
+        // offered, as Vulkan requires.
+        let mut ycbcr = vk::PhysicalDeviceSamplerYcbcrConversionFeatures::default();
+        let mut ycbcr_444 = vk::PhysicalDeviceYcbcr2Plane444FormatsFeaturesEXT::default();
+        let mut av1 = vk::PhysicalDeviceVideoEncodeAV1FeaturesKHR::default();
+        let mut query = vk::PhysicalDeviceFeatures2::default().push(&mut ycbcr);
+        if has(ash::ext::ycbcr_2plane_444_formats::NAME) {
+            query = query.push(&mut ycbcr_444);
+        }
+        if has(ash::khr::video_encode_av1::NAME) {
+            query = query.push(&mut av1);
+        }
+        unsafe { instance.get_physical_device_features2(physical_device, &mut query) };
+
+        let family = encode.family;
         let mut available = Vec::new();
         if has(ash::khr::video_encode_h264::NAME)
-            && VideoContext::check_h264_encode_support(entry, instance, physical_device, encode)
+            && VideoContext::check_h264_encode_support(entry, instance, physical_device, family)
         {
             available.push(Codec::H264);
         }
         if has(ash::khr::video_encode_h265::NAME)
-            && VideoContext::check_h265_encode_support(entry, instance, physical_device, encode)
+            && VideoContext::check_h265_encode_support(entry, instance, physical_device, family)
         {
             available.push(Codec::H265);
         }
         if has(ash::khr::video_encode_av1::NAME)
-            && VideoContext::check_av1_encode_support(entry, instance, physical_device, encode)
+            && av1.video_encode_av1 != 0
+            && VideoContext::check_av1_encode_support(entry, instance, physical_device, family)
         {
             available.push(Codec::AV1);
         }
@@ -83,8 +121,8 @@ impl EncodePlan {
             for codec in required {
                 if !available.contains(codec) {
                     return Err(PixelForgeError::CodecNotSupported(format!(
-                        "Physical device does not support encoding {:?}",
-                        codec
+                        "Queue family {} does not support encoding {:?}",
+                        family, codec
                     )));
                 }
             }
@@ -96,21 +134,23 @@ impl EncodePlan {
             ));
         }
 
-        let mut ycbcr = vk::PhysicalDeviceSamplerYcbcrConversionFeatures::default();
-        let mut query = vk::PhysicalDeviceFeatures2::default().push(&mut ycbcr);
-        unsafe { instance.get_physical_device_features2(physical_device, &mut query) };
-
         Ok(Self {
             families: EncodeQueueFamilies {
                 encode,
-                encode_timestamp_valid_bits: scanned.video_timestamp_valid_bits,
+                encode_timestamp_valid_bits,
                 transfer: scanned.transfer,
                 compute: scanned.compute,
             },
             codecs,
             push_descriptor: has(ash::khr::push_descriptor::NAME),
-            ycbcr_2plane_444: has(ash::ext::ycbcr_2plane_444_formats::NAME),
+            ycbcr_2plane_444: has(ash::ext::ycbcr_2plane_444_formats::NAME)
+                && ycbcr_444.ycbcr2plane444_formats != 0,
             sampler_ycbcr_conversion: ycbcr.sampler_ycbcr_conversion != 0,
+            internally_synchronized_queues: supports_internally_synchronized_queues(
+                instance,
+                physical_device,
+                &extensions,
+            ),
         })
     }
 
@@ -152,7 +192,7 @@ impl EncodePlan {
 
     fn roles(&self) -> QueueRoles {
         QueueRoles {
-            encode: Some(self.families.encode),
+            encode: Some(self.families.encode.family),
             decode: None,
             transfer: self.families.transfer,
             compute: self.families.compute,
@@ -184,6 +224,7 @@ impl VideoContextBuilder {
             instance,
             physical_device,
             &self.required_encode_codecs,
+            self.queues.encode,
         )?;
         let queues = plan.roles();
         Ok(DeviceRequirements {
@@ -192,10 +233,7 @@ impl VideoContextBuilder {
             extensions: plan.extensions(),
             features: plan.features(),
             unified_image_layouts: false,
-            internally_synchronized_queues: supports_internally_synchronized_queues(
-                instance,
-                physical_device,
-            ),
+            internally_synchronized_queues: plan.internally_synchronized_queues,
         })
     }
 
@@ -242,17 +280,15 @@ impl VideoContext {
         physical_device: vk::PhysicalDevice,
         device: ash::Device,
     ) -> Result<VideoContext> {
-        let plan = EncodePlan::new(&entry, &instance, physical_device, required_encode_codecs)?;
-        let families = &plan.families;
-
-        let encode = queues::resolve(
+        let plan = EncodePlan::new(
+            &entry,
             &instance,
             physical_device,
-            "encode",
+            required_encode_codecs,
             queue_overrides.encode,
-            families.encode,
-            vk::QueueFlags::VIDEO_ENCODE_KHR,
         )?;
+        let families = &plan.families;
+        let encode = families.encode;
         let transfer = queues::resolve(
             &instance,
             physical_device,
@@ -269,16 +305,6 @@ impl VideoContext {
             families.compute,
             vk::QueueFlags::COMPUTE,
         )?;
-
-        // The caller may have picked another encode family than the scan did,
-        // so the timestamp support is that family's, not the scanned one's.
-        let encode_timestamp_valid_bits = if encode.family == families.encode {
-            families.encode_timestamp_valid_bits
-        } else {
-            let props =
-                unsafe { instance.get_physical_device_queue_family_properties(physical_device) };
-            props[encode.family as usize].timestamp_valid_bits
-        };
 
         let device_properties = unsafe { instance.get_physical_device_properties(physical_device) };
         let memory_properties =
@@ -301,7 +327,7 @@ impl VideoContext {
                 physical_device,
                 device,
                 video_encode_queue_family: Some(encode.family),
-                video_encode_timestamp_valid_bits: encode_timestamp_valid_bits,
+                video_encode_timestamp_valid_bits: families.encode_timestamp_valid_bits,
                 video_encode_queue: Some(video_encode_queue),
                 video_decode_queue_family: None,
                 video_decode_queue: None,
