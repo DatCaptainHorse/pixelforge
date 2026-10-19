@@ -292,6 +292,7 @@ impl VideoContextBuilder {
 /// everything newer through the extensions listed here, so an application that
 /// created its instance for 1.1 or 1.2 does not have to raise it.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct DeviceRequirements {
     /// Queue families pixelforge needs a queue created for. Merge these with
     /// your own (deduplicated) when building the device.
@@ -341,6 +342,7 @@ pub struct DeviceRequirements {
 /// to set them in whichever structs it uses. The field names match the Vulkan
 /// feature names.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct DeviceFeatures {
     /// `synchronization2`, from `VkPhysicalDeviceSynchronization2Features`.
     pub synchronization2: bool,

@@ -132,6 +132,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Adopted devices may come from an instance asking for any Vulkan version from
   1.1 up. Pixelforge reaches synchronization2 through its extension rather than
   core 1.3, and the requirements list `VK_KHR_timeline_semaphore`.
+- `DeviceRequirements` is `#[non_exhaustive]`, like the new `DeviceFeatures`
+  and `QueueRoles`, so later fields are not breaking changes. It can no longer
+  be built with a struct literal outside pixelforge.
 
 ### Fixed
 

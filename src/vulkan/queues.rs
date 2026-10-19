@@ -36,6 +36,7 @@ impl DeviceQueue {
 /// Returned as part of [`DeviceRequirements`](super::DeviceRequirements). A
 /// role that the requested work does not need is `None`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct QueueRoles {
     /// Video encode submissions.
     pub encode: Option<u32>,
