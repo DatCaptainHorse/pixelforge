@@ -187,7 +187,7 @@ fn query_detailed_capabilities(
         }
         println!("      Supported");
         println!(
-            "      Max Dimenstions: {}x{}",
+            "      Max Dimensions: {}x{}",
             caps.max_coded_extent.width, caps.max_coded_extent.height
         );
         println!(
