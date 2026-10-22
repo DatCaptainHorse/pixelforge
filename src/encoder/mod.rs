@@ -342,7 +342,7 @@ pub struct EncodeConfig {
     /// IDR frames maximum headroom.
     pub initial_virtual_buffer_size_ms: u32,
     /// Color description for VUI signaling.
-    /// Defaults to BT.709 (full-range) when `None`.
+    /// Defaults to BT.709, limited range, when `None`.
     pub color_description: Option<ColorDescription>,
     /// Usage hint for encoding.
     pub encode_usage_hint: EncodeUsageHint,
