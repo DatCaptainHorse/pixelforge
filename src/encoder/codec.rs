@@ -96,9 +96,10 @@ impl EncoderCommon {
         }
     }
 
-    /// Copy a source image into the current slot's input image. No-op when the
-    /// source already *is* the slot image (e.g. converted in place).
-    pub fn upload(&mut self, src_image: vk::Image) -> Result<()> {
+    /// Copy a source image, in `src_layout`, into the current slot's input
+    /// image. No-op when the source already *is* the slot image (e.g.
+    /// converted in place).
+    pub fn upload(&mut self, src_image: vk::Image, src_layout: vk::ImageLayout) -> Result<()> {
         let (dst_image, input_image_layout) = {
             let slot = self.pipeline.current();
             (slot.input_image, slot.input_image_layout)
@@ -112,6 +113,7 @@ impl EncoderCommon {
             upload_command_buffer: self.upload_command_buffer,
             upload_fence: self.upload_fence,
             src_image,
+            src_layout,
             dst_image,
             width: self.config.dimensions.width,
             height: self.config.dimensions.height,
@@ -330,12 +332,13 @@ impl<C: VideoCodec> CodecEncoder<C> {
     pub fn encode_after(
         &mut self,
         src_image: vk::Image,
+        src_layout: vk::ImageLayout,
         wait: &[TimelinePoint],
     ) -> Result<EncodeFuture> {
         let plan = self.common.begin_frame();
         self.common.pending_waits.clear();
         self.common.pending_waits.extend_from_slice(wait);
-        self.common.upload(src_image)?;
+        self.common.upload(src_image, src_layout)?;
 
         let setup = self.codec.begin_picture(&mut self.common, &plan)?;
         self.common.set_pending_metadata(SlotPacketMetadata {

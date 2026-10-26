@@ -418,6 +418,10 @@ pub(crate) struct UploadParams<'a> {
     pub upload_fence: vk::Fence,
     /// The source image to copy from.
     pub src_image: vk::Image,
+    /// The layout the source image is in. `UNDEFINED` means a first-time
+    /// external-memory import, which the copy acquires from
+    /// `VK_QUEUE_FAMILY_EXTERNAL` for the transfer queue family.
+    pub src_layout: vk::ImageLayout,
     /// The destination image to copy to.
     pub dst_image: vk::Image,
     /// The width of the image.
@@ -440,7 +444,8 @@ pub(crate) struct UploadParams<'a> {
 ///
 /// This function handles:
 /// - Resetting and beginning the command buffer
-/// - Transitioning source image from GENERAL to TRANSFER_SRC
+/// - Transitioning source image from `src_layout` to TRANSFER_SRC, acquiring
+///   a first-time external-memory import
 /// - Transitioning destination image from `input_image_layout` to TRANSFER_DST
 /// - Copying Y and UV planes (NV12 format)
 /// - Transitioning destination image to VIDEO_ENCODE_SRC
@@ -467,12 +472,23 @@ pub(crate) fn upload_image_to_input(
     unsafe { device.begin_command_buffer(params.upload_command_buffer, &begin_info) }
         .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
 
-    // Transition source image from GENERAL to TRANSFER_SRC.
+    // Transition source image to TRANSFER_SRC. A first-time external-memory
+    // import (UNDEFINED) is still owned by VK_QUEUE_FAMILY_EXTERNAL: acquire it
+    // for the transfer queue family.
+    let needs_acquire = params.src_layout == vk::ImageLayout::UNDEFINED;
     let src_barrier = vk::ImageMemoryBarrier::default()
-        .old_layout(vk::ImageLayout::GENERAL)
+        .old_layout(params.src_layout)
         .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
-        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .src_queue_family_index(if needs_acquire {
+            vk::QUEUE_FAMILY_EXTERNAL
+        } else {
+            vk::QUEUE_FAMILY_IGNORED
+        })
+        .dst_queue_family_index(if needs_acquire {
+            context.transfer_queue_family()
+        } else {
+            vk::QUEUE_FAMILY_IGNORED
+        })
         .image(params.src_image)
         .subresource_range(vk::ImageSubresourceRange {
             aspect_mask: vk::ImageAspectFlags::COLOR,
@@ -481,7 +497,11 @@ pub(crate) fn upload_image_to_input(
             base_array_layer: 0,
             layer_count: 1,
         })
-        .src_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE)
+        .src_access_mask(if needs_acquire {
+            vk::AccessFlags::empty()
+        } else {
+            vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE
+        })
         .dst_access_mask(vk::AccessFlags::TRANSFER_READ);
 
     // Transition destination image to TRANSFER_DST.
