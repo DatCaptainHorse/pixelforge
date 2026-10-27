@@ -255,7 +255,9 @@ Where the conversion is nothing but the YUV matrix, as for ordinary SDR
 content, some encoders can do it themselves and the shader need not run at
 all. [`ColorConverterConfig::rgb_encode_input`] says whether that works for
 a given conversion and codec on this device. When it does, build the
-encoder with [`EncodeConfig::with_rgb_input`] and hand it the RGB frames.
+encoder with [`EncodeConfig::with_rgb_input`] and hand it the RGB frames,
+passing `UNDEFINED` to [`Encoder::encode_after`] for first-time DMA-BUF
+imports.
 
 ```rust
 let encode_config = EncodeConfig::h264(1920, 1080)
@@ -297,7 +299,7 @@ let converted = converter.convert_async(
     encoder.input_image(),
     &[TimelinePoint::new(rendered, frame_number)],
 )?;
-let packet = encoder.encode_after(encoder.input_image(), &[converted])?;
+let packet = encoder.encode_after(encoder.input_image(), vk::ImageLayout::GENERAL, &[converted])?;
 ```
 
 ## Benchmarking
